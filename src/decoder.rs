@@ -438,6 +438,21 @@ impl Decoder {
                 let mut v = vec![0u8; (w / 2) * (full_h / 2)];
                 let cw = w / 2;
 
+                // The two fields must agree on geometry and hold enough samples;
+                // a corrupt stream can change SPS dimensions between fields.
+                let ch = full_h / 4;
+                let field_ok = |f: &Frame| {
+                    f.width as usize == w
+                        && f.y.len() >= field_h * w
+                        && f.u.len() >= ch * cw
+                        && f.v.len() >= ch * cw
+                };
+                if w == 0 || full_h < 2 || !field_ok(&first_field) || !field_ok(&field_frame) {
+                    // Drop the stale field and hold the current one instead.
+                    self.pending_field = Some(field_frame);
+                    return None;
+                }
+
                 // Determine which is top and which is bottom
                 let (top, bot) = if ps.bottom_field_flag {
                     (&first_field, &field_frame)
@@ -453,7 +468,6 @@ impl Decoder {
                         .copy_from_slice(&bot.y[src_off..src_off + w]);
                 }
                 // Interleave chroma lines
-                let ch = full_h / 4;
                 for r in 0..ch {
                     let src_off = r * cw;
                     u[r * 2 * cw..r * 2 * cw + cw]
@@ -2607,6 +2621,12 @@ mod tests {
     #[test]
     fn test_fuzz_regression_poc_type1_mul_overflow() {
         fuzz_decode_avcc("decode_avcc_poc_type1_mul_overflow.bin");
+    }
+
+    /// Field-pair combine with mismatched field geometry (decoder.rs:451)
+    #[test]
+    fn test_fuzz_regression_field_pair_mismatch() {
+        fuzz_decode_avcc("decode_avcc_field_pair_mismatch.bin");
     }
 
     /// MBAFF CAVLC test (64x64, 6-frame, interlaced, CAVLC, frame-coded pairs)

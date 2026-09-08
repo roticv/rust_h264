@@ -1312,7 +1312,6 @@ impl SliceContext<'_> {
                     }
                 }
                 // P_8x8ref0 (mb_type=4): all ref_idx = 0 (already initialized)
-
                 // Parse MVD for each sub-partition and store MVs
                 for smb in 0..4 {
                     let (sy, sx) = sub_mb_origins[smb];
