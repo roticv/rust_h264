@@ -368,3 +368,60 @@ medium, no-deblock). `--threads N` uses `ThreadedDecoder`; `threads=1` is
   row-level reference sync (FFmpeg-style) to overlap dependent pictures,
   deblock/IDCT/intra-prediction SIMD, block-fused MC kernels (the
   `luma_mc` dispatch overhead noted above).
+
+## Deblocking ON + x86-64 FFmpeg baseline (Windows, same machine)
+
+The streams above disable the in-loop deblocking filter
+(`--no-deblock`). Real content (including PS5 cutscenes) uses it, and
+deblocking has no SIMD yet. Streams regenerated without `no-deblock`
+(`testdata/deb_*.h264`, regenerable with the commands below; not
+committed):
+
+```bash
+ffmpeg -f lavfi -i "testsrc2=s=1920x1080:rate=30:duration=3.33" -frames:v 100   -c:v libx264 -preset medium -crf 23 -x264opts "bframes=3:ref=2" -f h264 deb_1080p_100f.h264
+ffmpeg -f lavfi -i "testsrc2=s=1280x720:rate=30:duration=10" -frames:v 300   -c:v libx264 -preset medium -crf 23 -x264opts "bframes=3:ref=4" -f h264 deb_720p_300f_bframes.h264
+ffmpeg -f lavfi -i "testsrc2=s=1280x720:rate=30:duration=10" -frames:v 300   -c:v libx264 -preset medium -crf 23 -x264opts "bframes=0:ref=1" -f h264 deb_720p_300f_ponly.h264
+```
+
+| Stream | rust_h264 1t | rust_h264 4t | FFmpeg `-threads 1` | FFmpeg / rust_h264 4t |
+|--------|-------------:|-------------:|--------------------:|----------------------:|
+| 1080p B + deblock | 70 fps | 95 fps | 321 fps | 3.4x |
+| 720p B + deblock  | 159 fps | 241 fps | 620 fps | 2.6x |
+| 720p P + deblock  | 262 fps | 233 fps | 800 fps | 3.4x |
+
+- Deblocking costs **16-30% single-threaded** (83->70, 227->159, 318->262).
+- With deblocking, the 4-thread P-only case is **slower** than 1 thread:
+  deblock runs on the worker but sits on the critical path between
+  chained P-pictures (each waits for its reference's full commit), so
+  threading only adds overhead there. Row-level reference sync is the
+  structural fix.
+- **FFmpeg single-threaded is 2.6-3.4x faster than our best threaded
+  result on this machine** — the x86 gap is larger than the 2.6-4x
+  single-threaded gap on the original author's Mac. The remaining gap
+  maps to: deblock SIMD, IDCT/intra-pred SIMD, block-fused MC (per-row
+  function dispatch overhead), and row-level threading.
+
+## FFmpeg byte-exactness on real content
+
+`tools/verify_vs_ffmpeg.py` compares our output byte-for-byte against
+FFmpeg on any `.h264` or container input (extracts the H.264 track with
+a bitstream copy — use it on PS5 cutscenes pulled from game `.mp4`
+files):
+
+```bash
+python tools/verify_vs_ffmpeg.py cutscene.mp4
+```
+
+Status on synthetic streams: **byte-identical** on 1080p B-frame CABAC
+with deblocking (the PS5-representative case), MB-aligned 480p with
+deblocking, and non-aligned width without deblocking. Known upstream
+divergence class (present identically at the upstream commit, verified
+via worktree): for some content the decoder differs from FFmpeg by the
+H.264-allowed transform rounding tolerance — a handful of ±1..3 pixels
+("all-I4x4 IDR ... IDCT rounding differences" per the upstream test
+notes) — and P-chains then amplify the drift (measured: 0.0017% of
+bytes / max ±3 on a B-mix; 1.1% / max ±11 on a 300-frame P-only chain).
+B-frame/IDR-heavy content re-anchors and stays byte-exact. If a PS5
+cutscene shows divergences, the investigation starts at the
+transform/intra rounding path upstream, not in this fork's SIMD or
+threading (both bit-exact with the serial decoder by construction).
