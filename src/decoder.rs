@@ -408,7 +408,12 @@ pub(crate) fn prepare_slice(
         header.frame_num
     };
     let mut ref_pic_list = if is_p_slice {
-        let mut refs = dpb.short_term_ref_list(is_field_pic, header.bottom_field_flag);
+        let mut refs = dpb.short_term_ref_list(
+            header.frame_num,
+            max_frame_num,
+            is_field_pic,
+            header.bottom_field_flag,
+        );
         // Pad ref list if shorter than num_ref_idx_l0_active (spec 8.2.4.2.1:
         // if the list is shorter, duplicate the last entry to fill)
         if !refs.is_empty() {

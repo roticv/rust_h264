@@ -428,12 +428,18 @@ impl Dpb {
     /// Get the list of short-term reference pictures, sorted by descending PicNum.
     /// Used to build ref_pic_list_0 for P slices (spec 8.2.4.2.1 / 8.2.4.2.5).
     ///
-    /// For frame pictures (`is_field_pic=false`): standard frame ordering by descending POC.
+    /// The order is by descending FrameNumWrap (spec 8.2.4.1): `frame_num`, less
+    /// `max_frame_num` for pictures whose frame_num is above the current
+    /// picture's `frame_num`. That is decoding order, which isn't display (POC)
+    /// order once B-pictures are used as references.
+    ///
     /// For field pictures (`is_field_pic=true`): field ordering per spec 8.2.4.2.5 —
-    /// group fields by frame_num, sort groups by descending FrameNumWrap (POC proxy),
-    /// within each group emit same-parity field before opposite-parity field.
+    /// group fields by frame, frames by descending FrameNumWrap, and within each
+    /// frame emit the same-parity field before the opposite-parity field.
     pub fn short_term_ref_list(
         &self,
+        frame_num: u32,
+        max_frame_num: u32,
         is_field_pic: bool,
         bottom_field_flag: bool,
     ) -> Vec<Arc<DecodedPicture>> {
@@ -444,25 +450,28 @@ impl Dpb {
             .map(|e| e.pic.clone())
             .collect();
 
+        let frame_num_wrap = |p: &DecodedPicture| {
+            if p.frame_num > frame_num {
+                i64::from(p.frame_num) - i64::from(max_frame_num)
+            } else {
+                i64::from(p.frame_num)
+            }
+        };
         if is_field_pic {
             // Spec 8.2.4.2.5: field picture P-slice reference list initialization.
-            // Group by frame_num, sort groups by descending POC (proxy for FrameNumWrap),
-            // within each group same-parity field first.
             refs.sort_by(|a, b| {
-                // Primary: descending by FrameNumWrap (use POC as proxy)
-                let poc_cmp = b.pic_order_cnt.cmp(&a.pic_order_cnt);
-                if a.frame_num != b.frame_num {
-                    return poc_cmp;
-                }
-                // Same frame_num: same-parity field first
-                let a_same = (a.structure == PictureStructure::BottomField) == bottom_field_flag;
-                let b_same = (b.structure == PictureStructure::BottomField) == bottom_field_flag;
-                // true (same parity) should come first → sort descending
-                b_same.cmp(&a_same)
+                frame_num_wrap(b).cmp(&frame_num_wrap(a)).then_with(|| {
+                    // Same frame: same-parity field first
+                    let a_same =
+                        (a.structure == PictureStructure::BottomField) == bottom_field_flag;
+                    let b_same =
+                        (b.structure == PictureStructure::BottomField) == bottom_field_flag;
+                    // true (same parity) should come first → sort descending
+                    b_same.cmp(&a_same)
+                })
             });
         } else {
-            // Sort by descending POC as a proxy for recency (handles frame_num wraparound).
-            refs.sort_by_key(|a| core::cmp::Reverse(a.pic_order_cnt));
+            refs.sort_by_key(|p| core::cmp::Reverse(frame_num_wrap(p)));
         }
         // Append long-term refs sorted by ascending long_term_frame_idx (spec 8.2.4.2.1)
         refs.extend(self.long_term_ref_list());
@@ -1056,9 +1065,9 @@ mod tests {
         let mut dpb = Dpb::new(4);
         dpb.insert(make_pic(0, 0), ReferenceStatus::ShortTerm);
         dpb.insert(make_pic(1, 2), ReferenceStatus::ShortTerm);
-        assert_eq!(dpb.short_term_ref_list(false, false).len(), 2);
+        assert_eq!(dpb.short_term_ref_list(15, 16, false, false).len(), 2);
         dpb.clear();
-        assert_eq!(dpb.short_term_ref_list(false, false).len(), 0);
+        assert_eq!(dpb.short_term_ref_list(15, 16, false, false).len(), 0);
     }
 
     #[test]
@@ -1066,11 +1075,11 @@ mod tests {
         let mut dpb = Dpb::new(2);
         dpb.insert(make_pic(0, 0), ReferenceStatus::ShortTerm);
         dpb.insert(make_pic(1, 2), ReferenceStatus::ShortTerm);
-        assert_eq!(dpb.short_term_ref_list(false, false).len(), 2);
+        assert_eq!(dpb.short_term_ref_list(15, 16, false, false).len(), 2);
 
         // Third insert triggers sliding window — oldest (frame_num=0) gets evicted
         dpb.insert(make_pic(2, 4), ReferenceStatus::ShortTerm);
-        let refs = dpb.short_term_ref_list(false, false);
+        let refs = dpb.short_term_ref_list(15, 16, false, false);
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].frame_num, 2); // newest first (descending)
         assert_eq!(refs[1].frame_num, 1);
@@ -1091,10 +1100,81 @@ mod tests {
         dpb.insert(make_pic(1, 2), ReferenceStatus::ShortTerm);
         dpb.insert(make_pic(5, 10), ReferenceStatus::ShortTerm);
 
-        let refs = dpb.short_term_ref_list(false, false);
+        let refs = dpb.short_term_ref_list(15, 16, false, false);
         assert_eq!(refs[0].frame_num, 5);
         assert_eq!(refs[1].frame_num, 3);
         assert_eq!(refs[2].frame_num, 1);
+    }
+
+    fn make_field(frame_num: u32, poc: i32, bottom: bool) -> Arc<DecodedPicture> {
+        let pic = make_pic(frame_num, poc);
+        let mut field = Arc::try_unwrap(pic).unwrap();
+        field.structure = if bottom {
+            PictureStructure::BottomField
+        } else {
+            PictureStructure::TopField
+        };
+        Arc::new(field)
+    }
+
+    #[test]
+    fn test_ref_list_in_decoding_order_not_display_order() {
+        // I0, then P4, then a reference B2 shown before it: the B was decoded
+        // last, so it has the highest PicNum and leads the P-slice list
+        // (spec 8.2.4.2.1), although P4 comes later in display order
+        let mut dpb = Dpb::new(4);
+        dpb.insert(make_pic(0, 0), ReferenceStatus::ShortTerm);
+        dpb.insert(make_pic(1, 8), ReferenceStatus::ShortTerm);
+        dpb.insert(make_pic(2, 4), ReferenceStatus::ShortTerm);
+        let refs = dpb.short_term_ref_list(3, 16, false, false);
+        let nums: Vec<u32> = refs.iter().map(|p| p.frame_num).collect();
+        assert_eq!(nums, [2, 1, 0]);
+    }
+
+    #[test]
+    fn test_ref_list_after_frame_num_wraps() {
+        // FrameNumWrap counts frame_nums above the current one as before the
+        // wrap (spec 8.2.4.1), so 0 is newer than 15 when the current is 1
+        let mut dpb = Dpb::new(4);
+        dpb.insert(make_pic(14, 28), ReferenceStatus::ShortTerm);
+        dpb.insert(make_pic(15, 30), ReferenceStatus::ShortTerm);
+        dpb.insert(make_pic(0, 32), ReferenceStatus::ShortTerm);
+        let refs = dpb.short_term_ref_list(1, 16, false, false);
+        let nums: Vec<u32> = refs.iter().map(|p| p.frame_num).collect();
+        assert_eq!(nums, [0, 15, 14]);
+    }
+
+    #[test]
+    fn test_field_ref_list_in_decoding_order_not_display_order() {
+        // Field pairs I0, P1 and a reference B-pair 2 shown between them: the
+        // frames go by FrameNumWrap too (spec 8.2.4.2.2), same parity first
+        let mut dpb = Dpb::new(4);
+        for (frame_num, poc) in [(0, 0), (1, 16), (2, 8)] {
+            dpb.insert(
+                make_field(frame_num, poc, false),
+                ReferenceStatus::ShortTerm,
+            );
+            dpb.insert(
+                make_field(frame_num, poc + 1, true),
+                ReferenceStatus::ShortTerm,
+            );
+        }
+        let refs = dpb.short_term_ref_list(3, 16, true, true);
+        let order: Vec<(u32, bool)> = refs
+            .iter()
+            .map(|p| (p.frame_num, p.structure == PictureStructure::BottomField))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                (2, true),
+                (2, false),
+                (1, true),
+                (1, false),
+                (0, true),
+                (0, false)
+            ]
+        );
     }
 
     #[test]
@@ -1102,7 +1182,7 @@ mod tests {
         let mut dpb = Dpb::new(4);
         dpb.insert(make_pic(0, 0), ReferenceStatus::ShortTerm);
         dpb.insert(make_pic(1, 2), ReferenceStatus::Unused); // non-reference
-        assert_eq!(dpb.short_term_ref_list(false, false).len(), 1);
+        assert_eq!(dpb.short_term_ref_list(15, 16, false, false).len(), 1);
     }
 
     #[test]

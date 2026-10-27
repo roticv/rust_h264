@@ -65,7 +65,7 @@ mod tests {
         ),
         (
             "bench_1080p_100f",
-            "6a0486521aba40c2b3457d91f376de2b7f308be4fd396f2c4947468ac7734872",
+            "b6dd85988629b07b23f3dafa90108f671279466faa4527e5360e26ba25b67d9a",
         ),
         (
             "bench_1080p_100f_complex",
