@@ -18,6 +18,15 @@ pub enum MbType {
 }
 
 /// Per-macroblock metadata needed by the deblocking filter.
+/// One slice's deblocking settings from its header. Each MB's edges are
+/// filtered as its own slice says (spec 8.7).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SliceDeblock {
+    pub disable_deblocking_filter_idc: u32,
+    pub slice_alpha_c0_offset_div2: i32,
+    pub slice_beta_offset_div2: i32,
+}
+
 #[derive(Clone, Default)]
 pub struct MbInfo {
     pub mb_type: MbType,
@@ -109,35 +118,40 @@ pub fn filter_frame_params(
         frame,
         mb_info,
         mb_width,
-        disable_deblocking_filter_idc,
-        slice_alpha_c0_offset_div2,
-        slice_beta_offset_div2,
+        &vec![0; mb_info.len()],
+        &[SliceDeblock {
+            disable_deblocking_filter_idc,
+            slice_alpha_c0_offset_div2,
+            slice_beta_offset_div2,
+        }],
+        chroma_qp_index_offset,
         chroma_qp_index_offset,
         false,
         0..mb_info.len(),
     );
 }
 
-/// Apply deblocking with MBAFF support.
+/// Apply deblocking with MBAFF support. `mb_slice_id` gives each MB's slice,
+/// an index into `slices`; Cr uses the second chroma QP offset.
 #[allow(clippy::too_many_arguments)]
 pub fn filter_frame_mbaff(
     frame: &mut Frame,
     mb_info: &[MbInfo],
     mb_width: usize,
-    disable_deblocking_filter_idc: u32,
-    slice_alpha_c0_offset_div2: i32,
-    slice_beta_offset_div2: i32,
+    mb_slice_id: &[u16],
+    slices: &[SliceDeblock],
     chroma_qp_index_offset: i32,
+    second_chroma_qp_index_offset: i32,
     mbaff: bool,
 ) {
     filter_frame_inner(
         frame,
         mb_info,
         mb_width,
-        disable_deblocking_filter_idc,
-        slice_alpha_c0_offset_div2,
-        slice_beta_offset_div2,
+        mb_slice_id,
+        slices,
         chroma_qp_index_offset,
+        second_chroma_qp_index_offset,
         mbaff,
         0..mb_info.len(),
     );
@@ -153,10 +167,10 @@ pub(crate) fn filter_mb_range(
     frame: &mut Frame,
     mb_info: &[MbInfo],
     mb_width: usize,
-    disable_deblocking_filter_idc: u32,
-    slice_alpha_c0_offset_div2: i32,
-    slice_beta_offset_div2: i32,
+    mb_slice_id: &[u16],
+    slices: &[SliceDeblock],
     chroma_qp_index_offset: i32,
+    second_chroma_qp_index_offset: i32,
     mbaff: bool,
     mbs: core::ops::Range<usize>,
 ) {
@@ -164,10 +178,10 @@ pub(crate) fn filter_mb_range(
         frame,
         mb_info,
         mb_width,
-        disable_deblocking_filter_idc,
-        slice_alpha_c0_offset_div2,
-        slice_beta_offset_div2,
+        mb_slice_id,
+        slices,
         chroma_qp_index_offset,
+        second_chroma_qp_index_offset,
         mbaff,
         mbs,
     );
@@ -178,19 +192,13 @@ fn filter_frame_inner(
     frame: &mut Frame,
     mb_info: &[MbInfo],
     mb_width: usize,
-    disable_deblocking_filter_idc: u32,
-    slice_alpha_c0_offset_div2: i32,
-    slice_beta_offset_div2: i32,
+    mb_slice_id: &[u16],
+    slices: &[SliceDeblock],
     chroma_qp_index_offset: i32,
+    second_chroma_qp_index_offset: i32,
     mbaff: bool,
     mbs: core::ops::Range<usize>,
 ) {
-    if disable_deblocking_filter_idc == 1 {
-        return;
-    }
-
-    let filter_offset_a = slice_alpha_c0_offset_div2.wrapping_mul(2);
-    let filter_offset_b = slice_beta_offset_div2.wrapping_mul(2);
     // The frame is still at its coded size here (cropping happens on output),
     // so a row is mb_width MBs long whatever frame.width says
     let stride_y = mb_width * 16;
@@ -224,6 +232,24 @@ fn filter_frame_inner(
         };
         let mb_q = &mb_info[mb_idx];
 
+        // This MB's edges are filtered as its own slice's header says
+        let slice_id = mb_slice_id.get(mb_idx).copied().unwrap_or(0);
+        let slice = slices
+            .get(usize::from(slice_id))
+            .or(slices.last())
+            .copied()
+            .unwrap_or_default();
+        if slice.disable_deblocking_filter_idc == 1 {
+            continue;
+        }
+        let filter_offset_a = slice.slice_alpha_c0_offset_div2.wrapping_mul(2);
+        let filter_offset_b = slice.slice_beta_offset_div2.wrapping_mul(2);
+        // With 2, edges shared with an MB of another slice aren't filtered
+        let other_slice = |neighbour: usize| {
+            slice.disable_deblocking_filter_idc == 2
+                && mb_slice_id.get(neighbour).copied().unwrap_or(slice_id) != slice_id
+        };
+
         // -- Vertical edges (left to right) --
         for edge in 0..4 {
             let edge_x = mb_x + edge * 4;
@@ -249,6 +275,9 @@ fn filter_frame_inner(
             } else {
                 mb_idx - 1
             };
+            if is_mb_edge && other_slice(left_mb_idx) {
+                continue;
+            }
             let mb_p = &mb_info[left_mb_idx];
 
             let qp_q = mb_q.qp_y;
@@ -259,14 +288,16 @@ fn filter_frame_inner(
             let alpha = ALPHA_TABLE[index_a];
             let beta = BETA_TABLE[index_b];
 
-            // Chroma QP (computed once per edge, used for chroma segments)
-            let qp_c_p = chroma_qp(qp_p, chroma_qp_index_offset);
-            let qp_c_q = chroma_qp(qp_q, chroma_qp_index_offset);
-            let qp_c_avg = (qp_c_p + qp_c_q + 1) >> 1;
-            let c_index_a = (qp_c_avg + filter_offset_a).clamp(0, 51) as usize;
-            let c_index_b = (qp_c_avg + filter_offset_b).clamp(0, 51) as usize;
-            let c_alpha = ALPHA_TABLE[c_index_a];
-            let c_beta = BETA_TABLE[c_index_b];
+            // Chroma QP (computed once per edge, used for chroma segments).
+            // Cb and Cr each take their own QP offset.
+            let chroma_params = |offset: i32| {
+                let qp_c_avg = (chroma_qp(qp_p, offset) + chroma_qp(qp_q, offset) + 1) >> 1;
+                let c_index_a = (qp_c_avg + filter_offset_a).clamp(0, 51) as usize;
+                let c_index_b = (qp_c_avg + filter_offset_b).clamp(0, 51) as usize;
+                (c_index_a, ALPHA_TABLE[c_index_a], BETA_TABLE[c_index_b])
+            };
+            let cb = chroma_params(chroma_qp_index_offset);
+            let cr = chroma_params(second_chroma_qp_index_offset);
 
             // Compute bS for all 4 segments first
             let mut seg_bs = [0i32; 4];
@@ -318,7 +349,9 @@ fn filter_frame_inner(
                         seg_bs[cseg * 2 + 1],
                         seg_bs[cseg * 2 + 1],
                     ];
-                    for plane in [&mut frame.u, &mut frame.v] {
+                    for (plane, (c_index_a, c_alpha, c_beta)) in
+                        [(&mut frame.u, cb), (&mut frame.v, cr)]
+                    {
                         for i in 0..4 {
                             let pbs = c_bs[i];
                             if pbs == 0 {
@@ -386,6 +419,9 @@ fn filter_frame_inner(
             } else {
                 mb_idx - mb_width
             };
+            if is_mb_edge && other_slice(above_mb_idx) {
+                continue;
+            }
             let mb_p = &mb_info[above_mb_idx];
 
             let qp_q = mb_q.qp_y;
@@ -396,13 +432,15 @@ fn filter_frame_inner(
             let alpha = ALPHA_TABLE[index_a];
             let beta = BETA_TABLE[index_b];
 
-            let qp_c_p = chroma_qp(qp_p, chroma_qp_index_offset);
-            let qp_c_q = chroma_qp(qp_q, chroma_qp_index_offset);
-            let qp_c_avg = (qp_c_p + qp_c_q + 1) >> 1;
-            let c_index_a = (qp_c_avg + filter_offset_a).clamp(0, 51) as usize;
-            let c_index_b = (qp_c_avg + filter_offset_b).clamp(0, 51) as usize;
-            let c_alpha = ALPHA_TABLE[c_index_a];
-            let c_beta = BETA_TABLE[c_index_b];
+            // Cb and Cr each take their own QP offset
+            let chroma_params = |offset: i32| {
+                let qp_c_avg = (chroma_qp(qp_p, offset) + chroma_qp(qp_q, offset) + 1) >> 1;
+                let c_index_a = (qp_c_avg + filter_offset_a).clamp(0, 51) as usize;
+                let c_index_b = (qp_c_avg + filter_offset_b).clamp(0, 51) as usize;
+                (c_index_a, ALPHA_TABLE[c_index_a], BETA_TABLE[c_index_b])
+            };
+            let cb = chroma_params(chroma_qp_index_offset);
+            let cr = chroma_params(second_chroma_qp_index_offset);
 
             // Compute bS for all 4 segments first
             let mut seg_bs = [0i32; 4];
@@ -451,7 +489,9 @@ fn filter_frame_inner(
                         seg_bs[cseg * 2 + 1],
                         seg_bs[cseg * 2 + 1],
                     ];
-                    for plane in [&mut frame.u, &mut frame.v] {
+                    for (plane, (c_index_a, c_alpha, c_beta)) in
+                        [(&mut frame.u, cb), (&mut frame.v, cr)]
+                    {
                         for i in 0..4 {
                             let pbs = c_bs[i];
                             if pbs == 0 {
@@ -1048,6 +1088,91 @@ mod tests {
             "the edge between the MBs is filtered"
         );
         assert_eq!(cropped.y, whole.y);
+    }
+
+    /// Two intra MBs side by side whose luma and both chroma planes step up
+    /// across the edge between them.
+    fn two_mb_steps() -> Frame {
+        let mut frame = two_mb_frame(32);
+        for row in 0..8 {
+            for col in 0..16 {
+                let level = if col < 8 { 100 } else { 120 };
+                frame.u[row * 16 + col] = level;
+                frame.v[row * 16 + col] = level;
+            }
+        }
+        frame
+    }
+
+    fn intra(qp_y: i32) -> MbInfo {
+        MbInfo {
+            mb_type: MbType::Intra,
+            qp_y,
+            ..Default::default()
+        }
+    }
+
+    fn deblock(slice_ids: [u16; 2], slices: &[SliceDeblock], cb: i32, cr: i32) -> Frame {
+        let mut frame = two_mb_steps();
+        filter_frame_mbaff(
+            &mut frame,
+            &[intra(40), intra(40)],
+            2,
+            &slice_ids,
+            slices,
+            cb,
+            cr,
+            false,
+        );
+        frame
+    }
+
+    const FILTER: SliceDeblock = SliceDeblock {
+        disable_deblocking_filter_idc: 0,
+        slice_alpha_c0_offset_div2: 0,
+        slice_beta_offset_div2: 0,
+    };
+    const OFF: SliceDeblock = SliceDeblock {
+        disable_deblocking_filter_idc: 1,
+        ..FILTER
+    };
+    const NOT_ACROSS_SLICES: SliceDeblock = SliceDeblock {
+        disable_deblocking_filter_idc: 2,
+        ..FILTER
+    };
+
+    #[test]
+    fn test_idc_2_leaves_edges_between_slices_alone() {
+        let unfiltered = two_mb_steps();
+        // In one slice the edge between the two MBs is filtered
+        let one_slice = deblock([0, 0], &[NOT_ACROSS_SLICES], 0, 0);
+        assert_ne!(one_slice.y, unfiltered.y);
+        // In two slices it's left alone (spec 8.7: filterLeftMbEdgeFlag)
+        let two_slices = deblock([0, 1], &[NOT_ACROSS_SLICES, NOT_ACROSS_SLICES], 0, 0);
+        assert_eq!(two_slices.y, unfiltered.y);
+        assert_eq!(two_slices.u, unfiltered.u);
+    }
+
+    #[test]
+    fn test_each_mb_filters_as_its_own_slice_says() {
+        let unfiltered = two_mb_steps();
+        // The edge between the MBs belongs to the right-hand one, so its
+        // slice decides: filtered when that slice says so...
+        let filtered = deblock([0, 1], &[OFF, FILTER], 0, 0);
+        assert_ne!(filtered.y, unfiltered.y);
+        // ...and not when it says not to, whatever the first slice says
+        let left_alone = deblock([0, 1], &[FILTER, OFF], 0, 0);
+        assert_eq!(left_alone.y, unfiltered.y);
+    }
+
+    #[test]
+    fn test_cr_uses_the_second_chroma_qp_offset() {
+        // At QP 40 an offset of -12 lowers Cr's QP enough that its 20-level
+        // step is above alpha and isn't filtered, while Cb's is
+        let unfiltered = two_mb_steps();
+        let frame = deblock([0, 0], &[FILTER], 0, -12);
+        assert_ne!(frame.u, unfiltered.u);
+        assert_eq!(frame.v, unfiltered.v);
     }
 
     #[test]

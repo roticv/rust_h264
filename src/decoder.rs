@@ -83,12 +83,11 @@ pub(crate) struct PictureState {
     pub(crate) mmco_ops: Vec<(u32, u32)>,
     pub(crate) long_term_reference_flag: bool,
     pub(crate) is_intra_slice: bool,
-    // Deblock parameters (from first slice; per-slice deblock offsets
-    // could differ but we use the first slice's values)
-    pub(crate) disable_deblocking_filter_idc: u32,
-    pub(crate) slice_alpha_c0_offset_div2: i32,
-    pub(crate) slice_beta_offset_div2: i32,
+    /// Deblocking settings of each slice so far, indexed by slice ID
+    /// (each MB is filtered as its own slice says, spec 8.7).
+    pub(crate) slice_deblock: Vec<deblock::SliceDeblock>,
     pub(crate) chroma_qp_index_offset: i32,
+    pub(crate) second_chroma_qp_index_offset: i32,
     pub(crate) mb_width: u32,
     pub(crate) mb_height: u32,
     /// Per-MB-pair field decoding flag (MBAFF only). Indexed by pair address.
@@ -664,10 +663,9 @@ pub(crate) fn run_slice(
             mmco_ops: header.mmco_ops.clone(),
             long_term_reference_flag: header.long_term_reference_flag,
             is_intra_slice: header.slice_type == SliceType::I,
-            disable_deblocking_filter_idc: header.disable_deblocking_filter_idc,
-            slice_alpha_c0_offset_div2: header.slice_alpha_c0_offset_div2,
-            slice_beta_offset_div2: header.slice_beta_offset_div2,
+            slice_deblock: Vec::new(),
             chroma_qp_index_offset: pps.chroma_qp_index_offset,
+            second_chroma_qp_index_offset: pps.second_chroma_qp_index_offset,
             mb_width,
             mb_height,
             mb_field_decoding: vec![false; total_mbs.div_ceil(2)],
@@ -711,10 +709,9 @@ pub(crate) fn run_slice(
         mmco_ops: _ps_mmco_ops,
         long_term_reference_flag: _ps_lt_ref_flag,
         is_intra_slice: _ps_is_intra,
-        disable_deblocking_filter_idc: ps_deblock_idc,
-        slice_alpha_c0_offset_div2: ps_alpha,
-        slice_beta_offset_div2: ps_beta,
+        mut slice_deblock,
         chroma_qp_index_offset: ps_chroma_qp_offset,
+        second_chroma_qp_index_offset: ps_second_chroma_qp_offset,
         mb_width: _ps_mb_width,
         mb_height: _ps_mb_height,
         mb_field_decoding: mut _mb_field_decoding,
@@ -729,6 +726,15 @@ pub(crate) fn run_slice(
         current_slice_id += 1;
     }
     let this_slice_id = current_slice_id;
+
+    // This slice's deblocking settings, at its ID
+    let this_slice_deblock = deblock::SliceDeblock {
+        disable_deblocking_filter_idc: header.disable_deblocking_filter_idc,
+        slice_alpha_c0_offset_div2: header.slice_alpha_c0_offset_div2,
+        slice_beta_offset_div2: header.slice_beta_offset_div2,
+    };
+    slice_deblock.resize(usize::from(this_slice_id), this_slice_deblock);
+    slice_deblock.push(this_slice_deblock);
 
     // Each slice reinitializes its own QP from the slice header
     let mut prev_mb_qp = slice_qp;
@@ -866,10 +872,10 @@ pub(crate) fn run_slice(
                     &mb_info,
                     mb_width as usize,
                     mbaff,
-                    ps_deblock_idc,
-                    ps_alpha,
-                    ps_beta,
+                    &mb_slice_id,
+                    &slice_deblock,
                     ps_chroma_qp_offset,
+                    ps_second_chroma_qp_offset,
                 );
             }
         }
@@ -1028,10 +1034,10 @@ pub(crate) fn run_slice(
             &mb_info,
             mb_width as usize,
             mbaff,
-            ps_deblock_idc,
-            ps_alpha,
-            ps_beta,
+            &mb_slice_id,
+            &slice_deblock,
             ps_chroma_qp_offset,
+            ps_second_chroma_qp_offset,
         );
     }
 
@@ -1069,10 +1075,9 @@ pub(crate) fn run_slice(
         mmco_ops: header.mmco_ops.clone(),
         long_term_reference_flag: header.long_term_reference_flag,
         is_intra_slice: header.slice_type == SliceType::I,
-        disable_deblocking_filter_idc: ps_deblock_idc,
-        slice_alpha_c0_offset_div2: ps_alpha,
-        slice_beta_offset_div2: ps_beta,
+        slice_deblock,
         chroma_qp_index_offset: ps_chroma_qp_offset,
+        second_chroma_qp_index_offset: ps_second_chroma_qp_offset,
         mb_width,
         mb_height,
         mb_field_decoding: _mb_field_decoding,
@@ -1091,10 +1096,10 @@ pub(crate) fn deblock_picture(ps: &mut PictureState) {
         &mut ps.frame,
         &ps.mb_info,
         ps.mb_width as usize,
-        ps.disable_deblocking_filter_idc,
-        ps.slice_alpha_c0_offset_div2,
-        ps.slice_beta_offset_div2,
+        &ps.mb_slice_id,
+        &ps.slice_deblock,
         ps.chroma_qp_index_offset,
+        ps.second_chroma_qp_index_offset,
         ps.mbaff_frame_flag,
     );
 }
@@ -1189,10 +1194,10 @@ impl RowSync {
         mb_info: &[MbInfo],
         mb_width: usize,
         mbaff: bool,
-        deblock_idc: u32,
-        alpha: i32,
-        beta: i32,
+        mb_slice_id: &[u16],
+        slice_deblock: &[deblock::SliceDeblock],
         chroma_qp_offset: i32,
+        second_chroma_qp_offset: i32,
     ) {
         let unit_len = deblock_unit_len(mb_width, mbaff);
         if unit_len == 0 {
@@ -1211,10 +1216,10 @@ impl RowSync {
                 frame,
                 mb_info,
                 mb_width,
-                deblock_idc,
-                alpha,
-                beta,
+                mb_slice_id,
+                slice_deblock,
                 chroma_qp_offset,
+                second_chroma_qp_offset,
                 mbaff,
                 start..start + unit_len,
             );
@@ -1239,10 +1244,10 @@ impl RowSync {
                 &mut ps.frame,
                 &ps.mb_info,
                 ps.mb_width as usize,
-                ps.disable_deblocking_filter_idc,
-                ps.slice_alpha_c0_offset_div2,
-                ps.slice_beta_offset_div2,
+                &ps.mb_slice_id,
+                &ps.slice_deblock,
                 ps.chroma_qp_index_offset,
+                ps.second_chroma_qp_index_offset,
                 ps.mbaff_frame_flag,
                 start..ps.mb_info.len(),
             );
