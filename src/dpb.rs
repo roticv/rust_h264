@@ -920,6 +920,13 @@ impl Dpb {
         }
     }
 
+    /// The frame_num of the frame a PicNum names (spec 8.2.4.1). PicNum counts back
+    /// from the current frame_num, so it's negative for frames from before frame_num
+    /// last wrapped, whose frame_num is it plus MaxFrameNum.
+    pub fn frame_num_for_pic_num(pic_num: i32, max_frame_num: u32) -> u32 {
+        pic_num.rem_euclid(max_frame_num.max(1) as i32) as u32
+    }
+
     /// Mark a short-term reference as unused by frame_num (MMCO op=1).
     pub fn mark_short_term_unused(&mut self, frame_num: u32) {
         for entry in &mut self.entries {
@@ -1175,6 +1182,23 @@ mod tests {
                 (0, false)
             ]
         );
+    }
+
+    #[test]
+    fn test_mmco_after_frame_num_wraps_names_a_frame_from_before() {
+        // x264's B-pyramid: the reference B-frame with frame_num 1 marks the one
+        // two before it unused, PicNum -2, which is frame_num 14 (MaxFrameNum 16)
+        let mut dpb = Dpb::new(5);
+        for (frame_num, poc) in [(13, 48), (14, 44), (15, 50), (0, 58)] {
+            dpb.insert(make_pic(frame_num, poc), ReferenceStatus::ShortTerm);
+        }
+        assert_eq!(Dpb::frame_num_for_pic_num(1 - 3, 16), 14);
+        dpb.mark_short_term_unused(Dpb::frame_num_for_pic_num(1 - 3, 16));
+        let mut left: Vec<u32> = dpb.short_term_refs().iter().map(|p| p.frame_num).collect();
+        left.sort_unstable();
+        assert_eq!(left, [0, 13, 15]);
+        assert_eq!(Dpb::frame_num_for_pic_num(3, 16), 3);
+        assert_eq!(Dpb::frame_num_for_pic_num(-16, 16), 0);
     }
 
     #[test]

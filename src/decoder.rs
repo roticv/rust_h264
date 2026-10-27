@@ -100,6 +100,8 @@ pub(crate) struct PictureState {
     pub(crate) bottom_field_flag: bool,
     /// Full frame height (needed for field picture output combining).
     pub(crate) frame_height: u32,
+    /// MaxFrameNum from the SPS, for the picture numbers MMCO commands give.
+    pub(crate) max_frame_num: u32,
 }
 
 /// Streaming H.264 decoder.
@@ -281,6 +283,7 @@ impl Decoder {
                 ps.nal_unit_type,
                 ps.nal_ref_idc,
                 ps.frame_num,
+                ps.max_frame_num,
                 ps.field_pic_flag,
                 &ps.mmco_ops,
                 ps.long_term_reference_flag,
@@ -673,6 +676,7 @@ pub(crate) fn run_slice(
             field_pic_flag: header.field_pic_flag,
             bottom_field_flag: header.bottom_field_flag,
             frame_height,
+            max_frame_num: 1u32 << (sps.log2_max_frame_num_minus4 + 4).min(31),
         }
     };
 
@@ -719,6 +723,7 @@ pub(crate) fn run_slice(
         field_pic_flag: _ps_field,
         bottom_field_flag: _ps_bottom,
         frame_height: _ps_frame_height,
+        max_frame_num,
     } = ps;
 
     // Increment slice ID for continuation slices so boundary checks work
@@ -1085,6 +1090,7 @@ pub(crate) fn run_slice(
         field_pic_flag: header.field_pic_flag,
         bottom_field_flag: header.bottom_field_flag,
         frame_height,
+        max_frame_num,
     })
 }
 
@@ -1270,6 +1276,7 @@ pub(crate) fn apply_reference_marking(
     nal_unit_type: NalUnitType,
     nal_ref_idc: u8,
     frame_num: u32,
+    max_frame_num: u32,
     field_pic_flag: bool,
     mmco_ops: &[(u32, u32)],
     long_term_reference_flag: bool,
@@ -1294,11 +1301,21 @@ pub(crate) fn apply_reference_marking(
     } else {
         frame_num as i32
     };
+    // A command names a picture by PicNum, counted back from CurrPicNum
+    // (spec 8.2.5.4.1), negative for a frame once frame_num has wrapped.
+    // Field pictures keep their previous mapping.
+    let frame_num_of = |pic_num: i32| -> u32 {
+        if field_pic_flag {
+            pic_num as u32
+        } else {
+            Dpb::frame_num_for_pic_num(pic_num, max_frame_num)
+        }
+    };
     for &(op, param) in mmco_ops {
         match op {
             1 => {
                 let pic_num_to_remove = mmco_curr_pic_num - ((param & 0xFFFF) as i32 + 1);
-                dpb.mark_short_term_unused(pic_num_to_remove as u32);
+                dpb.mark_short_term_unused(frame_num_of(pic_num_to_remove));
             }
             2 => {
                 dpb.mark_long_term_unused(param);
@@ -1307,7 +1324,7 @@ pub(crate) fn apply_reference_marking(
                 let abs_diff_minus1 = param & 0xFFFF;
                 let long_term_frame_idx = param >> 16;
                 let pic_num = mmco_curr_pic_num - (abs_diff_minus1 as i32 + 1);
-                dpb.assign_long_term(pic_num as u32, long_term_frame_idx);
+                dpb.assign_long_term(frame_num_of(pic_num), long_term_frame_idx);
             }
             4 => {
                 dpb.set_max_long_term_frame_idx(param);

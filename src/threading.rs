@@ -280,6 +280,7 @@ impl ThreadedDecoder {
             last.nal_unit_type,
             last.nal_ref_idc,
             last.header.frame_num,
+            1u32 << (last.sps.log2_max_frame_num_minus4 + 4).min(31),
             last.header.field_pic_flag,
             &last.header.mmco_ops,
             last.header.long_term_reference_flag,

@@ -57,15 +57,15 @@ mod tests {
         ),
         (
             "bench_720p_300f_bframes",
-            "0d5d059d8d8632a33109e29ba3f78d94577dacec03ba7b97b052a6ce7908f54a",
+            "1334e148259f165b5ed6410748eb946af643e1c76fdad84ea01d0a6d2b2bafbe",
         ),
         (
             "bench_720p_300f_bframes_complex",
-            "28572d2b4b26bfc882e9e190d461ef360d3332edcf67730a6303a34fa0f062f0",
+            "3259ba108ef4b105abba2accbb1cf41565a2908b3042b5276ea389c9a008ae3f",
         ),
         (
             "bench_1080p_100f",
-            "b6dd85988629b07b23f3dafa90108f671279466faa4527e5360e26ba25b67d9a",
+            "ddc43f8e744faba424cea23a6a17922a6ce6d0bbbb0a4cd4bc395536f7ba5d0c",
         ),
         (
             "bench_1080p_100f_complex",
