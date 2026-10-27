@@ -2690,6 +2690,22 @@ mod tests {
     }
 
     #[test]
+    fn test_x264_pyramid_weightp_sliced() {
+        // 88x128 (cropped from 96 wide), 80 frames of x264 High: ref=5, bframes=3
+        // with b-pyramid (reference B-frames), weightp=2 (P-frames list a picture
+        // twice) and sliced threads (two slices a frame, deblocking mode 2), with
+        // log2_max_frame_num=4. Trunk decodes it differently from ffmpeg; this is
+        // the SHA-256 of ffmpeg's decode.
+        decode_and_compare_hash(
+            "x264_pyramid_weightp_sliced",
+            80,
+            88,
+            128,
+            "cfc769b9ba681ce87882b759745e6c766425b0507aea8485cde39c053f09823e",
+        );
+    }
+
+    #[test]
     fn test_1080p() {
         // 1920x1080, 10 frames: mandelbrot source, x264 --preset medium,
         // CABAC, bframes=3, ref=2, no-deblock. 6 B-frames, 3 P-frames, 1 IDR.
