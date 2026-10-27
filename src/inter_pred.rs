@@ -593,12 +593,12 @@ pub fn weighted_bi_implicit(pred_l0: &[u8], pred_l1: &[u8], output: &mut [u8], w
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::rc::Rc;
+    use alloc::sync::Arc;
     use alloc::vec::Vec;
 
-    fn make_ref_pic(width: u32, height: u32, y_data: Vec<u8>) -> Rc<DecodedPicture> {
+    fn make_ref_pic(width: u32, height: u32, y_data: Vec<u8>) -> Arc<DecodedPicture> {
         let uv_size = (width / 2 * height / 2) as usize;
-        Rc::new(DecodedPicture {
+        Arc::new(DecodedPicture {
             y: y_data,
             u: vec![128; uv_size],
             v: vec![128; uv_size],

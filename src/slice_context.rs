@@ -4,7 +4,7 @@
 //! every MB decoder (CABAC/CAVLC, I/P/B) reads and writes. Extracting it
 //! from `decode_slice` enables splitting MB decode logic into methods.
 
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::decoder::Frame;
@@ -26,9 +26,9 @@ pub(crate) struct SliceParams<'a> {
     pub scaling_list_8x8: &'a [[u8; 64]; 2],
     pub constrained_intra_pred_flag: bool,
     pub chroma_qp_index_offset: i32,
-    pub ref_pic_list: &'a [Rc<DecodedPicture>],
-    pub ref_pic_list_l0: &'a [Rc<DecodedPicture>],
-    pub ref_pic_list_l1: &'a [Rc<DecodedPicture>],
+    pub ref_pic_list: &'a [Arc<DecodedPicture>],
+    pub ref_pic_list_l0: &'a [Arc<DecodedPicture>],
+    pub ref_pic_list_l1: &'a [Arc<DecodedPicture>],
     pub num_ref_idx_l0_active: u32,
     pub num_ref_idx_l1_active: u32,
     pub wctx: &'a WeightContext<'a>,

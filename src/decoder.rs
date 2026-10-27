@@ -1,5 +1,5 @@
 use alloc::collections::BTreeMap;
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::bitstream::BitstreamReader;
@@ -10,7 +10,7 @@ use crate::error::DecodeError;
 use crate::mv_pred::WeightContext;
 use crate::nal::{NalUnit, NalUnitType};
 use crate::pps::{parse_pps, Pps};
-use crate::slice::{parse_slice_header, SliceType};
+use crate::slice::{parse_slice_header, SliceHeader, SliceType};
 use crate::slice_context::{SliceContext, SliceParams};
 use crate::sps::{parse_sps, Sps};
 
@@ -43,64 +43,64 @@ pub struct Frame {
 
 /// In-progress picture state shared across slices within the same frame.
 #[derive(Clone)]
-struct PictureState {
-    frame: Frame,
-    frame_num: u32,
-    poc: i32,
-    nal_unit_type: NalUnitType,
-    nal_ref_idc: u8,
+pub(crate) struct PictureState {
+    pub(crate) frame: Frame,
+    pub(crate) frame_num: u32,
+    pub(crate) poc: i32,
+    pub(crate) nal_unit_type: NalUnitType,
+    pub(crate) nal_ref_idc: u8,
     // Per-MB arrays that persist across slices
-    nc_luma: Vec<u8>,
-    nc_cb: Vec<u8>,
-    nc_cr: Vec<u8>,
-    mv_store_l0: Vec<[i16; 2]>,
-    mv_store_l1: Vec<[i16; 2]>,
-    ref_idx_store_l0: Vec<i8>,
-    ref_poc_store_l0: Vec<i32>,
-    ref_idx_store_l1: Vec<i8>,
-    mvd_store: Vec<[i16; 2]>,
-    mvd_store_l1: Vec<[i16; 2]>,
-    mb_info: Vec<deblock::MbInfo>,
-    i4x4_modes: Vec<u8>,
+    pub(crate) nc_luma: Vec<u8>,
+    pub(crate) nc_cb: Vec<u8>,
+    pub(crate) nc_cr: Vec<u8>,
+    pub(crate) mv_store_l0: Vec<[i16; 2]>,
+    pub(crate) mv_store_l1: Vec<[i16; 2]>,
+    pub(crate) ref_idx_store_l0: Vec<i8>,
+    pub(crate) ref_poc_store_l0: Vec<i32>,
+    pub(crate) ref_idx_store_l1: Vec<i8>,
+    pub(crate) mvd_store: Vec<[i16; 2]>,
+    pub(crate) mvd_store_l1: Vec<[i16; 2]>,
+    pub(crate) mb_info: Vec<deblock::MbInfo>,
+    pub(crate) i4x4_modes: Vec<u8>,
     // CABAC neighbor context state
-    mb_cbp: Vec<u16>,
-    mb_chroma_pred: Vec<u8>,
-    mb_is_8x8dct: Vec<bool>,
-    mb_skip: Vec<bool>,
-    mb_is_direct: Vec<bool>,
-    blk_is_direct: Vec<bool>,
-    is_i16x16: Vec<bool>,
+    pub(crate) mb_cbp: Vec<u16>,
+    pub(crate) mb_chroma_pred: Vec<u8>,
+    pub(crate) mb_is_8x8dct: Vec<bool>,
+    pub(crate) mb_skip: Vec<bool>,
+    pub(crate) mb_is_direct: Vec<bool>,
+    pub(crate) blk_is_direct: Vec<bool>,
+    pub(crate) is_i16x16: Vec<bool>,
     /// Per-MB slice ID for slice boundary detection. MBs from different
     /// slices are treated as unavailable for CABAC context and MV prediction.
-    mb_slice_id: Vec<u16>,
+    pub(crate) mb_slice_id: Vec<u16>,
     /// Current slice ID counter (incremented for each new slice).
-    current_slice_id: u16,
+    pub(crate) current_slice_id: u16,
     #[allow(dead_code)]
-    prev_mb_qp: i32,
+    pub(crate) prev_mb_qp: i32,
     #[allow(dead_code)]
-    last_qp_delta_nonzero: bool,
+    pub(crate) last_qp_delta_nonzero: bool,
     // Slice header info for finalization
-    mmco_ops: Vec<(u32, u32)>,
-    long_term_reference_flag: bool,
-    is_intra_slice: bool,
+    pub(crate) mmco_ops: Vec<(u32, u32)>,
+    pub(crate) long_term_reference_flag: bool,
+    pub(crate) is_intra_slice: bool,
     // Deblock parameters (from first slice; per-slice deblock offsets
     // could differ but we use the first slice's values)
-    disable_deblocking_filter_idc: u32,
-    slice_alpha_c0_offset_div2: i32,
-    slice_beta_offset_div2: i32,
-    chroma_qp_index_offset: i32,
-    mb_width: u32,
-    mb_height: u32,
+    pub(crate) disable_deblocking_filter_idc: u32,
+    pub(crate) slice_alpha_c0_offset_div2: i32,
+    pub(crate) slice_beta_offset_div2: i32,
+    pub(crate) chroma_qp_index_offset: i32,
+    pub(crate) mb_width: u32,
+    pub(crate) mb_height: u32,
     /// Per-MB-pair field decoding flag (MBAFF only). Indexed by pair address.
-    mb_field_decoding: Vec<bool>,
+    pub(crate) mb_field_decoding: Vec<bool>,
     /// True if this picture uses MBAFF (mb_adaptive_frame_field_flag && !field_pic_flag).
-    mbaff_frame_flag: bool,
+    pub(crate) mbaff_frame_flag: bool,
     /// True if this picture is a field picture (field_pic_flag=1).
-    field_pic_flag: bool,
+    pub(crate) field_pic_flag: bool,
     /// True if this is the bottom field (only valid when field_pic_flag=true).
-    bottom_field_flag: bool,
+    pub(crate) bottom_field_flag: bool,
     /// Full frame height (needed for field picture output combining).
-    frame_height: u32,
+    pub(crate) frame_height: u32,
 }
 
 /// Streaming H.264 decoder.
@@ -133,8 +133,8 @@ struct PictureState {
 /// }
 /// ```
 pub struct Decoder {
-    sps_table: BTreeMap<u32, Sps>,
-    pps_table: BTreeMap<u32, Pps>,
+    sps_table: BTreeMap<u32, Arc<Sps>>,
+    pps_table: BTreeMap<u32, Arc<Pps>>,
     dpb: Dpb,
     /// In-progress picture being assembled from one or more slices.
     pending: Option<PictureState>,
@@ -180,7 +180,8 @@ impl Decoder {
             NalUnitType::Sps => {
                 let sps = parse_sps(&nal.rbsp)?;
                 self.dpb.set_max_ref_frames(sps.max_num_ref_frames);
-                self.sps_table.insert(sps.seq_parameter_set_id, sps);
+                self.sps_table
+                    .insert(sps.seq_parameter_set_id, Arc::new(sps));
                 Ok(None)
             }
             NalUnitType::Pps => {
@@ -190,9 +191,12 @@ impl Decoder {
                     let _ = peek.read_ue(); // pic_parameter_set_id
                     peek.read_ue().ok()
                 };
-                let sps_ref = pps_id_sps.and_then(|id| self.sps_table.get(&id));
+                let sps_ref = pps_id_sps
+                    .and_then(|id| self.sps_table.get(&id))
+                    .map(|s| &**s);
                 let pps = parse_pps(&nal.rbsp, sps_ref)?;
-                self.pps_table.insert(pps.pic_parameter_set_id, pps);
+                self.pps_table
+                    .insert(pps.pic_parameter_set_id, Arc::new(pps));
                 Ok(None)
             }
             NalUnitType::Sei => Ok(None),
@@ -284,366 +288,187 @@ impl Decoder {
     /// Finalize the pending picture: apply deblocking, insert into DPB, return frame.
     fn finalize_pending(&mut self) -> Option<Frame> {
         let mut ps = self.pending.take()?;
-
-        // Apply deblocking filter
-        {
-            #[cfg(feature = "profile")]
-            let _profile_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::Deblock);
-            deblock::filter_frame_mbaff(
-                &mut ps.frame,
-                &ps.mb_info,
-                ps.mb_width as usize,
-                ps.disable_deblocking_filter_idc,
-                ps.slice_alpha_c0_offset_div2,
-                ps.slice_beta_offset_div2,
-                ps.chroma_qp_index_offset,
-                ps.mbaff_frame_flag,
-            );
-        }
-
+        deblock_picture(&mut ps);
         {
             #[cfg(feature = "profile")]
             let _profile_timer =
                 crate::profile::PhaseTimer::start(crate::profile::Phase::DpbFinalize);
-
-            if ps.nal_unit_type == NalUnitType::SliceIdr {
-                self.dpb.clear();
-            }
-
-            let reference = if ps.nal_ref_idc > 0 {
-                if ps.nal_unit_type == NalUnitType::SliceIdr && ps.long_term_reference_flag {
-                    ReferenceStatus::LongTerm(0) // IDR with long_term_reference_flag → LT idx 0
-                } else {
-                    ReferenceStatus::ShortTerm
-                }
-            } else {
-                ReferenceStatus::Unused
-            };
-
-            // For MMCO, use CurrPicNum (= 2*frame_num+1 for field pictures)
-            let mmco_curr_pic_num = if ps.field_pic_flag {
-                (ps.frame_num * 2 + 1) as i32
-            } else {
-                ps.frame_num as i32
-            };
-            let mut has_mmco5 = false;
-            for &(op, param) in &ps.mmco_ops {
-                match op {
-                    1 => {
-                        let pic_num_to_remove = mmco_curr_pic_num - ((param & 0xFFFF) as i32 + 1);
-                        self.dpb.mark_short_term_unused(pic_num_to_remove as u32);
-                    }
-                    2 => {
-                        self.dpb.mark_long_term_unused(param);
-                    }
-                    3 => {
-                        let abs_diff_minus1 = param & 0xFFFF;
-                        let long_term_frame_idx = param >> 16;
-                        let pic_num = mmco_curr_pic_num - (abs_diff_minus1 as i32 + 1);
-                        self.dpb
-                            .assign_long_term(pic_num as u32, long_term_frame_idx);
-                    }
-                    4 => {
-                        self.dpb.set_max_long_term_frame_idx(param);
-                    }
-                    5 => {
-                        self.dpb.clear_all_refs();
-                        has_mmco5 = true;
-                    }
-                    6 => {
-                        // Will be applied after insert (current pic must be in DPB first)
-                    }
-                    _ => {}
-                }
-            }
-
-            let pic = Rc::new(DecodedPicture {
-                y: ps.frame.y.clone(),
-                u: ps.frame.u.clone(),
-                v: ps.frame.v.clone(),
-                width: ps.mb_width * 16,
-                height: (ps.frame.height.div_ceil(16)) * 16,
-                frame_num: ps.frame_num,
-                pic_order_cnt: ps.poc,
-                mv_l0: ps.mv_store_l0,
-                ref_idx_l0: ps.ref_idx_store_l0,
-                ref_poc_l0: ps.ref_poc_store_l0,
-                mv_l1: ps.mv_store_l1,
-                ref_idx_l1: ps.ref_idx_store_l1,
-                mb_width: ps.mb_width,
-                is_intra: ps.is_intra_slice,
-                structure: if ps.field_pic_flag {
-                    if ps.bottom_field_flag {
-                        crate::dpb::PictureStructure::BottomField
-                    } else {
-                        crate::dpb::PictureStructure::TopField
-                    }
-                } else {
-                    crate::dpb::PictureStructure::Frame
-                },
-            });
-
-            self.dpb.insert(pic, reference);
-
-            // MMCO op=6: mark current picture as long-term (after insert)
-            for &(op, param) in &ps.mmco_ops {
-                if op == 6 {
-                    self.dpb.mark_current_as_long_term(param, ps.frame_num);
-                }
-            }
-
-            // MMCO op=5: reset frame_num to 0 after clearing (spec 7.4.3.3)
-            if has_mmco5 {
-                // After op=5, the current picture should have frame_num = 0
-                // This is handled by the encoder; we just need the DPB cleared.
-            }
+            let pic = Arc::new(make_decoded_picture(&mut ps));
+            apply_reference_marking(
+                &mut self.dpb,
+                pic,
+                ps.nal_unit_type,
+                ps.nal_ref_idc,
+                ps.frame_num,
+                ps.field_pic_flag,
+                &ps.mmco_ops,
+                ps.long_term_reference_flag,
+            );
         }
-
-        #[cfg(feature = "profile")]
-        let _output_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::Output);
-
-        // Crop frame from coded dimensions (MB-aligned) to display dimensions
-        let coded_w = (ps.mb_width * 16) as usize;
-        if coded_w == 0 {
-            return None;
-        }
-        let coded_h = ps.frame.y.len() / coded_w;
-        let display_w = ps.frame.width as usize;
-        let display_h = ps.frame.height as usize;
-        if coded_w != display_w || coded_h != display_h {
-            // Ensure display dimensions don't exceed coded dimensions or frame buffer
-            if display_w > coded_w || display_h > coded_h || coded_w * coded_h > ps.frame.y.len() {
-                return None;
-            }
-            let chroma_coded_w = coded_w / 2;
-            let chroma_w = display_w / 2;
-            let chroma_h = display_h / 2;
-
-            if coded_w == display_w {
-                ps.frame.y.truncate(display_w * display_h);
-                ps.frame.u.truncate(chroma_w * chroma_h);
-                ps.frame.v.truncate(chroma_w * chroma_h);
-            } else {
-                // Luma: copy display_w pixels per row from coded_w-stride buffer
-                let mut y = vec![0u8; display_w * display_h];
-                for r in 0..display_h {
-                    y[r * display_w..(r + 1) * display_w]
-                        .copy_from_slice(&ps.frame.y[r * coded_w..r * coded_w + display_w]);
-                }
-                let mut u = vec![0u8; chroma_w * chroma_h];
-                let mut v = vec![0u8; chroma_w * chroma_h];
-                for r in 0..chroma_h {
-                    u[r * chroma_w..(r + 1) * chroma_w].copy_from_slice(
-                        &ps.frame.u[r * chroma_coded_w..r * chroma_coded_w + chroma_w],
-                    );
-                    v[r * chroma_w..(r + 1) * chroma_w].copy_from_slice(
-                        &ps.frame.v[r * chroma_coded_w..r * chroma_coded_w + chroma_w],
-                    );
-                }
-                ps.frame.y = y;
-                ps.frame.u = u;
-                ps.frame.v = v;
-            }
-        }
-
-        // For field pictures, combine two fields into one frame for output
-        if ps.field_pic_flag {
-            let field_frame = ps.frame;
-            if let Some(first_field) = self.pending_field.take() {
-                // Second field arrived — combine into a full frame
-                let w = field_frame.width as usize;
-                let full_h = ps.frame_height as usize;
-                let field_h = full_h / 2;
-                let mut y = vec![0u8; w * full_h];
-                let mut u = vec![0u8; (w / 2) * (full_h / 2)];
-                let mut v = vec![0u8; (w / 2) * (full_h / 2)];
-                let cw = w / 2;
-
-                // The two fields must agree on geometry and hold enough samples;
-                // a corrupt stream can change SPS dimensions between fields.
-                let ch = full_h / 4;
-                let field_ok = |f: &Frame| {
-                    f.width as usize == w
-                        && f.y.len() >= field_h * w
-                        && f.u.len() >= ch * cw
-                        && f.v.len() >= ch * cw
-                };
-                if w == 0 || full_h < 2 || !field_ok(&first_field) || !field_ok(&field_frame) {
-                    // Drop the stale field and hold the current one instead.
-                    self.pending_field = Some(field_frame);
-                    return None;
-                }
-
-                // Determine which is top and which is bottom
-                let (top, bot) = if ps.bottom_field_flag {
-                    (&first_field, &field_frame)
-                } else {
-                    (&field_frame, &first_field)
-                };
-
-                // Interleave luma lines: top→even, bottom→odd
-                for r in 0..field_h {
-                    let src_off = r * w;
-                    y[r * 2 * w..r * 2 * w + w].copy_from_slice(&top.y[src_off..src_off + w]);
-                    y[(r * 2 + 1) * w..(r * 2 + 1) * w + w]
-                        .copy_from_slice(&bot.y[src_off..src_off + w]);
-                }
-                // Interleave chroma lines
-                for r in 0..ch {
-                    let src_off = r * cw;
-                    u[r * 2 * cw..r * 2 * cw + cw].copy_from_slice(&top.u[src_off..src_off + cw]);
-                    u[(r * 2 + 1) * cw..(r * 2 + 1) * cw + cw]
-                        .copy_from_slice(&bot.u[src_off..src_off + cw]);
-                    v[r * 2 * cw..r * 2 * cw + cw].copy_from_slice(&top.v[src_off..src_off + cw]);
-                    v[(r * 2 + 1) * cw..(r * 2 + 1) * cw + cw]
-                        .copy_from_slice(&bot.v[src_off..src_off + cw]);
-                }
-
-                return Some(Frame {
-                    y,
-                    u,
-                    v,
-                    width: w as u32,
-                    height: full_h as u32,
-                    pic_order_cnt: field_frame.pic_order_cnt.min(first_field.pic_order_cnt),
-                });
-            } else {
-                // First field — hold it, return None
-                self.pending_field = Some(field_frame);
-                return None;
-            }
-        }
-
-        Some(ps.frame)
+        finish_output(ps, &mut self.pending_field)
     }
 
     fn decode_slice(&mut self, nal: &NalUnit) -> Result<(), DecodeError> {
-        // Covers everything before the MB loop: header parse, ref lists,
-        // PictureState allocation, entropy decoder init.
-        #[cfg(feature = "profile")]
-        let setup_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::SliceSetup);
-        let pps = self
-            .pps_table
-            .values()
-            .next()
-            .ok_or(DecodeError::InvalidSyntax("no PPS available"))?;
-        let sps = self
-            .sps_table
-            .get(&pps.seq_parameter_set_id)
-            .ok_or(DecodeError::InvalidSyntax("no SPS available"))?;
+        let plan = prepare_slice(&self.sps_table, &self.pps_table, &mut self.dpb, nal)?;
+        let pending = self.pending.take();
+        let ps = run_slice(&plan, pending)?;
+        self.pending = Some(ps);
+        Ok(())
+    }
+}
 
-        let (header, mut reader) =
-            parse_slice_header(&nal.rbsp, sps, pps, nal.nal_unit_type, nal.nal_ref_idc)?;
+/// Everything about one slice that can be decided from its header and the
+/// DPB state alone: the parsed header, parameter sets, reference lists and
+/// weights, picture geometry, and the slice data to decode. Building a plan
+/// is cheap and mutates only the DPB's POC state; running it does the
+/// macroblock decode. The split lets the threaded decoder plan slices in
+/// coded order on one thread and run them on others.
+pub(crate) struct SlicePlan {
+    pub(crate) sps: Arc<Sps>,
+    pub(crate) pps: Arc<Pps>,
+    pub(crate) header: SliceHeader,
+    pub(crate) nal_unit_type: NalUnitType,
+    pub(crate) nal_ref_idc: u8,
+    /// Slice RBSP (header + data); the MB loop resumes at `header_end`.
+    pub(crate) rbsp: Vec<u8>,
+    pub(crate) header_end: (usize, u8),
+    pub(crate) current_poc: i32,
+    pub(crate) ref_pic_list: Vec<Arc<DecodedPicture>>,
+    pub(crate) ref_pic_list_l0: Vec<Arc<DecodedPicture>>,
+    pub(crate) ref_pic_list_l1: Vec<Arc<DecodedPicture>>,
+    pub(crate) use_weight: u8,
+    pub(crate) implicit_weights: Vec<Vec<i32>>,
+    pub(crate) slice_qp: i32,
+    pub(crate) width: u32,
+    pub(crate) frame_height: u32,
+    pub(crate) height: u32,
+    pub(crate) mb_width: u32,
+    pub(crate) mb_height: u32,
+    pub(crate) coded_width: u32,
+    pub(crate) coded_height: u32,
+    pub(crate) total_mbs: usize,
+}
 
-        if header.slice_type != SliceType::I
-            && header.slice_type != SliceType::P
-            && header.slice_type != SliceType::B
-        {
-            return Err(DecodeError::from("unsupported slice type"));
-        }
-        let is_field_pic = header.field_pic_flag;
-        let is_p_slice = header.slice_type == SliceType::P;
-        let is_b_slice = header.slice_type == SliceType::B;
+/// Header-level half of slice decoding (see [`SlicePlan`]).
+pub(crate) fn prepare_slice(
+    sps_table: &BTreeMap<u32, Arc<Sps>>,
+    pps_table: &BTreeMap<u32, Arc<Pps>>,
+    dpb: &mut Dpb,
+    nal: &NalUnit,
+) -> Result<SlicePlan, DecodeError> {
+    #[cfg(feature = "profile")]
+    let _setup_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::SliceSetup);
+    let pps = pps_table
+        .values()
+        .next()
+        .ok_or(DecodeError::InvalidSyntax("no PPS available"))?;
+    let sps = sps_table
+        .get(&pps.seq_parameter_set_id)
+        .ok_or(DecodeError::InvalidSyntax("no SPS available"))?;
 
-        // Compute POC for current picture (needed for B-slice ref list construction)
-        let current_poc = self
-            .dpb
-            .compute_poc(sps, &header, nal.nal_unit_type, nal.nal_ref_idc);
+    let (header, reader) =
+        parse_slice_header(&nal.rbsp, sps, pps, nal.nal_unit_type, nal.nal_ref_idc)?;
 
-        // Build reference picture lists
-        // For field pictures: MaxPicNum = 2*MaxFrameNum, CurrPicNum = 2*frame_num+1
-        let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4).min(31);
-        let max_pic_num = if is_field_pic {
-            max_frame_num.saturating_mul(2)
-        } else {
-            max_frame_num
-        };
-        let curr_pic_num = if is_field_pic {
-            header.frame_num.saturating_mul(2).saturating_add(1)
-        } else {
-            header.frame_num
-        };
-        let mut ref_pic_list = if is_p_slice {
-            let mut refs = self
-                .dpb
-                .short_term_ref_list(is_field_pic, header.bottom_field_flag);
-            // Pad ref list if shorter than num_ref_idx_l0_active (spec 8.2.4.2.1:
-            // if the list is shorter, duplicate the last entry to fill)
-            if !refs.is_empty() {
-                while refs.len() < header.num_ref_idx_l0_active as usize {
-                    refs.push(refs.last().unwrap().clone());
-                }
+    if header.slice_type != SliceType::I
+        && header.slice_type != SliceType::P
+        && header.slice_type != SliceType::B
+    {
+        return Err(DecodeError::from("unsupported slice type"));
+    }
+    let is_field_pic = header.field_pic_flag;
+    let is_p_slice = header.slice_type == SliceType::P;
+    let is_b_slice = header.slice_type == SliceType::B;
+
+    // Compute POC for current picture (needed for B-slice ref list construction)
+    let current_poc = dpb.compute_poc(sps, &header, nal.nal_unit_type, nal.nal_ref_idc);
+
+    // Build reference picture lists
+    // For field pictures: MaxPicNum = 2*MaxFrameNum, CurrPicNum = 2*frame_num+1
+    let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4).min(31);
+    let max_pic_num = if is_field_pic {
+        max_frame_num.saturating_mul(2)
+    } else {
+        max_frame_num
+    };
+    let curr_pic_num = if is_field_pic {
+        header.frame_num.saturating_mul(2).saturating_add(1)
+    } else {
+        header.frame_num
+    };
+    let mut ref_pic_list = if is_p_slice {
+        let mut refs = dpb.short_term_ref_list(is_field_pic, header.bottom_field_flag);
+        // Pad ref list if shorter than num_ref_idx_l0_active (spec 8.2.4.2.1:
+        // if the list is shorter, duplicate the last entry to fill)
+        if !refs.is_empty() {
+            while refs.len() < header.num_ref_idx_l0_active as usize {
+                refs.push(refs.last().unwrap().clone());
             }
-            refs
-        } else {
-            vec![]
-        };
-        let mut _ref_pic_list_l0 = if is_b_slice {
-            let mut refs =
-                self.dpb
-                    .ref_list_l0_b(current_poc, is_field_pic, header.bottom_field_flag);
-            if !refs.is_empty() {
-                while refs.len() < header.num_ref_idx_l0_active as usize {
-                    refs.push(refs.last().unwrap().clone());
-                }
+        }
+        refs
+    } else {
+        vec![]
+    };
+    let mut _ref_pic_list_l0 = if is_b_slice {
+        let mut refs = dpb.ref_list_l0_b(current_poc, is_field_pic, header.bottom_field_flag);
+        if !refs.is_empty() {
+            while refs.len() < header.num_ref_idx_l0_active as usize {
+                refs.push(refs.last().unwrap().clone());
             }
-            refs
-        } else {
-            vec![]
-        };
-        let mut _ref_pic_list_l1 = if is_b_slice {
-            let mut refs =
-                self.dpb
-                    .ref_list_l1_b(current_poc, is_field_pic, header.bottom_field_flag);
-            if !refs.is_empty() {
-                while refs.len() < header.num_ref_idx_l1_active as usize {
-                    refs.push(refs.last().unwrap().clone());
-                }
+        }
+        refs
+    } else {
+        vec![]
+    };
+    let mut _ref_pic_list_l1 = if is_b_slice {
+        let mut refs = dpb.ref_list_l1_b(current_poc, is_field_pic, header.bottom_field_flag);
+        if !refs.is_empty() {
+            while refs.len() < header.num_ref_idx_l1_active as usize {
+                refs.push(refs.last().unwrap().clone());
             }
-            refs
-        } else {
-            vec![]
-        };
+        }
+        refs
+    } else {
+        vec![]
+    };
 
-        // Apply ref_pic_list_modification (spec 8.2.4.3)
-        if is_p_slice && !header.ref_list_mod_l0.is_empty() {
-            Dpb::apply_ref_list_modification(
-                &mut ref_pic_list,
-                &header.ref_list_mod_l0,
-                curr_pic_num,
-                max_pic_num,
-                is_field_pic,
-                header.bottom_field_flag,
-            );
-        }
-        if is_b_slice && !header.ref_list_mod_l0.is_empty() {
-            Dpb::apply_ref_list_modification(
-                &mut _ref_pic_list_l0,
-                &header.ref_list_mod_l0,
-                curr_pic_num,
-                max_pic_num,
-                is_field_pic,
-                header.bottom_field_flag,
-            );
-        }
-        if is_b_slice && !header.ref_list_mod_l1.is_empty() {
-            Dpb::apply_ref_list_modification(
-                &mut _ref_pic_list_l1,
-                &header.ref_list_mod_l1,
-                curr_pic_num,
-                max_pic_num,
-                is_field_pic,
-                header.bottom_field_flag,
-            );
-        }
+    // Apply ref_pic_list_modification (spec 8.2.4.3)
+    if is_p_slice && !header.ref_list_mod_l0.is_empty() {
+        Dpb::apply_ref_list_modification(
+            &mut ref_pic_list,
+            &header.ref_list_mod_l0,
+            curr_pic_num,
+            max_pic_num,
+            is_field_pic,
+            header.bottom_field_flag,
+        );
+    }
+    if is_b_slice && !header.ref_list_mod_l0.is_empty() {
+        Dpb::apply_ref_list_modification(
+            &mut _ref_pic_list_l0,
+            &header.ref_list_mod_l0,
+            curr_pic_num,
+            max_pic_num,
+            is_field_pic,
+            header.bottom_field_flag,
+        );
+    }
+    if is_b_slice && !header.ref_list_mod_l1.is_empty() {
+        Dpb::apply_ref_list_modification(
+            &mut _ref_pic_list_l1,
+            &header.ref_list_mod_l1,
+            curr_pic_num,
+            max_pic_num,
+            is_field_pic,
+            header.bottom_field_flag,
+        );
+    }
 
-        // Weighted prediction mode:
-        // 0 = no weighting (default)
-        // 1 = explicit weights (P-slice weighted_pred_flag=1, or B-slice weighted_bipred_idc=1)
-        // 2 = implicit weights (B-slice weighted_bipred_idc=2)
-        let use_weight = if (is_p_slice && pps.weighted_pred_flag)
-            || (is_b_slice && pps.weighted_bipred_idc == 1)
-        {
+    // Weighted prediction mode:
+    // 0 = no weighting (default)
+    // 1 = explicit weights (P-slice weighted_pred_flag=1, or B-slice weighted_bipred_idc=1)
+    // 2 = implicit weights (B-slice weighted_bipred_idc=2)
+    let use_weight =
+        if (is_p_slice && pps.weighted_pred_flag) || (is_b_slice && pps.weighted_bipred_idc == 1) {
             1
         } else if is_b_slice && pps.weighted_bipred_idc == 2 {
             2
@@ -651,496 +476,796 @@ impl Decoder {
             0
         };
 
-        // Implicit weighted prediction: compute L0 weight from POC distances.
-        // implicit_weights[l0_idx][l1_idx] = w0. L1 weight = 64 - w0. Fixed log2_denom=5.
-        let implicit_weights: Vec<Vec<i32>> = if use_weight == 2 {
-            _ref_pic_list_l0
-                .iter()
-                .map(|ref_l0| {
-                    _ref_pic_list_l1
-                        .iter()
-                        .map(|ref_l1| {
-                            let td = (ref_l1.pic_order_cnt - ref_l0.pic_order_cnt).clamp(-128, 127);
-                            if td == 0 {
+    // Implicit weighted prediction: compute L0 weight from POC distances.
+    // implicit_weights[l0_idx][l1_idx] = w0. L1 weight = 64 - w0. Fixed log2_denom=5.
+    let implicit_weights: Vec<Vec<i32>> = if use_weight == 2 {
+        _ref_pic_list_l0
+            .iter()
+            .map(|ref_l0| {
+                _ref_pic_list_l1
+                    .iter()
+                    .map(|ref_l1| {
+                        let td = (ref_l1.pic_order_cnt - ref_l0.pic_order_cnt).clamp(-128, 127);
+                        if td == 0 {
+                            32
+                        } else {
+                            let tb = (current_poc - ref_l0.pic_order_cnt).clamp(-128, 127);
+                            let tx = (16384 + (td.abs() / 2)) / td;
+                            let w1 = (tb * tx + 32) >> 8;
+                            if !(-64..=128).contains(&w1) {
                                 32
                             } else {
-                                let tb = (current_poc - ref_l0.pic_order_cnt).clamp(-128, 127);
-                                let tx = (16384 + (td.abs() / 2)) / td;
-                                let w1 = (tb * tx + 32) >> 8;
-                                if !(-64..=128).contains(&w1) {
-                                    32
-                                } else {
-                                    64 - w1
-                                }
+                                64 - w1
                             }
-                        })
-                        .collect()
-                })
-                .collect()
-        } else {
-            vec![]
-        };
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    } else {
+        vec![]
+    };
 
-        let wctx = WeightContext {
-            use_weight,
-            wt: header.weight_table.as_ref(),
-            implicit_weights: &implicit_weights,
-        };
+    let width = sps.width();
+    let frame_height = sps.height();
+    // Reject absurd dimensions that would cause allocation overflow.
+    // H.264 Level 6.2 max is 8192x4320; allow up to 16384x16384 for headroom.
+    if width == 0 || frame_height == 0 || width > 16384 || frame_height > 16384 {
+        return Err(DecodeError::InvalidSyntax("SPS dimensions out of range"));
+    }
+    // For field pictures, each field has half the frame height
+    let height = if is_field_pic {
+        frame_height / 2
+    } else {
+        frame_height
+    };
+    let mb_width = width.div_ceil(16);
+    let mb_height = height.div_ceil(16);
+    let coded_width = mb_width * 16;
+    let coded_height = mb_height * 16;
+    let total_mbs = (mb_width * mb_height) as usize;
 
-        let width = sps.width();
-        let frame_height = sps.height();
-        // Reject absurd dimensions that would cause allocation overflow.
-        // H.264 Level 6.2 max is 8192x4320; allow up to 16384x16384 for headroom.
-        if width == 0 || frame_height == 0 || width > 16384 || frame_height > 16384 {
-            return Err(DecodeError::InvalidSyntax("SPS dimensions out of range"));
-        }
-        // For field pictures, each field has half the frame height
-        let height = if is_field_pic {
-            frame_height / 2
-        } else {
-            frame_height
-        };
-        let mb_width = width.div_ceil(16);
-        let mb_height = height.div_ceil(16);
-        let coded_width = mb_width * 16;
-        let coded_height = mb_height * 16;
-        let total_mbs = (mb_width * mb_height) as usize;
+    let slice_qp = header.qp_y(pps);
 
-        let slice_qp = header.qp_y(pps);
+    Ok(SlicePlan {
+        sps: Arc::clone(sps),
+        pps: Arc::clone(pps),
+        header_end: reader.position(),
+        header,
+        nal_unit_type: nal.nal_unit_type,
+        nal_ref_idc: nal.nal_ref_idc,
+        rbsp: nal.rbsp.to_vec(),
+        current_poc,
+        ref_pic_list,
+        ref_pic_list_l0: _ref_pic_list_l0,
+        ref_pic_list_l1: _ref_pic_list_l1,
+        use_weight,
+        implicit_weights,
+        slice_qp,
+        width,
+        frame_height,
+        height,
+        mb_width,
+        mb_height,
+        coded_width,
+        coded_height,
+        total_mbs,
+    })
+}
 
-        // Create or reuse PictureState for multi-slice support.
-        // For continuation slices (first_mb > 0), reuse the pending state
-        // so per-MB data from earlier slices is visible for MV prediction,
-        // CABAC neighbor contexts, and deblocking.
-        let is_continuation = header.first_mb_in_slice > 0
-            && self.pending.is_some()
-            && self.pending.as_ref().unwrap().mb_slice_id.len() == total_mbs;
-        let ps = if is_continuation {
-            self.pending.take().unwrap()
-        } else {
-            PictureState {
-                frame: Frame {
-                    width,
-                    height,
-                    y: vec![0u8; (coded_width * coded_height) as usize],
-                    u: vec![0u8; (coded_width * coded_height / 4) as usize],
-                    v: vec![0u8; (coded_width * coded_height / 4) as usize],
-                    pic_order_cnt: current_poc,
-                },
-                frame_num: header.frame_num,
-                poc: current_poc,
-                nal_unit_type: nal.nal_unit_type,
-                nal_ref_idc: nal.nal_ref_idc,
-                nc_luma: vec![0u8; total_mbs * 16],
-                nc_cb: vec![0u8; total_mbs * 4],
-                nc_cr: vec![0u8; total_mbs * 4],
-                mv_store_l0: vec![[0i16; 2]; total_mbs * 16],
-                mv_store_l1: vec![[0i16; 2]; total_mbs * 16],
-                ref_idx_store_l0: vec![-1i8; total_mbs * 16],
-                ref_poc_store_l0: vec![-1i32; total_mbs * 16],
-                ref_idx_store_l1: vec![-1i8; total_mbs * 16],
-                mvd_store: vec![[0i16; 2]; total_mbs * 16],
-                mvd_store_l1: vec![[0i16; 2]; total_mbs * 16],
-                mb_info: vec![deblock::MbInfo::default(); total_mbs],
-                i4x4_modes: vec![2u8; total_mbs * 16],
-                mb_cbp: vec![0u16; total_mbs],
-                mb_chroma_pred: vec![0u8; total_mbs],
-                mb_is_8x8dct: vec![false; total_mbs],
-                mb_skip: vec![false; total_mbs],
-                mb_is_direct: vec![false; total_mbs],
-                blk_is_direct: vec![false; total_mbs * 16],
-                is_i16x16: vec![false; total_mbs],
-                mb_slice_id: vec![0u16; total_mbs],
-                current_slice_id: 0,
-                prev_mb_qp: slice_qp,
-                last_qp_delta_nonzero: false,
-                mmco_ops: header.mmco_ops.clone(),
-                long_term_reference_flag: header.long_term_reference_flag,
-                is_intra_slice: header.slice_type == SliceType::I,
-                disable_deblocking_filter_idc: header.disable_deblocking_filter_idc,
-                slice_alpha_c0_offset_div2: header.slice_alpha_c0_offset_div2,
-                slice_beta_offset_div2: header.slice_beta_offset_div2,
-                chroma_qp_index_offset: pps.chroma_qp_index_offset,
-                mb_width,
-                mb_height,
-                mb_field_decoding: vec![false; total_mbs.div_ceil(2)],
-                mbaff_frame_flag: header.mbaff_frame_flag,
-                field_pic_flag: header.field_pic_flag,
-                bottom_field_flag: header.bottom_field_flag,
-                frame_height,
-            }
-        };
+/// Macroblock-decode half of slice decoding: creates or continues the
+/// picture's [`PictureState`] (`pending` is the state left by an earlier
+/// slice of the same picture) and decodes all macroblocks of the slice.
+/// Returns the updated state; deblocking and DPB insertion happen when the
+/// picture is finalized.
+pub(crate) fn run_slice(
+    plan: &SlicePlan,
+    mut pending: Option<PictureState>,
+) -> Result<PictureState, DecodeError> {
+    // Covers everything before the MB loop: PictureState allocation and
+    // entropy decoder init.
+    #[cfg(feature = "profile")]
+    let setup_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::SliceSetup);
+    let header = &plan.header;
+    let sps: &Sps = &plan.sps;
+    let pps: &Pps = &plan.pps;
+    let rbsp: &[u8] = &plan.rbsp;
+    let mut reader = BitstreamReader::new(rbsp);
+    reader.set_position(plan.header_end);
+    let is_field_pic = header.field_pic_flag;
+    let is_p_slice = header.slice_type == SliceType::P;
+    let is_b_slice = header.slice_type == SliceType::B;
+    let current_poc = plan.current_poc;
+    let ref_pic_list: &[Arc<DecodedPicture>] = &plan.ref_pic_list;
+    let _ref_pic_list_l0: &[Arc<DecodedPicture>] = &plan.ref_pic_list_l0;
+    let _ref_pic_list_l1: &[Arc<DecodedPicture>] = &plan.ref_pic_list_l1;
+    let use_weight = plan.use_weight;
+    let implicit_weights = &plan.implicit_weights;
+    let (width, frame_height, height) = (plan.width, plan.frame_height, plan.height);
+    let (mb_width, mb_height) = (plan.mb_width, plan.mb_height);
+    let (coded_width, coded_height) = (plan.coded_width, plan.coded_height);
+    let total_mbs = plan.total_mbs;
+    let slice_qp = plan.slice_qp;
+    let wctx = WeightContext {
+        use_weight,
+        wt: header.weight_table.as_ref(),
+        implicit_weights,
+    };
 
-        // Destructure into local variables so existing code works unchanged
-        let PictureState {
-            mut frame,
-            frame_num: _ps_frame_num,
-            poc: _ps_poc,
-            nal_unit_type: _ps_nal_type,
-            nal_ref_idc: _ps_nal_ref_idc,
-            mut nc_luma,
-            mut nc_cb,
-            mut nc_cr,
-            mut mv_store_l0,
-            mut mv_store_l1,
-            mut ref_idx_store_l0,
-            mut ref_poc_store_l0,
-            mut ref_idx_store_l1,
-            mut mvd_store,
-            mut mvd_store_l1,
-            mut mb_info,
-            mut i4x4_modes,
-            mut mb_cbp,
-            mut mb_chroma_pred,
-            mut mb_is_8x8dct,
-            mut mb_skip,
-            mut mb_is_direct,
-            mut blk_is_direct,
-            mut is_i16x16,
-            mut mb_slice_id,
-            mut current_slice_id,
-            prev_mb_qp: _,
-            last_qp_delta_nonzero: _,
-            mmco_ops: _ps_mmco_ops,
-            long_term_reference_flag: _ps_lt_ref_flag,
-            is_intra_slice: _ps_is_intra,
-            disable_deblocking_filter_idc: ps_deblock_idc,
-            slice_alpha_c0_offset_div2: ps_alpha,
-            slice_beta_offset_div2: ps_beta,
-            chroma_qp_index_offset: ps_chroma_qp_offset,
-            mb_width: _ps_mb_width,
-            mb_height: _ps_mb_height,
-            mb_field_decoding: mut _mb_field_decoding,
-            mbaff_frame_flag: _ps_mbaff,
-            field_pic_flag: _ps_field,
-            bottom_field_flag: _ps_bottom,
-            frame_height: _ps_frame_height,
-        } = ps;
-
-        // Increment slice ID for continuation slices so boundary checks work
-        if is_continuation {
-            current_slice_id += 1;
-        }
-        let this_slice_id = current_slice_id;
-
-        // Each slice reinitializes its own QP from the slice header
-        let mut prev_mb_qp = slice_qp;
-        let mut last_qp_delta_nonzero = false;
-
-        // CABAC or CAVLC?
-        let use_cabac = pps.entropy_coding_mode_flag;
-
-        // Initialize CABAC engine if needed
-        let cabac_byte_pos = if use_cabac {
-            let (pos, _data) = reader.cabac_start();
-            Some(pos)
-        } else {
-            None
-        };
-        // Create CabacReader from original RBSP data (avoids borrow conflict with reader)
-        let mut cabac_reader =
-            cabac_byte_pos.map(|pos| crate::cabac::CabacReader::new(&nal.rbsp, pos));
-        let mut cabac_state = if use_cabac {
-            crate::cabac::init_cabac_states(
-                slice_qp,
-                header.slice_type == SliceType::I,
-                header.cabac_init_idc,
-            )
-        } else {
-            [0u8; 1024]
-        };
-
-        let mut mb_skip_run: i32 = -1; // -1 = not initialized for P slices
-
-        let stride = coded_width as usize;
-        let mbaff = header.mbaff_frame_flag;
-        let mut mb_ly_stride = stride;
-        let mut mb_ly_offset = 0usize;
-        let mut mb_lc_stride = (coded_width / 2) as usize;
-        let mut mb_lc_offset = 0usize;
-
-        // Macro to construct a SliceContext from the local variables.
-        // Used at each call site that delegates to a SliceContext method.
-        macro_rules! make_ctx {
-            () => {
-                SliceContext {
-                    frame: &mut frame,
-                    stride,
-                    width: coded_width,
-                    height: coded_height,
-                    mb_width,
-                    nc_luma: &mut nc_luma,
-                    nc_cb: &mut nc_cb,
-                    nc_cr: &mut nc_cr,
-                    mv_store_l0: &mut mv_store_l0,
-                    mv_store_l1: &mut mv_store_l1,
-                    ref_idx_store_l0: &mut ref_idx_store_l0,
-                    ref_poc_store_l0: &mut ref_poc_store_l0,
-                    ref_idx_store_l1: &mut ref_idx_store_l1,
-                    mvd_store: &mut mvd_store,
-                    mvd_store_l1: &mut mvd_store_l1,
-                    mb_info: &mut mb_info,
-                    i4x4_modes: &mut i4x4_modes,
-                    mb_cbp: &mut mb_cbp,
-                    mb_chroma_pred: &mut mb_chroma_pred,
-                    mb_is_8x8dct: &mut mb_is_8x8dct,
-                    mb_skip: &mut mb_skip,
-                    mb_is_direct: &mut mb_is_direct,
-                    blk_is_direct: &mut blk_is_direct,
-                    is_i16x16: &mut is_i16x16,
-                    mb_slice_id: &mut mb_slice_id,
-                    this_slice_id,
-                    prev_mb_qp,
-                    last_qp_delta_nonzero,
-                    mbaff,
-                    mb_field_decoding: &mut _mb_field_decoding,
-                    ly_stride: mb_ly_stride,
-                    ly_offset: mb_ly_offset,
-                    lc_stride: mb_lc_stride,
-                    lc_offset: mb_lc_offset,
-                    field_pic_flag: is_field_pic,
-                    bottom_field_flag: header.bottom_field_flag,
-                }
-            };
-        }
-
-        let params = SliceParams {
-            is_p_slice,
-            is_b_slice,
-            use_weight,
-            current_poc,
-            direct_spatial_mv_pred_flag: header.direct_spatial_mv_pred_flag,
-            direct_8x8_inference_flag: sps.direct_8x8_inference_flag,
-            transform_8x8_mode_flag: pps.transform_8x8_mode_flag,
-            scaling_list_4x4: &pps.scaling_list_4x4,
-            scaling_list_8x8: &pps.scaling_list_8x8,
-            constrained_intra_pred_flag: pps.constrained_intra_pred_flag,
+    // Create or reuse PictureState for multi-slice support.
+    // For continuation slices (first_mb > 0), reuse the pending state
+    // so per-MB data from earlier slices is visible for MV prediction,
+    // CABAC neighbor contexts, and deblocking.
+    let is_continuation = header.first_mb_in_slice > 0
+        && pending.is_some()
+        && pending.as_ref().unwrap().mb_slice_id.len() == total_mbs;
+    let ps = if is_continuation {
+        pending.take().unwrap()
+    } else {
+        PictureState {
+            frame: Frame {
+                width,
+                height,
+                y: vec![0u8; (coded_width * coded_height) as usize],
+                u: vec![0u8; (coded_width * coded_height / 4) as usize],
+                v: vec![0u8; (coded_width * coded_height / 4) as usize],
+                pic_order_cnt: current_poc,
+            },
+            frame_num: header.frame_num,
+            poc: current_poc,
+            nal_unit_type: plan.nal_unit_type,
+            nal_ref_idc: plan.nal_ref_idc,
+            nc_luma: vec![0u8; total_mbs * 16],
+            nc_cb: vec![0u8; total_mbs * 4],
+            nc_cr: vec![0u8; total_mbs * 4],
+            mv_store_l0: vec![[0i16; 2]; total_mbs * 16],
+            mv_store_l1: vec![[0i16; 2]; total_mbs * 16],
+            ref_idx_store_l0: vec![-1i8; total_mbs * 16],
+            ref_poc_store_l0: vec![-1i32; total_mbs * 16],
+            ref_idx_store_l1: vec![-1i8; total_mbs * 16],
+            mvd_store: vec![[0i16; 2]; total_mbs * 16],
+            mvd_store_l1: vec![[0i16; 2]; total_mbs * 16],
+            mb_info: vec![deblock::MbInfo::default(); total_mbs],
+            i4x4_modes: vec![2u8; total_mbs * 16],
+            mb_cbp: vec![0u16; total_mbs],
+            mb_chroma_pred: vec![0u8; total_mbs],
+            mb_is_8x8dct: vec![false; total_mbs],
+            mb_skip: vec![false; total_mbs],
+            mb_is_direct: vec![false; total_mbs],
+            blk_is_direct: vec![false; total_mbs * 16],
+            is_i16x16: vec![false; total_mbs],
+            mb_slice_id: vec![0u16; total_mbs],
+            current_slice_id: 0,
+            prev_mb_qp: slice_qp,
+            last_qp_delta_nonzero: false,
+            mmco_ops: header.mmco_ops.clone(),
+            long_term_reference_flag: header.long_term_reference_flag,
+            is_intra_slice: header.slice_type == SliceType::I,
+            disable_deblocking_filter_idc: header.disable_deblocking_filter_idc,
+            slice_alpha_c0_offset_div2: header.slice_alpha_c0_offset_div2,
+            slice_beta_offset_div2: header.slice_beta_offset_div2,
             chroma_qp_index_offset: pps.chroma_qp_index_offset,
-            ref_pic_list: &ref_pic_list,
-            ref_pic_list_l0: &_ref_pic_list_l0,
-            ref_pic_list_l1: &_ref_pic_list_l1,
-            num_ref_idx_l0_active: header.num_ref_idx_l0_active,
-            num_ref_idx_l1_active: header.num_ref_idx_l1_active,
-            wctx: &wctx,
-            first_mb_in_slice: header.first_mb_in_slice,
-            slice_qp,
-            is_i_slice: header.slice_type == SliceType::I,
-            cabac_init_idc: header.cabac_init_idc,
-        };
-
-        // In MBAFF, first_mb_in_slice is a pair address
-        let mut mb_idx = if mbaff {
-            (header.first_mb_in_slice as usize) * 2
-        } else {
-            header.first_mb_in_slice as usize
-        };
-        if mb_idx >= total_mbs {
-            return Err(DecodeError::InvalidSyntax("first_mb_in_slice out of range"));
+            mb_width,
+            mb_height,
+            mb_field_decoding: vec![false; total_mbs.div_ceil(2)],
+            mbaff_frame_flag: header.mbaff_frame_flag,
+            field_pic_flag: header.field_pic_flag,
+            bottom_field_flag: header.bottom_field_flag,
+            frame_height,
         }
-        #[cfg(feature = "profile")]
-        drop(setup_timer);
-        #[cfg(feature = "profile")]
-        let loop_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::MbLoop);
-        while mb_idx < total_mbs {
-            // CAVLC end-of-slice: check before reading any new syntax elements.
-            // Skip this check when counting down a skip run (no reads needed).
-            if !use_cabac && mb_skip_run <= 0 && !reader.more_rbsp_data() {
-                break;
+    };
+
+    // Destructure into local variables so existing code works unchanged
+    let PictureState {
+        mut frame,
+        frame_num: _ps_frame_num,
+        poc: _ps_poc,
+        nal_unit_type: _ps_nal_type,
+        nal_ref_idc: _ps_nal_ref_idc,
+        mut nc_luma,
+        mut nc_cb,
+        mut nc_cr,
+        mut mv_store_l0,
+        mut mv_store_l1,
+        mut ref_idx_store_l0,
+        mut ref_poc_store_l0,
+        mut ref_idx_store_l1,
+        mut mvd_store,
+        mut mvd_store_l1,
+        mut mb_info,
+        mut i4x4_modes,
+        mut mb_cbp,
+        mut mb_chroma_pred,
+        mut mb_is_8x8dct,
+        mut mb_skip,
+        mut mb_is_direct,
+        mut blk_is_direct,
+        mut is_i16x16,
+        mut mb_slice_id,
+        mut current_slice_id,
+        prev_mb_qp: _,
+        last_qp_delta_nonzero: _,
+        mmco_ops: _ps_mmco_ops,
+        long_term_reference_flag: _ps_lt_ref_flag,
+        is_intra_slice: _ps_is_intra,
+        disable_deblocking_filter_idc: ps_deblock_idc,
+        slice_alpha_c0_offset_div2: ps_alpha,
+        slice_beta_offset_div2: ps_beta,
+        chroma_qp_index_offset: ps_chroma_qp_offset,
+        mb_width: _ps_mb_width,
+        mb_height: _ps_mb_height,
+        mb_field_decoding: mut _mb_field_decoding,
+        mbaff_frame_flag: _ps_mbaff,
+        field_pic_flag: _ps_field,
+        bottom_field_flag: _ps_bottom,
+        frame_height: _ps_frame_height,
+    } = ps;
+
+    // Increment slice ID for continuation slices so boundary checks work
+    if is_continuation {
+        current_slice_id += 1;
+    }
+    let this_slice_id = current_slice_id;
+
+    // Each slice reinitializes its own QP from the slice header
+    let mut prev_mb_qp = slice_qp;
+    let mut last_qp_delta_nonzero = false;
+
+    // CABAC or CAVLC?
+    let use_cabac = pps.entropy_coding_mode_flag;
+
+    // Initialize CABAC engine if needed
+    let cabac_byte_pos = if use_cabac {
+        let (pos, _data) = reader.cabac_start();
+        Some(pos)
+    } else {
+        None
+    };
+    // Create CabacReader from original RBSP data (avoids borrow conflict with reader)
+    let mut cabac_reader = cabac_byte_pos.map(|pos| crate::cabac::CabacReader::new(rbsp, pos));
+    let mut cabac_state = if use_cabac {
+        crate::cabac::init_cabac_states(
+            slice_qp,
+            header.slice_type == SliceType::I,
+            header.cabac_init_idc,
+        )
+    } else {
+        [0u8; 1024]
+    };
+
+    let mut mb_skip_run: i32 = -1; // -1 = not initialized for P slices
+
+    let stride = coded_width as usize;
+    let mbaff = header.mbaff_frame_flag;
+    let mut mb_ly_stride = stride;
+    let mut mb_ly_offset = 0usize;
+    let mut mb_lc_stride = (coded_width / 2) as usize;
+    let mut mb_lc_offset = 0usize;
+
+    // Macro to construct a SliceContext from the local variables.
+    // Used at each call site that delegates to a SliceContext method.
+    macro_rules! make_ctx {
+        () => {
+            SliceContext {
+                frame: &mut frame,
+                stride,
+                width: coded_width,
+                height: coded_height,
+                mb_width,
+                nc_luma: &mut nc_luma,
+                nc_cb: &mut nc_cb,
+                nc_cr: &mut nc_cr,
+                mv_store_l0: &mut mv_store_l0,
+                mv_store_l1: &mut mv_store_l1,
+                ref_idx_store_l0: &mut ref_idx_store_l0,
+                ref_poc_store_l0: &mut ref_poc_store_l0,
+                ref_idx_store_l1: &mut ref_idx_store_l1,
+                mvd_store: &mut mvd_store,
+                mvd_store_l1: &mut mvd_store_l1,
+                mb_info: &mut mb_info,
+                i4x4_modes: &mut i4x4_modes,
+                mb_cbp: &mut mb_cbp,
+                mb_chroma_pred: &mut mb_chroma_pred,
+                mb_is_8x8dct: &mut mb_is_8x8dct,
+                mb_skip: &mut mb_skip,
+                mb_is_direct: &mut mb_is_direct,
+                blk_is_direct: &mut blk_is_direct,
+                is_i16x16: &mut is_i16x16,
+                mb_slice_id: &mut mb_slice_id,
+                this_slice_id,
+                prev_mb_qp,
+                last_qp_delta_nonzero,
+                mbaff,
+                mb_field_decoding: &mut _mb_field_decoding,
+                ly_stride: mb_ly_stride,
+                ly_offset: mb_ly_offset,
+                lc_stride: mb_lc_stride,
+                lc_offset: mb_lc_offset,
+                field_pic_flag: is_field_pic,
+                bottom_field_flag: header.bottom_field_flag,
             }
+        };
+    }
 
-            // Stamp this MB with the current slice ID for boundary detection
-            mb_slice_id[mb_idx] = this_slice_id;
-            // Compute pixel position
-            let (mb_x, mb_y) = if mbaff {
-                let pair_addr = mb_idx / 2;
-                let pair_col = pair_addr % mb_width as usize;
-                let pair_row = pair_addr / mb_width as usize;
-                let x = pair_col * 16;
-                let y = pair_row * 32 + (mb_idx % 2) * 16;
-                (x, y)
-            } else {
-                (
-                    (mb_idx % mb_width as usize) * 16,
-                    (mb_idx / mb_width as usize) * 16,
-                )
-            };
+    let params = SliceParams {
+        is_p_slice,
+        is_b_slice,
+        use_weight,
+        current_poc,
+        direct_spatial_mv_pred_flag: header.direct_spatial_mv_pred_flag,
+        direct_8x8_inference_flag: sps.direct_8x8_inference_flag,
+        transform_8x8_mode_flag: pps.transform_8x8_mode_flag,
+        scaling_list_4x4: &pps.scaling_list_4x4,
+        scaling_list_8x8: &pps.scaling_list_8x8,
+        constrained_intra_pred_flag: pps.constrained_intra_pred_flag,
+        chroma_qp_index_offset: pps.chroma_qp_index_offset,
+        ref_pic_list,
+        ref_pic_list_l0: _ref_pic_list_l0,
+        ref_pic_list_l1: _ref_pic_list_l1,
+        num_ref_idx_l0_active: header.num_ref_idx_l0_active,
+        num_ref_idx_l1_active: header.num_ref_idx_l1_active,
+        wctx: &wctx,
+        first_mb_in_slice: header.first_mb_in_slice,
+        slice_qp,
+        is_i_slice: header.slice_type == SliceType::I,
+        cabac_init_idc: header.cabac_init_idc,
+    };
 
-            // CABAC decode path
-            if use_cabac {
-                let cr = cabac_reader.as_mut().unwrap();
-                let st = &mut cabac_state;
+    // In MBAFF, first_mb_in_slice is a pair address
+    let mut mb_idx = if mbaff {
+        (header.first_mb_in_slice as usize) * 2
+    } else {
+        header.first_mb_in_slice as usize
+    };
+    if mb_idx >= total_mbs {
+        return Err(DecodeError::InvalidSyntax("first_mb_in_slice out of range"));
+    }
+    #[cfg(feature = "profile")]
+    drop(setup_timer);
+    #[cfg(feature = "profile")]
+    let loop_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::MbLoop);
+    while mb_idx < total_mbs {
+        // CAVLC end-of-slice: check before reading any new syntax elements.
+        // Skip this check when counting down a skip run (no reads needed).
+        if !use_cabac && mb_skip_run <= 0 && !reader.more_rbsp_data() {
+            break;
+        }
 
-                // MBAFF: end_of_slice_flag and mb_field_decoding_flag are both
-                // handled inside decode_cabac_mb (contexts 70-72 for field flag,
-                // with MBAFF-adjusted first_mb comparison for terminate).
-                {
-                    #[cfg(feature = "profile")]
-                    let _profile_timer =
-                        crate::profile::PhaseTimer::start(crate::profile::Phase::MbDecode);
-                    let mut ctx = make_ctx!();
-                    match ctx.decode_cabac_mb(cr, st, &nal.rbsp, mb_idx, mb_x, mb_y, &params)? {
-                        CabacMbResult::EndOfSlice => break,
-                        CabacMbResult::Decoded => {}
-                    }
-                    prev_mb_qp = ctx.prev_mb_qp;
-                    last_qp_delta_nonzero = ctx.last_qp_delta_nonzero;
-                }
-                if mbaff && mb_idx % 2 != 0 {
-                    let term = cr.get_cabac_terminate();
-                    if term != 0 {
-                        mb_idx += 1;
-                        break;
-                    }
-                }
+        // Stamp this MB with the current slice ID for boundary detection
+        mb_slice_id[mb_idx] = this_slice_id;
+        // Compute pixel position
+        let (mb_x, mb_y) = if mbaff {
+            let pair_addr = mb_idx / 2;
+            let pair_col = pair_addr % mb_width as usize;
+            let pair_row = pair_addr / mb_width as usize;
+            let x = pair_col * 16;
+            let y = pair_row * 32 + (mb_idx % 2) * 16;
+            (x, y)
+        } else {
+            (
+                (mb_idx % mb_width as usize) * 16,
+                (mb_idx / mb_width as usize) * 16,
+            )
+        };
 
-                mb_idx += 1;
-                continue;
-            }
+        // CABAC decode path
+        if use_cabac {
+            let cr = cabac_reader.as_mut().unwrap();
+            let st = &mut cabac_state;
 
-            // P/B-slice skip run handling
-            if is_p_slice || is_b_slice {
-                if mb_skip_run < 0 {
-                    mb_skip_run = reader.read_ue()? as i32;
-                }
-                if mb_skip_run > 0 {
-                    mb_skip_run -= 1;
-                    mb_skip[mb_idx] = true; // Mark as skipped for MBAFF field flag inference
-                                            // Set layout for skip MBs (field_flag already known)
-                    {
-                        let mut ctx = make_ctx!();
-                        ctx.set_mb_layout(mb_idx, mb_x, mb_y);
-                        mb_ly_stride = ctx.ly_stride;
-                        mb_ly_offset = ctx.ly_offset;
-                        mb_lc_stride = ctx.lc_stride;
-                        mb_lc_offset = ctx.lc_offset;
-                    }
-                    if is_p_slice {
-                        // P_Skip: MV = median predictor, ref_idx = 0, no residual
-                        #[cfg(feature = "profile")]
-                        let _profile_timer =
-                            crate::profile::PhaseTimer::start(crate::profile::Phase::MbDecode);
-                        make_ctx!().decode_p_skip_mb(mb_idx, mb_x, mb_y, &params);
-                    } else {
-                        // B_Skip: spatial/temporal direct MV + MC, no residual
-                        #[cfg(feature = "profile")]
-                        let _profile_timer =
-                            crate::profile::PhaseTimer::start(crate::profile::Phase::MbDecode);
-                        make_ctx!().decode_b_skip_mb(mb_idx, mb_x, mb_y, &params);
-                    }
-                    mb_info[mb_idx] = MbInfo {
-                        mb_type: MbType::Inter,
-                        qp_y: prev_mb_qp,
-                        ..Default::default()
-                    };
-                    mb_idx += 1;
-                    continue;
-                }
-                // mb_skip_run == 0: parse the next MB normally
-                mb_skip_run = -1; // reset for next iteration
-
-                // MBAFF: read mb_field_decoding_flag for this pair
-                // (spec 7.3.4: read before first non-skipped MB of pair)
-                if mbaff {
-                    let is_top = mb_idx % 2 == 0;
-                    let top_was_skipped = !is_top && mb_skip[mb_idx - 1];
-                    if is_top || top_was_skipped {
-                        _mb_field_decoding[mb_idx / 2] = reader.read_bit()? != 0;
-                    }
-                }
-            }
-
-            // MBAFF I-slice: read mb_field_decoding_flag before MB decode
-            if mbaff && !(is_p_slice || is_b_slice) {
-                let is_top = mb_idx % 2 == 0;
-                if is_top {
-                    _mb_field_decoding[mb_idx / 2] = reader.read_bit()? != 0;
-                }
-            }
-
+            // MBAFF: end_of_slice_flag and mb_field_decoding_flag are both
+            // handled inside decode_cabac_mb (contexts 70-72 for field flag,
+            // with MBAFF-adjusted first_mb comparison for terminate).
             {
                 #[cfg(feature = "profile")]
                 let _profile_timer =
                     crate::profile::PhaseTimer::start(crate::profile::Phase::MbDecode);
                 let mut ctx = make_ctx!();
-                ctx.set_mb_layout(mb_idx, mb_x, mb_y);
-                ctx.decode_cavlc_mb(&mut reader, mb_idx, mb_x, mb_y, &params)?;
+                match ctx.decode_cabac_mb(cr, st, rbsp, mb_idx, mb_x, mb_y, &params)? {
+                    CabacMbResult::EndOfSlice => break,
+                    CabacMbResult::Decoded => {}
+                }
                 prev_mb_qp = ctx.prev_mb_qp;
                 last_qp_delta_nonzero = ctx.last_qp_delta_nonzero;
             }
-            mb_idx += 1;
+            if mbaff && mb_idx % 2 != 0 {
+                let term = cr.get_cabac_terminate();
+                if term != 0 {
+                    mb_idx += 1;
+                    break;
+                }
+            }
 
-            // CAVLC end-of-slice: spec says "while (more_rbsp_data())"
-            // after each MB. For single-slice, this naturally ends at
-            // total_mbs. For multi-slice, it stops at each slice boundary.
-            if !use_cabac && !reader.more_rbsp_data() {
-                break;
+            mb_idx += 1;
+            continue;
+        }
+
+        // P/B-slice skip run handling
+        if is_p_slice || is_b_slice {
+            if mb_skip_run < 0 {
+                mb_skip_run = reader.read_ue()? as i32;
+            }
+            if mb_skip_run > 0 {
+                mb_skip_run -= 1;
+                mb_skip[mb_idx] = true; // Mark as skipped for MBAFF field flag inference
+                                        // Set layout for skip MBs (field_flag already known)
+                {
+                    let mut ctx = make_ctx!();
+                    ctx.set_mb_layout(mb_idx, mb_x, mb_y);
+                    mb_ly_stride = ctx.ly_stride;
+                    mb_ly_offset = ctx.ly_offset;
+                    mb_lc_stride = ctx.lc_stride;
+                    mb_lc_offset = ctx.lc_offset;
+                }
+                if is_p_slice {
+                    // P_Skip: MV = median predictor, ref_idx = 0, no residual
+                    #[cfg(feature = "profile")]
+                    let _profile_timer =
+                        crate::profile::PhaseTimer::start(crate::profile::Phase::MbDecode);
+                    make_ctx!().decode_p_skip_mb(mb_idx, mb_x, mb_y, &params);
+                } else {
+                    // B_Skip: spatial/temporal direct MV + MC, no residual
+                    #[cfg(feature = "profile")]
+                    let _profile_timer =
+                        crate::profile::PhaseTimer::start(crate::profile::Phase::MbDecode);
+                    make_ctx!().decode_b_skip_mb(mb_idx, mb_x, mb_y, &params);
+                }
+                mb_info[mb_idx] = MbInfo {
+                    mb_type: MbType::Inter,
+                    qp_y: prev_mb_qp,
+                    ..Default::default()
+                };
+                mb_idx += 1;
+                continue;
+            }
+            // mb_skip_run == 0: parse the next MB normally
+            mb_skip_run = -1; // reset for next iteration
+
+            // MBAFF: read mb_field_decoding_flag for this pair
+            // (spec 7.3.4: read before first non-skipped MB of pair)
+            if mbaff {
+                let is_top = mb_idx % 2 == 0;
+                let top_was_skipped = !is_top && mb_skip[mb_idx - 1];
+                if is_top || top_was_skipped {
+                    _mb_field_decoding[mb_idx / 2] = reader.read_bit()? != 0;
+                }
             }
         }
 
-        // Post-loop: fill deblock info and ref POC table
-        let first_mb = if mbaff {
-            (header.first_mb_in_slice as usize) * 2
-        } else {
-            header.first_mb_in_slice as usize
-        };
-        #[cfg(feature = "profile")]
-        drop(loop_timer);
-        {
-            #[cfg(feature = "profile")]
-            let _profile_timer =
-                crate::profile::PhaseTimer::start(crate::profile::Phase::FinalizeMbInfo);
-            make_ctx!().finalize_mb_info(first_mb, mb_idx.min(total_mbs), &params);
+        // MBAFF I-slice: read mb_field_decoding_flag before MB decode
+        if mbaff && !(is_p_slice || is_b_slice) {
+            let is_top = mb_idx % 2 == 0;
+            if is_top {
+                _mb_field_decoding[mb_idx / 2] = reader.read_bit()? != 0;
+            }
         }
 
-        // Store state back into pending PictureState.
-        // Deblocking and DPB insertion happen in finalize_pending().
-        self.pending = Some(PictureState {
-            frame,
-            frame_num: header.frame_num,
-            poc: current_poc,
-            nal_unit_type: nal.nal_unit_type,
-            nal_ref_idc: nal.nal_ref_idc,
-            nc_luma,
-            nc_cb,
-            nc_cr,
-            mv_store_l0,
-            mv_store_l1,
-            ref_idx_store_l0,
-            ref_poc_store_l0,
-            ref_idx_store_l1,
-            mvd_store,
-            mvd_store_l1,
-            mb_info,
-            i4x4_modes,
-            mb_cbp,
-            mb_chroma_pred,
-            mb_is_8x8dct,
-            mb_skip,
-            mb_is_direct,
-            blk_is_direct,
-            is_i16x16,
-            mb_slice_id,
-            current_slice_id,
-            prev_mb_qp,
-            last_qp_delta_nonzero,
-            mmco_ops: header.mmco_ops.clone(),
-            long_term_reference_flag: header.long_term_reference_flag,
-            is_intra_slice: header.slice_type == SliceType::I,
-            disable_deblocking_filter_idc: ps_deblock_idc,
-            slice_alpha_c0_offset_div2: ps_alpha,
-            slice_beta_offset_div2: ps_beta,
-            chroma_qp_index_offset: ps_chroma_qp_offset,
-            mb_width,
-            mb_height,
-            mb_field_decoding: _mb_field_decoding,
-            mbaff_frame_flag: header.mbaff_frame_flag,
-            field_pic_flag: header.field_pic_flag,
-            bottom_field_flag: header.bottom_field_flag,
-            frame_height,
-        });
+        {
+            #[cfg(feature = "profile")]
+            let _profile_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::MbDecode);
+            let mut ctx = make_ctx!();
+            ctx.set_mb_layout(mb_idx, mb_x, mb_y);
+            ctx.decode_cavlc_mb(&mut reader, mb_idx, mb_x, mb_y, &params)?;
+            prev_mb_qp = ctx.prev_mb_qp;
+            last_qp_delta_nonzero = ctx.last_qp_delta_nonzero;
+        }
+        mb_idx += 1;
 
-        Ok(())
+        // CAVLC end-of-slice: spec says "while (more_rbsp_data())"
+        // after each MB. For single-slice, this naturally ends at
+        // total_mbs. For multi-slice, it stops at each slice boundary.
+        if !use_cabac && !reader.more_rbsp_data() {
+            break;
+        }
     }
+
+    // Post-loop: fill deblock info and ref POC table
+    let first_mb = if mbaff {
+        (header.first_mb_in_slice as usize) * 2
+    } else {
+        header.first_mb_in_slice as usize
+    };
+    #[cfg(feature = "profile")]
+    drop(loop_timer);
+    {
+        #[cfg(feature = "profile")]
+        let _profile_timer =
+            crate::profile::PhaseTimer::start(crate::profile::Phase::FinalizeMbInfo);
+        make_ctx!().finalize_mb_info(first_mb, mb_idx.min(total_mbs), &params);
+    }
+
+    // Store state back into pending PictureState.
+    // Deblocking and DPB insertion happen in finalize_pending().
+    Ok(PictureState {
+        frame,
+        frame_num: header.frame_num,
+        poc: current_poc,
+        nal_unit_type: plan.nal_unit_type,
+        nal_ref_idc: plan.nal_ref_idc,
+        nc_luma,
+        nc_cb,
+        nc_cr,
+        mv_store_l0,
+        mv_store_l1,
+        ref_idx_store_l0,
+        ref_poc_store_l0,
+        ref_idx_store_l1,
+        mvd_store,
+        mvd_store_l1,
+        mb_info,
+        i4x4_modes,
+        mb_cbp,
+        mb_chroma_pred,
+        mb_is_8x8dct,
+        mb_skip,
+        mb_is_direct,
+        blk_is_direct,
+        is_i16x16,
+        mb_slice_id,
+        current_slice_id,
+        prev_mb_qp,
+        last_qp_delta_nonzero,
+        mmco_ops: header.mmco_ops.clone(),
+        long_term_reference_flag: header.long_term_reference_flag,
+        is_intra_slice: header.slice_type == SliceType::I,
+        disable_deblocking_filter_idc: ps_deblock_idc,
+        slice_alpha_c0_offset_div2: ps_alpha,
+        slice_beta_offset_div2: ps_beta,
+        chroma_qp_index_offset: ps_chroma_qp_offset,
+        mb_width,
+        mb_height,
+        mb_field_decoding: _mb_field_decoding,
+        mbaff_frame_flag: header.mbaff_frame_flag,
+        field_pic_flag: header.field_pic_flag,
+        bottom_field_flag: header.bottom_field_flag,
+        frame_height,
+    })
+}
+
+/// Apply the in-loop deblocking filter to a fully decoded picture.
+pub(crate) fn deblock_picture(ps: &mut PictureState) {
+    #[cfg(feature = "profile")]
+    let _profile_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::Deblock);
+    deblock::filter_frame_mbaff(
+        &mut ps.frame,
+        &ps.mb_info,
+        ps.mb_width as usize,
+        ps.disable_deblocking_filter_idc,
+        ps.slice_alpha_c0_offset_div2,
+        ps.slice_beta_offset_div2,
+        ps.chroma_qp_index_offset,
+        ps.mbaff_frame_flag,
+    );
+}
+
+/// Build the DPB picture for a decoded (and deblocked) picture: the coded
+/// planes are copied, the motion data is moved out of `ps`.
+pub(crate) fn make_decoded_picture(ps: &mut PictureState) -> DecodedPicture {
+    DecodedPicture {
+        y: ps.frame.y.clone(),
+        u: ps.frame.u.clone(),
+        v: ps.frame.v.clone(),
+        width: ps.mb_width * 16,
+        height: (ps.frame.height.div_ceil(16)) * 16,
+        frame_num: ps.frame_num,
+        pic_order_cnt: ps.poc,
+        mv_l0: core::mem::take(&mut ps.mv_store_l0),
+        ref_idx_l0: core::mem::take(&mut ps.ref_idx_store_l0),
+        ref_poc_l0: core::mem::take(&mut ps.ref_poc_store_l0),
+        mv_l1: core::mem::take(&mut ps.mv_store_l1),
+        ref_idx_l1: core::mem::take(&mut ps.ref_idx_store_l1),
+        mb_width: ps.mb_width,
+        is_intra: ps.is_intra_slice,
+        structure: if ps.field_pic_flag {
+            if ps.bottom_field_flag {
+                crate::dpb::PictureStructure::BottomField
+            } else {
+                crate::dpb::PictureStructure::TopField
+            }
+        } else {
+            crate::dpb::PictureStructure::Frame
+        },
+    }
+}
+
+/// Decoded reference picture marking (spec 8.2.5) for a picture that has
+/// just been decoded: IDR handling, MMCO operations, insertion with sliding
+/// window marking, and MMCO 6 after insertion. `pic` only needs correct
+/// metadata (frame_num, POC, structure) for the DPB bookkeeping itself.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_reference_marking(
+    dpb: &mut Dpb,
+    pic: Arc<DecodedPicture>,
+    nal_unit_type: NalUnitType,
+    nal_ref_idc: u8,
+    frame_num: u32,
+    field_pic_flag: bool,
+    mmco_ops: &[(u32, u32)],
+    long_term_reference_flag: bool,
+) {
+    if nal_unit_type == NalUnitType::SliceIdr {
+        dpb.clear();
+    }
+
+    let reference = if nal_ref_idc > 0 {
+        if nal_unit_type == NalUnitType::SliceIdr && long_term_reference_flag {
+            ReferenceStatus::LongTerm(0) // IDR with long_term_reference_flag → LT idx 0
+        } else {
+            ReferenceStatus::ShortTerm
+        }
+    } else {
+        ReferenceStatus::Unused
+    };
+
+    // For MMCO, use CurrPicNum (= 2*frame_num+1 for field pictures)
+    let mmco_curr_pic_num = if field_pic_flag {
+        (frame_num * 2 + 1) as i32
+    } else {
+        frame_num as i32
+    };
+    for &(op, param) in mmco_ops {
+        match op {
+            1 => {
+                let pic_num_to_remove = mmco_curr_pic_num - ((param & 0xFFFF) as i32 + 1);
+                dpb.mark_short_term_unused(pic_num_to_remove as u32);
+            }
+            2 => {
+                dpb.mark_long_term_unused(param);
+            }
+            3 => {
+                let abs_diff_minus1 = param & 0xFFFF;
+                let long_term_frame_idx = param >> 16;
+                let pic_num = mmco_curr_pic_num - (abs_diff_minus1 as i32 + 1);
+                dpb.assign_long_term(pic_num as u32, long_term_frame_idx);
+            }
+            4 => {
+                dpb.set_max_long_term_frame_idx(param);
+            }
+            5 => {
+                // After op=5 the current picture is treated as frame_num 0;
+                // the encoder guarantees that, we only need the DPB cleared.
+                dpb.clear_all_refs();
+            }
+            6 => {
+                // Applied after insert (current pic must be in DPB first)
+            }
+            _ => {}
+        }
+    }
+
+    dpb.insert(pic, reference);
+
+    for &(op, param) in mmco_ops {
+        if op == 6 {
+            dpb.mark_current_as_long_term(param, frame_num);
+        }
+    }
+}
+
+/// Turn a finalized picture into an output frame: crop the coded (MB-aligned)
+/// planes to the display size and, for field pictures, interleave the two
+/// fields of a frame (`pending_field` holds the first field until its
+/// complement arrives). Returns `None` when nothing is ready for output.
+pub(crate) fn finish_output(
+    mut ps: PictureState,
+    pending_field: &mut Option<Frame>,
+) -> Option<Frame> {
+    #[cfg(feature = "profile")]
+    let _output_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::Output);
+
+    // Crop frame from coded dimensions (MB-aligned) to display dimensions
+    let coded_w = (ps.mb_width * 16) as usize;
+    if coded_w == 0 {
+        return None;
+    }
+    let coded_h = ps.frame.y.len() / coded_w;
+    let display_w = ps.frame.width as usize;
+    let display_h = ps.frame.height as usize;
+    if coded_w != display_w || coded_h != display_h {
+        // Ensure display dimensions don't exceed coded dimensions or frame buffer
+        if display_w > coded_w || display_h > coded_h || coded_w * coded_h > ps.frame.y.len() {
+            return None;
+        }
+        let chroma_coded_w = coded_w / 2;
+        let chroma_w = display_w / 2;
+        let chroma_h = display_h / 2;
+
+        if coded_w == display_w {
+            ps.frame.y.truncate(display_w * display_h);
+            ps.frame.u.truncate(chroma_w * chroma_h);
+            ps.frame.v.truncate(chroma_w * chroma_h);
+        } else {
+            // Luma: copy display_w pixels per row from coded_w-stride buffer
+            let mut y = vec![0u8; display_w * display_h];
+            for r in 0..display_h {
+                y[r * display_w..(r + 1) * display_w]
+                    .copy_from_slice(&ps.frame.y[r * coded_w..r * coded_w + display_w]);
+            }
+            let mut u = vec![0u8; chroma_w * chroma_h];
+            let mut v = vec![0u8; chroma_w * chroma_h];
+            for r in 0..chroma_h {
+                u[r * chroma_w..(r + 1) * chroma_w].copy_from_slice(
+                    &ps.frame.u[r * chroma_coded_w..r * chroma_coded_w + chroma_w],
+                );
+                v[r * chroma_w..(r + 1) * chroma_w].copy_from_slice(
+                    &ps.frame.v[r * chroma_coded_w..r * chroma_coded_w + chroma_w],
+                );
+            }
+            ps.frame.y = y;
+            ps.frame.u = u;
+            ps.frame.v = v;
+        }
+    }
+
+    // For field pictures, combine two fields into one frame for output
+    if ps.field_pic_flag {
+        let field_frame = ps.frame;
+        if let Some(first_field) = pending_field.take() {
+            // Second field arrived — combine into a full frame
+            let w = field_frame.width as usize;
+            let full_h = ps.frame_height as usize;
+            let field_h = full_h / 2;
+            let mut y = vec![0u8; w * full_h];
+            let mut u = vec![0u8; (w / 2) * (full_h / 2)];
+            let mut v = vec![0u8; (w / 2) * (full_h / 2)];
+            let cw = w / 2;
+
+            // The two fields must agree on geometry and hold enough samples;
+            // a corrupt stream can change SPS dimensions between fields.
+            let ch = full_h / 4;
+            let field_ok = |f: &Frame| {
+                f.width as usize == w
+                    && f.y.len() >= field_h * w
+                    && f.u.len() >= ch * cw
+                    && f.v.len() >= ch * cw
+            };
+            if w == 0 || full_h < 2 || !field_ok(&first_field) || !field_ok(&field_frame) {
+                // Drop the stale field and hold the current one instead.
+                *pending_field = Some(field_frame);
+                return None;
+            }
+
+            // Determine which is top and which is bottom
+            let (top, bot) = if ps.bottom_field_flag {
+                (&first_field, &field_frame)
+            } else {
+                (&field_frame, &first_field)
+            };
+
+            // Interleave luma lines: top→even, bottom→odd
+            for r in 0..field_h {
+                let src_off = r * w;
+                y[r * 2 * w..r * 2 * w + w].copy_from_slice(&top.y[src_off..src_off + w]);
+                y[(r * 2 + 1) * w..(r * 2 + 1) * w + w]
+                    .copy_from_slice(&bot.y[src_off..src_off + w]);
+            }
+            // Interleave chroma lines
+            for r in 0..ch {
+                let src_off = r * cw;
+                u[r * 2 * cw..r * 2 * cw + cw].copy_from_slice(&top.u[src_off..src_off + cw]);
+                u[(r * 2 + 1) * cw..(r * 2 + 1) * cw + cw]
+                    .copy_from_slice(&bot.u[src_off..src_off + cw]);
+                v[r * 2 * cw..r * 2 * cw + cw].copy_from_slice(&top.v[src_off..src_off + cw]);
+                v[(r * 2 + 1) * cw..(r * 2 + 1) * cw + cw]
+                    .copy_from_slice(&bot.v[src_off..src_off + cw]);
+            }
+
+            return Some(Frame {
+                y,
+                u,
+                v,
+                width: w as u32,
+                height: full_h as u32,
+                pic_order_cnt: field_frame.pic_order_cnt.min(first_field.pic_order_cnt),
+            });
+        } else {
+            // First field — hold it, return None
+            *pending_field = Some(field_frame);
+            return None;
+        }
+    }
+
+    Some(ps.frame)
 }
 
 /// H.264 decoder with built-in display-order reordering.

@@ -4,7 +4,7 @@
 //! Manages short-term reference marking via sliding window (spec 8.2.5.3).
 
 use alloc::collections::BTreeSet;
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::nal::NalUnitType;
@@ -30,7 +30,7 @@ pub enum PictureStructure {
     BottomField,
 }
 
-/// Immutable decoded picture data shared via Rc.
+/// Immutable decoded picture data shared via Arc.
 #[derive(Debug)]
 pub struct DecodedPicture {
     pub y: Vec<u8>,
@@ -58,9 +58,9 @@ pub struct DecodedPicture {
     pub structure: PictureStructure,
 }
 
-/// A DPB entry wrapping an Rc<DecodedPicture> with mutable status.
+/// A DPB entry wrapping an Arc<DecodedPicture> with mutable status.
 struct DpbEntry {
-    pic: Rc<DecodedPicture>,
+    pic: Arc<DecodedPicture>,
     reference: ReferenceStatus,
 }
 
@@ -97,7 +97,7 @@ impl Dpb {
 
     /// Insert a decoded picture into the DPB.
     /// Applies sliding window marking if needed (spec 8.2.5.3).
-    pub fn insert(&mut self, pic: Rc<DecodedPicture>, reference: ReferenceStatus) {
+    pub fn insert(&mut self, pic: Arc<DecodedPicture>, reference: ReferenceStatus) {
         // Sliding window only applies to short-term references (spec 8.2.5.3)
         if reference == ReferenceStatus::ShortTerm {
             // Don't evict the complementary field of the picture being inserted.
@@ -130,7 +130,7 @@ impl Dpb {
         &self,
         is_field_pic: bool,
         bottom_field_flag: bool,
-    ) -> Vec<Rc<DecodedPicture>> {
+    ) -> Vec<Arc<DecodedPicture>> {
         let mut refs: Vec<_> = self
             .entries
             .iter()
@@ -172,7 +172,7 @@ impl Dpb {
         current_poc: i32,
         is_field_pic: bool,
         bottom_field_flag: bool,
-    ) -> Vec<Rc<DecodedPicture>> {
+    ) -> Vec<Arc<DecodedPicture>> {
         let short_term: Vec<_> = self
             .entries
             .iter()
@@ -215,7 +215,7 @@ impl Dpb {
         current_poc: i32,
         is_field_pic: bool,
         bottom_field_flag: bool,
-    ) -> Vec<Rc<DecodedPicture>> {
+    ) -> Vec<Arc<DecodedPicture>> {
         let short_term: Vec<_> = self
             .entries
             .iter()
@@ -264,7 +264,7 @@ impl Dpb {
 
     /// For field pictures: within runs of entries sharing the same frame_num,
     /// put same-parity fields before opposite-parity (spec 8.2.4.2.5).
-    fn field_parity_interleave(list: &mut [Rc<DecodedPicture>], bottom_field_flag: bool) {
+    fn field_parity_interleave(list: &mut [Arc<DecodedPicture>], bottom_field_flag: bool) {
         let mut i = 0;
         while i < list.len() {
             let fn_val = list[i].frame_num;
@@ -293,7 +293,7 @@ impl Dpb {
     /// `is_field_pic`: true for field pictures (PicNum = 2*frame_num + parity_bit)
     /// `bottom_field_flag`: current field parity (only meaningful when is_field_pic)
     pub fn apply_ref_list_modification(
-        ref_list: &mut Vec<Rc<DecodedPicture>>,
+        ref_list: &mut Vec<Arc<DecodedPicture>>,
         ops: &[(u32, u32)],
         curr_pic_num: u32,
         max_pic_num: u32,
@@ -335,7 +335,7 @@ impl Dpb {
                     // Remove duplicate: entries after ref_idx_lx with same pic
                     let mut n = ref_idx_lx + 1;
                     for c in (ref_idx_lx + 1)..ref_list.len() {
-                        if !Rc::ptr_eq(&ref_list[c], &pic) {
+                        if !Arc::ptr_eq(&ref_list[c], &pic) {
                             ref_list[n] = ref_list[c].clone();
                             n += 1;
                         }
@@ -691,7 +691,7 @@ impl Dpb {
 
     /// Get list of long-term reference pictures, sorted by ascending long_term_frame_idx.
     /// Used to append to reference lists after short-term refs (spec 8.2.4.2.1, 8.2.4.2.3).
-    pub fn long_term_ref_list(&self) -> Vec<Rc<DecodedPicture>> {
+    pub fn long_term_ref_list(&self) -> Vec<Arc<DecodedPicture>> {
         let mut refs: Vec<_> = self
             .entries
             .iter()
@@ -715,8 +715,8 @@ impl Dpb {
 mod tests {
     use super::*;
 
-    fn make_pic(frame_num: u32, poc: i32) -> Rc<DecodedPicture> {
-        Rc::new(DecodedPicture {
+    fn make_pic(frame_num: u32, poc: i32) -> Arc<DecodedPicture> {
+        Arc::new(DecodedPicture {
             y: vec![],
             u: vec![],
             v: vec![],

@@ -164,6 +164,14 @@ impl BitstreamReader {
         }
     }
 
+    /// Move the read cursor to a `(byte_offset, bit_offset)` previously
+    /// returned by [`position`](Self::position). Offsets past the end of the
+    /// data are clamped, so a stale position cannot cause out-of-bounds reads.
+    pub fn set_position(&mut self, pos: (usize, u8)) {
+        self.byte_offset = pos.0.min(self.data_len);
+        self.bit_offset = pos.1 & 7;
+    }
+
     pub fn position(&self) -> (usize, u8) {
         (self.byte_offset, self.bit_offset)
     }
