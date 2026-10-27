@@ -469,6 +469,15 @@ impl Dpb {
         refs
     }
 
+    /// Every short-term reference picture (frame or field), in no particular order.
+    pub fn short_term_refs(&self) -> Vec<Arc<DecodedPicture>> {
+        self.entries
+            .iter()
+            .filter(|e| e.reference == ReferenceStatus::ShortTerm)
+            .map(|e| e.pic.clone())
+            .collect()
+    }
+
     /// Build ref_pic_list_0 for B slices (spec 8.2.4.2.3 / 8.2.4.2.5).
     /// Short-term refs with POC < current sorted by descending POC,
     /// then refs with POC > current sorted by ascending POC.
@@ -598,6 +607,10 @@ impl Dpb {
     /// `max_pic_num`: MaxPicNum (= MaxFrameNum for frames, 2*MaxFrameNum for fields)
     /// `is_field_pic`: true for field pictures (PicNum = 2*frame_num + parity_bit)
     /// `bottom_field_flag`: current field parity (only meaningful when is_field_pic)
+    /// `short_term`: every short-term reference picture. A command can name one
+    /// that the initial list had no room for, or that an earlier command pushed
+    /// out of it (spec 8.2.4.3.1 picks from all short-term references).
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_ref_list_modification(
         ref_list: &mut Vec<Arc<DecodedPicture>>,
         ops: &[(u32, u32)],
@@ -605,6 +618,7 @@ impl Dpb {
         max_pic_num: u32,
         is_field_pic: bool,
         bottom_field_flag: bool,
+        short_term: &[Arc<DecodedPicture>],
     ) {
         if ops.is_empty() || ref_list.is_empty() {
             return;
@@ -689,9 +703,7 @@ impl Dpb {
                     p.frame_num == pic_num
                 }
             };
-            if let Some(found_pos) = ref_list.iter().position(|p| pic_num_match(p)) {
-                let pic = ref_list[found_pos].clone();
-
+            if let Some(pic) = short_term.iter().find(|p| pic_num_match(p)).cloned() {
                 // Shift right: make room at ref_idx_lx
                 // Temporarily grow the list by 1
                 ref_list.push(ref_list.last().unwrap().clone());
@@ -1151,6 +1163,28 @@ mod tests {
         // With val=0 → abs_diff=1 → pic_num = pred - 1
         let ops: Vec<(u32, u32)> = (0..10).map(|_| (0u32, 0u32)).collect();
         // This must not panic
-        Dpb::apply_ref_list_modification(&mut ref_list, &ops, 5, 16, false, false);
+        let short_term = ref_list.clone();
+        Dpb::apply_ref_list_modification(&mut ref_list, &ops, 5, 16, false, false, &short_term);
+    }
+
+    #[test]
+    fn test_rplm_finds_a_reference_pushed_out_of_the_list() {
+        // x264's weightp puts the same reference at indices 0 and 1 (with
+        // different weights). With four references and four active entries,
+        // the duplicate pushes the last of the initial list out, and the
+        // final command then names it: it has to come from the DPB, not the
+        // list. frame_num has wrapped at 16; the current picture's is 2.
+        let short_term = [
+            make_pic(1, 62),
+            make_pic(0, 66),
+            make_pic(15, 54),
+            make_pic(14, 58),
+        ];
+        // The initial list, by descending FrameNumWrap: 1, 0, 15, 14
+        let mut ref_list = short_term.to_vec();
+        let ops = [(0, 1), (0, 15), (1, 0), (0, 2)];
+        Dpb::apply_ref_list_modification(&mut ref_list, &ops, 2, 16, false, false, &short_term);
+        let nums: Vec<u32> = ref_list.iter().map(|p| p.frame_num).collect();
+        assert_eq!(nums, [0, 0, 1, 14]);
     }
 }

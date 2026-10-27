@@ -444,6 +444,8 @@ pub(crate) fn prepare_slice(
     };
 
     // Apply ref_pic_list_modification (spec 8.2.4.3)
+    // A command may name any short-term reference, not only one in the list.
+    let short_term = dpb.short_term_refs();
     if is_p_slice && !header.ref_list_mod_l0.is_empty() {
         Dpb::apply_ref_list_modification(
             &mut ref_pic_list,
@@ -452,6 +454,7 @@ pub(crate) fn prepare_slice(
             max_pic_num,
             is_field_pic,
             header.bottom_field_flag,
+            &short_term,
         );
     }
     if is_b_slice && !header.ref_list_mod_l0.is_empty() {
@@ -462,6 +465,7 @@ pub(crate) fn prepare_slice(
             max_pic_num,
             is_field_pic,
             header.bottom_field_flag,
+            &short_term,
         );
     }
     if is_b_slice && !header.ref_list_mod_l1.is_empty() {
@@ -472,6 +476,7 @@ pub(crate) fn prepare_slice(
             max_pic_num,
             is_field_pic,
             header.bottom_field_flag,
+            &short_term,
         );
     }
 
