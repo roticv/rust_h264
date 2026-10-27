@@ -191,8 +191,10 @@ fn filter_frame_inner(
 
     let filter_offset_a = slice_alpha_c0_offset_div2.wrapping_mul(2);
     let filter_offset_b = slice_beta_offset_div2.wrapping_mul(2);
-    let stride_y = frame.width as usize;
-    let stride_c = (frame.width / 2) as usize;
+    // The frame is still at its coded size here (cropping happens on output),
+    // so a row is mb_width MBs long whatever frame.width says
+    let stride_y = mb_width * 16;
+    let stride_c = mb_width * 8;
 
     // 4x4 block index layout within an MB (raster scan):
     //  0  1  4  5
@@ -1004,6 +1006,48 @@ mod tests {
             assert!(plane[row * stride + 3] > 100, "p0 should increase");
             assert!(plane[row * stride + 4] < 200, "q0 should decrease");
         }
+    }
+
+    /// Two macroblocks side by side, coded 32 columns wide, with a step at x = 16,
+    /// that say they're `width` wide once cropped.
+    fn two_mb_frame(width: u32) -> Frame {
+        let mut y = vec![0u8; 32 * 16];
+        for row in 0..16 {
+            for col in 0..32 {
+                y[row * 32 + col] = if col < 16 { 100 } else { 120 };
+            }
+        }
+        Frame {
+            width,
+            height: 16,
+            y,
+            u: vec![128; 16 * 8],
+            v: vec![128; 16 * 8],
+            pic_order_cnt: 0,
+        }
+    }
+
+    #[test]
+    fn test_cropped_frame_is_filtered_at_its_coded_width() {
+        // Cropping happens on output: until then the planes are laid out at the
+        // coded width, so a frame cropped to 22 columns must be filtered exactly
+        // like the uncropped one.
+        let mb = MbInfo {
+            mb_type: MbType::Intra,
+            qp_y: 40,
+            ..Default::default()
+        };
+        let mbs = [mb.clone(), mb];
+        let mut whole = two_mb_frame(32);
+        let mut cropped = two_mb_frame(22);
+        filter_frame_params(&mut whole, &mbs, 2, 0, 0, 0, 0);
+        filter_frame_params(&mut cropped, &mbs, 2, 0, 0, 0, 0);
+        assert_ne!(
+            whole.y,
+            two_mb_frame(32).y,
+            "the edge between the MBs is filtered"
+        );
+        assert_eq!(cropped.y, whole.y);
     }
 
     #[test]
