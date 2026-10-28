@@ -7,7 +7,6 @@ use crate::cavlc::parse_residual_block_cavlc;
 use crate::deblock::{MbInfo, MbType};
 use crate::error::DecodeError;
 use crate::inter_pred;
-use crate::intra_pred::predict_chroma_8x8;
 use crate::mv_pred::{predict_mv, predict_mv_sub, ref_pic_safe, MbaffCtx};
 use crate::neighbor::{compute_nc, dequant_4x4_ac_raster, predict_i4x4_mode};
 use crate::residual::{
@@ -1848,9 +1847,8 @@ impl SliceContext<'_> {
         let above_mb_avail = self
             .above_mb(mb_idx)
             .is_some_and(|above| self.is_intra_neighbor_avail(above, sp));
-        let left_mb_avail = self
-            .left_mb(mb_idx)
-            .is_some_and(|left| self.is_intra_neighbor_avail(left, sp));
+        let left_halves = self.left_intra_avail(mb_idx, sp);
+        let left_mb_avail = left_halves[0] && left_halves[1];
         let above_left_mb_avail = self.intra_corner_avail(mb_idx, -1, -1, sp);
         let above_right_mb_avail = self.intra_corner_avail(mb_idx, 16, -1, sp);
 
@@ -1978,7 +1976,7 @@ impl SliceContext<'_> {
                         pred_modes[i8x8 * 4],
                         &luma_residual,
                         above_mb_avail,
-                        left_mb_avail,
+                        left_halves,
                         above_left_mb_avail,
                         above_right_mb_avail,
                     );
@@ -2028,7 +2026,7 @@ impl SliceContext<'_> {
                         pred_modes[blk],
                         &block_coeffs,
                         above_mb_avail,
-                        left_mb_avail,
+                        left_halves,
                         above_left_mb_avail,
                         above_right_mb_avail,
                     );
@@ -2296,7 +2294,7 @@ impl SliceContext<'_> {
             } else {
                 None
             };
-            let left_c: Option<Vec<u8>> = if chroma_mb_x > 0 && left_mb_avail {
+            let left_c: Option<Vec<u8>> = if chroma_mb_x > 0 && (left_halves[0] || left_halves[1]) {
                 Some(
                     (0..8)
                         .map(|y| plane_buf[cbase + y * cstride + chroma_mb_x - 1])
@@ -2311,10 +2309,11 @@ impl SliceContext<'_> {
                 None
             };
 
-            predict_chroma_8x8(
+            crate::intra_pred::predict_chroma_8x8_halves(
                 intra_chroma_pred_mode,
                 above_c.as_deref(),
                 left_c.as_deref(),
+                left_halves,
                 above_left_c,
                 &mut chroma_pred,
             );

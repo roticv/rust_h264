@@ -5,7 +5,9 @@ use alloc::vec::Vec;
 use crate::bitstream::BitstreamReader;
 use crate::deblock::{self, MbInfo, MbType};
 use crate::decode_cabac::CabacMbResult;
-use crate::dpb::{DecodedPicture, Dpb, Motion, PictureMeta, PictureWriter, ReferenceStatus};
+use crate::dpb::{
+    DecodedPicture, Dpb, Motion, PictureMeta, PictureStructure, PictureWriter, ReferenceStatus,
+};
 use crate::error::DecodeError;
 use crate::mv_pred::WeightContext;
 use crate::nal::{NalUnit, NalUnitType};
@@ -1525,29 +1527,52 @@ pub(crate) fn apply_reference_marking(
         frame_num as i32
     };
     // A command names a picture by PicNum, counted back from CurrPicNum
-    // (spec 8.2.5.4.1), negative for a frame once frame_num has wrapped.
-    // Field pictures keep their previous mapping.
+    // (spec 8.2.5.4.1), negative for a frame once frame_num has wrapped. In
+    // a field picture PicNum is 2 * FrameNumWrap + 1 for a field of the
+    // current parity and 2 * FrameNumWrap for the other (spec 8.2.4.1);
+    // LongTermPicNum likewise with LongTermFrameIdx.
+    let current_parity = pic.structure;
+    let field_of = |num: i32| -> Option<PictureStructure> {
+        field_pic_flag.then(|| {
+            if num & 1 == 1 {
+                current_parity
+            } else if current_parity == PictureStructure::TopField {
+                PictureStructure::BottomField
+            } else {
+                PictureStructure::TopField
+            }
+        })
+    };
     let frame_num_of = |pic_num: i32| -> u32 {
-        if field_pic_flag {
-            pic_num as u32
+        let wrap = if field_pic_flag {
+            pic_num.div_euclid(2)
         } else {
-            Dpb::frame_num_for_pic_num(pic_num, max_frame_num)
-        }
+            pic_num
+        };
+        Dpb::frame_num_for_pic_num(wrap, max_frame_num)
     };
     for &(op, param) in mmco_ops {
         match op {
             1 => {
                 let pic_num_to_remove = mmco_curr_pic_num - ((param & 0xFFFF) as i32 + 1);
-                dpb.mark_short_term_unused(frame_num_of(pic_num_to_remove));
+                dpb.mark_short_term_unused(
+                    frame_num_of(pic_num_to_remove),
+                    field_of(pic_num_to_remove),
+                );
             }
             2 => {
-                dpb.mark_long_term_unused(param);
+                let idx = if field_pic_flag { param / 2 } else { param };
+                dpb.mark_long_term_unused(idx, field_of(param as i32));
             }
             3 => {
                 let abs_diff_minus1 = param & 0xFFFF;
                 let long_term_frame_idx = param >> 16;
                 let pic_num = mmco_curr_pic_num - (abs_diff_minus1 as i32 + 1);
-                dpb.assign_long_term(frame_num_of(pic_num), long_term_frame_idx);
+                dpb.assign_long_term(
+                    frame_num_of(pic_num),
+                    field_of(pic_num),
+                    long_term_frame_idx,
+                );
             }
             4 => {
                 dpb.set_max_long_term_frame_idx(param);

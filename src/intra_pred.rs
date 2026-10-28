@@ -273,6 +273,54 @@ pub fn predict_intra_4x4(
 
 /// Chroma 8x8 intra prediction (H.264 spec 8.3.4).
 /// `mode`: 0=DC, 1=horizontal, 2=vertical, 3=plane.
+/// Chroma intra prediction when only part of the left column may be
+/// available (MBAFF with constrained intra prediction, where the left
+/// samples of the upper and lower halves come from different MBs):
+/// `left_avail` covers rows 0-3 and 4-7. DC then follows spec 8.3.4.1-3
+/// per 4x4 block; other modes need the whole column.
+pub fn predict_chroma_8x8_halves(
+    mode: u8,
+    above: Option<&[u8]>,
+    left: Option<&[u8]>,
+    left_avail: [bool; 2],
+    above_left: Option<u8>,
+    output: &mut [u8; 64],
+) {
+    let left = left.filter(|_| left_avail[0] || left_avail[1]);
+    let (Some(l), true) = (left, mode == 0 && left_avail[0] != left_avail[1]) else {
+        let left = left.filter(|_| left_avail[0] && left_avail[1]);
+        predict_chroma_8x8(mode, above, left, above_left, output);
+        return;
+    };
+    let mean = |v: &[u8]| -> u32 { v.iter().map(|&x| x as u32).sum() };
+    let l_half = |h: usize| left_avail[h].then(|| &l[4 * h..4 * h + 4]);
+    let a_half = |h: usize| above.map(|a| &a[4 * h..4 * h + 4]);
+    // (xO, yO) = (0,0) and (4,4): both, else left, else above;
+    // (4,0): above, else left; (0,4): left, else above
+    let both = |a: Option<&[u8]>, l: Option<&[u8]>| -> u8 {
+        match (a, l) {
+            (Some(a), Some(l)) => ((mean(a) + mean(l) + 4) >> 3) as u8,
+            (None, Some(l)) => ((mean(l) + 2) >> 2) as u8,
+            (Some(a), None) => ((mean(a) + 2) >> 2) as u8,
+            (None, None) => 128,
+        }
+    };
+    let first = |x: Option<&[u8]>, y: Option<&[u8]>| -> u8 {
+        x.or(y).map_or(128, |v| ((mean(v) + 2) >> 2) as u8)
+    };
+    let blocks = [
+        both(a_half(0), l_half(0)),
+        first(a_half(1), l_half(0)),
+        first(l_half(1), a_half(0)),
+        both(a_half(1), l_half(1)),
+    ];
+    for row in 0..8 {
+        for col in 0..8 {
+            output[row * 8 + col] = blocks[(row / 4) * 2 + col / 4];
+        }
+    }
+}
+
 pub fn predict_chroma_8x8(
     mode: u8,
     above: Option<&[u8]>, // 8 pixels from row above

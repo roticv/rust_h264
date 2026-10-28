@@ -223,9 +223,8 @@ impl SliceContext<'_> {
                 let above_mb_avail = self
                     .above_mb(mb_idx)
                     .is_some_and(|above| self.is_intra_neighbor_avail(above, sp));
-                let left_mb_avail = self
-                    .left_mb(mb_idx)
-                    .is_some_and(|left| self.is_intra_neighbor_avail(left, sp));
+                let left_halves = self.left_intra_avail(mb_idx, sp);
+                let left_mb_avail = left_halves[0] && left_halves[1];
                 let above_left_mb_avail = self.intra_corner_avail(mb_idx, -1, -1, sp);
                 let above_right_mb_avail = self.intra_corner_avail(mb_idx, 16, -1, sp);
 
@@ -350,7 +349,7 @@ impl SliceContext<'_> {
                                 pred_modes[i8x8 * 4],
                                 &luma_residual,
                                 above_mb_avail,
-                                left_mb_avail,
+                                left_halves,
                                 above_left_mb_avail,
                                 above_right_mb_avail,
                             );
@@ -417,7 +416,7 @@ impl SliceContext<'_> {
                                 pred_modes[blk],
                                 &block_coeffs,
                                 above_mb_avail,
-                                left_mb_avail,
+                                left_halves,
                                 above_left_mb_avail,
                                 above_right_mb_avail,
                             );
@@ -432,7 +431,7 @@ impl SliceContext<'_> {
                         mb_x,
                         intra_chroma_pred_mode,
                         above_mb_avail,
-                        left_mb_avail,
+                        left_halves,
                         above_left_mb_avail,
                     );
 
@@ -742,7 +741,7 @@ impl SliceContext<'_> {
                         mb_x,
                         intra_chroma_pred_mode,
                         above_mb_avail,
-                        left_mb_avail,
+                        left_halves,
                         above_left_mb_avail,
                     );
 
@@ -3329,7 +3328,8 @@ impl SliceContext<'_> {
 
         // Cross-slice intra prediction: neighbors from other slices unavailable (spec 6.4.1)
         let above_mb_avail_i = self.above_mb(mb_idx).is_some();
-        let left_mb_avail_i = self.left_mb(mb_idx).is_some();
+        let left_halves = self.left_intra_avail(mb_idx, sp);
+        let left_mb_avail_i = left_halves[0] && left_halves[1];
         let above_left_mb_avail_i = self.intra_corner_avail(mb_idx, -1, -1, sp);
 
         // I_PCM via CABAC
@@ -3466,7 +3466,6 @@ impl SliceContext<'_> {
             self.prev_mb_qp = qp_y;
             let _qp_c = chroma_qp(qp_y, sp.chroma_qp_index_offset);
             let above_mb_avail = above_mb_avail_i;
-            let left_mb_avail = left_mb_avail_i;
             let above_left_mb_avail = above_left_mb_avail_i;
             let above_right_mb_avail = self.intra_corner_avail(mb_idx, 16, -1, sp);
             if use_8x8_intra {
@@ -3510,7 +3509,7 @@ impl SliceContext<'_> {
                         pred_modes[i8x8 * 4],
                         &luma_residual,
                         above_mb_avail,
-                        left_mb_avail,
+                        left_halves,
                         above_left_mb_avail,
                         above_right_mb_avail,
                     );
@@ -3577,7 +3576,7 @@ impl SliceContext<'_> {
                         pred_modes[blk],
                         &block_coeffs,
                         above_mb_avail,
-                        left_mb_avail,
+                        left_halves,
                         above_left_mb_avail,
                         above_right_mb_avail,
                     );
@@ -3594,7 +3593,7 @@ impl SliceContext<'_> {
                 mb_x,
                 intra_chroma_pred_mode,
                 above_mb_avail,
-                left_mb_avail,
+                left_halves,
                 above_left_mb_avail,
             );
 
@@ -3886,7 +3885,7 @@ impl SliceContext<'_> {
                 mb_x,
                 intra_chroma_pred_mode,
                 above_mb_avail_i,
-                left_mb_avail_i,
+                left_halves,
                 above_left_mb_avail_i,
             );
 

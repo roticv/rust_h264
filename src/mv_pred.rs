@@ -450,6 +450,12 @@ pub(crate) enum ColKind {
     /// Field picture, co-located frame (Frm_To_Fld, or a field MB pair of
     /// an MBAFF frame)
     FieldFromFrame,
+    /// Field MB of an MBAFF frame, co-located field of a field pair (the
+    /// field of the MB's parity, no vertical scaling)
+    MbaffFieldFromField,
+    /// Field picture, co-located field MB pair of an MBAFF frame (the MB of
+    /// the current parity, no vertical scaling)
+    FieldFromMbaffField,
 }
 
 /// The co-located picture whose motion direct mode reads, the index of
@@ -475,7 +481,32 @@ pub(crate) fn locate_colocated<'a>(
     let (mb_x, mb_y) = (mb_idx % w, mb_idx / w);
     let (x8, y8) = ((blk / 4) & 1, blk / 8);
     match &col_pic.view_source {
-        Some(ViewSource::Pair(fields)) if !mctx.mbaff => {
+        Some(ViewSource::Pair(fields)) if mctx.mbaff => {
+            // MBAFF frame over a field pair: the fields hold the motion in
+            // MB pair positions (field MB row = pair row)
+            let pair = mb_idx / 2;
+            let bottom = mb_idx % 2;
+            if mctx.mb_field_decoding[pair] {
+                const INFERENCE_MAP: [usize; 4] = [0, 5, 10, 15];
+                let b = if direct_8x8_inference_flag {
+                    INFERENCE_MAP[blk / 4]
+                } else {
+                    blk
+                };
+                return (&fields[bottom], pair * 16 + b, ColKind::MbaffFieldFromField);
+            }
+            let [top, bot] = fields;
+            let parity = ((top.pic_order_cnt as i64 - cur_poc as i64).abs()
+                >= (bot.pic_order_cnt as i64 - cur_poc as i64).abs())
+                as usize;
+            let row = 2 * bottom + y8;
+            (
+                &fields[parity],
+                pair * 16 + OFFSET_TO_BLOCK[row][3 * x8],
+                ColKind::FrameFromField,
+            )
+        }
+        Some(ViewSource::Pair(fields)) => {
             let [top, bottom] = fields;
             let parity = ((top.pic_order_cnt as i64 - cur_poc as i64).abs()
                 >= (bottom.pic_order_cnt as i64 - cur_poc as i64).abs())
@@ -501,7 +532,7 @@ pub(crate) fn locate_colocated<'a>(
                     } else {
                         blk
                     };
-                    return (frame, col_mb * 16 + b, ColKind::Same);
+                    return (frame, col_mb * 16 + b, ColKind::FieldFromMbaffField);
                 }
                 let col_mb = 2 * pair + y8;
                 return (
@@ -874,6 +905,7 @@ pub(crate) fn derive_temporal_direct_blk(
         })
         .unwrap_or(0);
     let (cur_field, col_field) = match kind {
+        ColKind::MbaffFieldFromField | ColKind::FieldFromMbaffField => (true, true),
         ColKind::FrameFromField => (false, true),
         ColKind::FieldFromFrame => (true, false),
         ColKind::Same => (
@@ -886,7 +918,40 @@ pub(crate) fn derive_temporal_direct_blk(
                     .unwrap_or(false),
         ),
     };
-    let (ref0, poc, poc0, poc1) = if kind == ColKind::FrameFromField {
+    let (ref0, poc, poc0, poc1) = if kind == ColKind::FieldFromMbaffField {
+        // The co-located MB's field ref_idx names a field of frame entry
+        // `col_ref_poc`: same parity as that MB when even, else the other
+        let parity = if cur_bottom ^ (col_ref & 1 != 0) {
+            PictureStructure::BottomField
+        } else {
+            PictureStructure::TopField
+        };
+        let ref0 = ref_pic_list_l0
+            .iter()
+            .position(|p| p.structure == parity && frame_poc_of(p, ref_pic_list_l0) == col_ref_poc)
+            .unwrap_or(0);
+        let poc0 = ref_pic_list_l0.get(ref0).map_or(0, |p| p.pic_order_cnt);
+        (ref0, current_poc, poc0, col_pic.pic_order_cnt)
+    } else if kind == ColKind::MbaffFieldFromField {
+        // The referenced field, as a field ref_idx of this MB: frame entry
+        // i, same parity first (2 * i) then the other (2 * i + 1)
+        let (field_poc, ref_bottom) = (col_ref_poc >> 1, (col_ref_poc & 1) as usize);
+        let parity = mb_idx % 2;
+        let i = ref_pic_list_l0
+            .iter()
+            .position(|p| p.field_poc[ref_bottom] == field_poc)
+            .unwrap_or(0);
+        let k = 2 * i + (ref_bottom != parity) as usize;
+        let poc0 = ref_pic_list_l0
+            .get(i)
+            .map_or(0, |p| p.field_poc[ref_bottom]);
+        (
+            k,
+            current_field_poc[parity],
+            poc0,
+            col_pic.field_poc[parity],
+        )
+    } else if kind == ColKind::FrameFromField {
         // The frame (or field pair) holding the referenced field
         let (field_poc, bottom) = (col_ref_poc >> 1, (col_ref_poc & 1) as usize);
         let ref0 = ref_pic_list_l0
@@ -938,7 +1003,12 @@ pub(crate) fn derive_temporal_direct_blk(
 
     let td = (poc1 - poc0).clamp(-128, 127);
     // A long-term reference is not scaled: mvL0 = mvCol, mvL1 = 0
-    let long_term = long_term_l0.get(frame_idx).copied().unwrap_or(false);
+    let list_idx = if mctx.mbaff && cur_field {
+        ref0 / 2
+    } else {
+        ref0
+    };
+    let long_term = long_term_l0.get(list_idx).copied().unwrap_or(false);
     let scale = if td == 0 || long_term {
         256
     } else {

@@ -63,6 +63,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     co-located motion across the two structures (spec Table 8-6).
   - Field pictures whose fields share a POC confused the two fields in
     temporal direct mode and in deblocking.
+  - Direct mode between MBAFF frames and field pictures: an MBAFF frame
+    over a field pair, and a field picture over the field macroblocks of an
+    MBAFF frame, read the wrong co-located block or reference.
+  - With constrained intra prediction in MBAFF frames, the left samples of
+    a macroblock's upper and lower halves can come from different
+    macroblocks; intra prediction now checks each half (spec 8.3.1.2,
+    8.3.4).
+  - MMCO commands in field pictures read PicNum and LongTermPicNum as
+    frame numbers instead of naming a field; one long-term index given to
+    both fields of a frame dropped the first; and commands naming a frame
+    decoded as two fields changed only one of them.
+  - The sliding window counted a long-term frame and a later short-term
+    frame with the same frame_num (after it wrapped) as one frame.
 - Temporal direct mode used no motion when the co-located block predicted from
   list 1 only, and identified the co-located references of a multi-slice
   picture through the last slice's reference list.

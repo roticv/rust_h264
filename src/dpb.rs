@@ -1256,15 +1256,19 @@ impl Dpb {
         let max = self.max_ref_frames.max(1);
         while self.max_ref_frames > 0 {
             // Total ref count includes both short-term and long-term (spec 8.2.5.3).
-            // For field pictures, two fields from the same frame_num count as ONE
-            // toward the limit. Count distinct frame_nums among reference entries.
-            let mut seen_frame_nums = BTreeSet::new();
+            // For field pictures, two fields of a frame count as ONE toward
+            // the limit: count distinct short-term frame_nums and long-term
+            // frame indices (a long-term frame may share its frame_num with
+            // a later short-term one once frame_num wraps).
+            let mut seen_frames = BTreeSet::new();
             for e in &self.entries {
-                if e.reference != ReferenceStatus::Unused {
-                    seen_frame_nums.insert(e.pic.frame_num);
-                }
+                match e.reference {
+                    ReferenceStatus::ShortTerm => seen_frames.insert((false, e.pic.frame_num)),
+                    ReferenceStatus::LongTerm(idx) => seen_frames.insert((true, idx)),
+                    ReferenceStatus::Unused => false,
+                };
             }
-            let total_ref_count = seen_frame_nums.len();
+            let total_ref_count = seen_frames.len();
             if total_ref_count < max {
                 break;
             }
@@ -1296,23 +1300,51 @@ impl Dpb {
         pic_num.rem_euclid(max_frame_num.max(1) as i32) as u32
     }
 
-    /// Mark a short-term reference as unused by frame_num (MMCO op=1).
-    pub fn mark_short_term_unused(&mut self, frame_num: u32) {
+    /// Whether `pic` is the picture an MMCO names: the frame `frame_num`,
+    /// or with `field` set, that field of it (a frame entry stands for
+    /// both its fields).
+    fn names(pic: &DecodedPicture, frame_num: u32, field: Option<PictureStructure>) -> bool {
+        pic.frame_num == frame_num
+            && field.is_none_or(|f| pic.structure == f || pic.structure == PictureStructure::Frame)
+    }
+
+    /// The other field of the pair `pic` (a field) belongs to, if `other`
+    /// is it: a long-term index shared with it is kept (spec 8.2.5.4.3).
+    fn is_pair_field(pic: &DecodedPicture, other: &DecodedPicture) -> bool {
+        pic.structure != PictureStructure::Frame
+            && other.structure != PictureStructure::Frame
+            && other.structure != pic.structure
+            && other.frame_num == pic.frame_num
+    }
+
+    /// Mark a short-term reference as unused by frame_num, or one field of
+    /// it with `field` set (MMCO op=1).
+    pub fn mark_short_term_unused(&mut self, frame_num: u32, field: Option<PictureStructure>) {
         for entry in &mut self.entries {
-            if entry.reference == ReferenceStatus::ShortTerm && entry.pic.frame_num == frame_num {
+            if entry.reference == ReferenceStatus::ShortTerm
+                && Self::names(&entry.pic, frame_num, field)
+            {
+                // Both fields of a frame stored as a field pair
                 entry.reference = ReferenceStatus::Unused;
-                break;
             }
         }
         self.remove_unused();
     }
 
-    /// Mark a long-term reference as unused by long_term_pic_num (MMCO op=2).
-    pub fn mark_long_term_unused(&mut self, long_term_pic_num: u32) {
+    /// Mark a long-term reference as unused by LongTermFrameIdx, or one
+    /// field of it with `field` set (MMCO op=2).
+    pub fn mark_long_term_unused(
+        &mut self,
+        long_term_frame_idx: u32,
+        field: Option<PictureStructure>,
+    ) {
         for entry in &mut self.entries {
-            if entry.reference == ReferenceStatus::LongTerm(long_term_pic_num) {
+            if entry.reference == ReferenceStatus::LongTerm(long_term_frame_idx)
+                && field.is_none_or(|f| {
+                    entry.pic.structure == f || entry.pic.structure == PictureStructure::Frame
+                })
+            {
                 entry.reference = ReferenceStatus::Unused;
-                break;
             }
         }
         self.remove_unused();
@@ -1320,19 +1352,34 @@ impl Dpb {
 
     /// Assign a short-term reference to long-term with given index (MMCO op=3).
     /// First marks any existing long-term with the same index as unused.
-    pub fn assign_long_term(&mut self, frame_num: u32, long_term_frame_idx: u32) {
-        // Remove any existing long-term with this index
+    pub fn assign_long_term(
+        &mut self,
+        frame_num: u32,
+        field: Option<PictureStructure>,
+        long_term_frame_idx: u32,
+    ) {
+        // The named frame (both fields, when stored as a field pair) or field
+        let targets: Vec<usize> = (0..self.entries.len())
+            .filter(|&i| {
+                let e = &self.entries[i];
+                e.reference == ReferenceStatus::ShortTerm && Self::names(&e.pic, frame_num, field)
+            })
+            .collect();
+        let Some(&first) = targets.first() else {
+            return;
+        };
+        // Remove any other long-term with this index, except the other
+        // field of the same frame
+        let pic = Arc::clone(&self.entries[first].pic);
         for entry in &mut self.entries {
-            if entry.reference == ReferenceStatus::LongTerm(long_term_frame_idx) {
+            if entry.reference == ReferenceStatus::LongTerm(long_term_frame_idx)
+                && !Self::is_pair_field(&pic, &entry.pic)
+            {
                 entry.reference = ReferenceStatus::Unused;
             }
         }
-        // Convert the short-term ref to long-term
-        for entry in &mut self.entries {
-            if entry.reference == ReferenceStatus::ShortTerm && entry.pic.frame_num == frame_num {
-                entry.reference = ReferenceStatus::LongTerm(long_term_frame_idx);
-                break;
-            }
+        for i in targets {
+            self.entries[i].reference = ReferenceStatus::LongTerm(long_term_frame_idx);
         }
         self.remove_unused();
     }
@@ -1379,9 +1426,15 @@ impl Dpb {
     /// Called after the picture is decoded and inserted into DPB.
     /// The picture must already be in the DPB as ShortTerm.
     pub fn mark_current_as_long_term(&mut self, long_term_frame_idx: u32, frame_num: u32) {
-        // Remove any existing long-term with this index
+        // Remove any existing long-term with this index, except the first
+        // field of the current picture's frame
+        let current = self.entries.last().map(|e| Arc::clone(&e.pic));
         for entry in &mut self.entries {
-            if entry.reference == ReferenceStatus::LongTerm(long_term_frame_idx) {
+            if entry.reference == ReferenceStatus::LongTerm(long_term_frame_idx)
+                && !current
+                    .as_ref()
+                    .is_some_and(|c| Self::is_pair_field(c, &entry.pic))
+            {
                 entry.reference = ReferenceStatus::Unused;
             }
         }
@@ -1561,7 +1614,7 @@ mod tests {
             dpb.insert(make_pic(frame_num, poc), ReferenceStatus::ShortTerm);
         }
         assert_eq!(Dpb::frame_num_for_pic_num(1 - 3, 16), 14);
-        dpb.mark_short_term_unused(Dpb::frame_num_for_pic_num(1 - 3, 16));
+        dpb.mark_short_term_unused(Dpb::frame_num_for_pic_num(1 - 3, 16), None);
         let mut left: Vec<u32> = dpb
             .short_term_refs(false)
             .iter()

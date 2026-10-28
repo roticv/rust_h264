@@ -47,7 +47,7 @@ pub(crate) struct SliceParams<'a> {
 use crate::dpb::{DecodedPicture, PictureStructure};
 use crate::inter_pred;
 use crate::intra_pred::{
-    predict_chroma_8x8, predict_intra_16x16, predict_intra_4x4, predict_intra_8x8,
+    predict_chroma_8x8_halves, predict_intra_16x16, predict_intra_4x4, predict_intra_8x8,
 };
 use crate::mv_pred::{
     apply_spatial_direct_col_zero, derive_spatial_direct_base, derive_spatial_direct_blk,
@@ -403,6 +403,37 @@ impl SliceContext<'_> {
         }
         let mt = self.mb_info[neighbor_idx].mb_type;
         mt == MbType::Intra || mt == MbType::Ipcm
+    }
+
+    /// Availability of the left column for intra prediction, for luma rows
+    /// 0-7 and 8-15 (chroma rows 0-3 and 4-7). In an MBAFF frame the left
+    /// samples of the two halves can come from different MBs of the left
+    /// pair (spec Table 6-4), which matters with constrained intra
+    /// prediction, where an inter MB's samples are unavailable.
+    pub(crate) fn left_intra_avail(&self, mb_idx: usize, sp: &SliceParams) -> [bool; 2] {
+        if !self.mbaff {
+            let l = self
+                .left_mb(mb_idx)
+                .is_some_and(|left| self.is_intra_neighbor_avail(left, sp));
+            return [l, l];
+        }
+        let mbw = self.mb_width as usize;
+        [0, 8].map(|y0| {
+            (y0..y0 + 8).all(|y| {
+                crate::neighbor::mbaff_neighbor_loc(
+                    mb_idx,
+                    mbw,
+                    self.mb_field_decoding,
+                    -1,
+                    y,
+                    16,
+                    16,
+                )
+                .is_some_and(|(m, _, _)| {
+                    self.mb_slice_id[m] == self.this_slice_id && self.is_intra_neighbor_avail(m, sp)
+                })
+            })
+        })
     }
 
     /// Whether the macroblock holding the luma sample at `(xn, yn)` relative
@@ -1508,7 +1539,7 @@ impl SliceContext<'_> {
         pred_mode: u8,
         luma_residual: &[i32; 256],
         above_mb_avail: bool,
-        left_mb_avail: bool,
+        left_mb_avail: [bool; 2],
         above_left_mb_avail: bool,
         above_right_mb_avail: bool,
     ) {
@@ -1551,7 +1582,7 @@ impl SliceContext<'_> {
         };
 
         // Left samples
-        let left_avail = px > 0 && (col_off > 0 || left_mb_avail);
+        let left_avail = px > 0 && (col_off > 0 || left_mb_avail[row_off / 8]);
         let left_buf: Option<[u8; 8]> = if left_avail {
             let mut buf = [0u8; 8];
             for (i, b) in buf.iter_mut().enumerate() {
@@ -1566,7 +1597,7 @@ impl SliceContext<'_> {
         let al_avail = px > 0
             && above_base >= self.ly_stride
             && ((row_off > 0 && col_off > 0)
-                || (row_off > 0 && col_off == 0 && left_mb_avail)
+                || (row_off > 0 && col_off == 0 && left_mb_avail[(row_off - 1) / 8])
                 || (row_off == 0 && col_off > 0 && above_mb_avail)
                 || (row_off == 0 && col_off == 0 && above_left_mb_avail));
         let above_left_val = if al_avail {
@@ -1607,7 +1638,7 @@ impl SliceContext<'_> {
         pred_mode: u8,
         block_coeffs: &[i32; 16],
         above_mb_avail: bool,
-        left_mb_avail: bool,
+        left_mb_avail: [bool; 2],
         above_left_mb_avail: bool,
         above_right_mb_avail: bool,
     ) {
@@ -1649,7 +1680,7 @@ impl SliceContext<'_> {
         };
 
         // Left samples
-        let left_avail = px > 0 && (local_col > 0 || left_mb_avail);
+        let left_avail = px > 0 && (local_col > 0 || left_mb_avail[local_row / 8]);
         let left_buf: Option<[u8; 4]> = if left_avail {
             let mut buf = [0u8; 4];
             for (i, b) in buf.iter_mut().enumerate() {
@@ -1664,7 +1695,7 @@ impl SliceContext<'_> {
         let al_avail = px > 0
             && above_base >= self.ly_stride
             && ((local_row > 0 && local_col > 0)
-                || (local_row > 0 && local_col == 0 && left_mb_avail)
+                || (local_row > 0 && local_col == 0 && left_mb_avail[(local_row - 1) / 8])
                 || (local_row == 0 && local_col > 0 && above_mb_avail)
                 || (local_row == 0 && local_col == 0 && above_left_mb_avail));
         let above_left_val = if al_avail {
@@ -1746,7 +1777,7 @@ impl SliceContext<'_> {
         mb_x: usize,
         intra_chroma_pred_mode: u8,
         above_avail: bool,
-        left_avail: bool,
+        left_avail: [bool; 2],
         above_left_avail: bool,
     ) -> ([u8; 64], [u8; 64]) {
         let chroma_mb_x = mb_x / 2;
@@ -1766,7 +1797,7 @@ impl SliceContext<'_> {
             } else {
                 None
             };
-            let left = if mb_x > 0 && left_avail {
+            let left = if mb_x > 0 && (left_avail[0] || left_avail[1]) {
                 let mut buf = [0u8; 8];
                 for (i, b) in buf.iter_mut().enumerate() {
                     *b = plane_buf[cbase + i * cstride + chroma_mb_x - 1];
@@ -1780,10 +1811,11 @@ impl SliceContext<'_> {
             } else {
                 None
             };
-            predict_chroma_8x8(
+            predict_chroma_8x8_halves(
                 intra_chroma_pred_mode,
                 above.as_ref().map(|b| &b[..]),
                 left.as_ref().map(|b| &b[..]),
+                left_avail,
                 above_left,
                 pred,
             );
