@@ -492,8 +492,19 @@ impl Dpb {
     /// Insert a decoded picture into the DPB.
     /// Applies sliding window marking if needed (spec 8.2.5.3).
     pub fn insert(&mut self, pic: Arc<DecodedPicture>, reference: ReferenceStatus) {
+        self.insert_marked(pic, reference, true);
+    }
+
+    /// Insert a picture; `sliding_window` is false when its slice header
+    /// marks references adaptively (MMCO), which replaces the sliding window.
+    pub(crate) fn insert_marked(
+        &mut self,
+        pic: Arc<DecodedPicture>,
+        reference: ReferenceStatus,
+        sliding_window: bool,
+    ) {
         // Sliding window only applies to short-term references (spec 8.2.5.3)
-        if reference == ReferenceStatus::ShortTerm {
+        if sliding_window && reference == ReferenceStatus::ShortTerm {
             // Don't evict the complementary field of the picture being inserted.
             // Two fields with the same frame_num form a pair and count as one
             // reference frame (spec 7.4.3.1). Skip eviction if the new field
@@ -546,24 +557,138 @@ impl Dpb {
             }
         };
         if is_field_pic {
-            // Spec 8.2.4.2.5: field picture P-slice reference list initialization.
-            refs.sort_by(|a, b| {
-                frame_num_wrap(b).cmp(&frame_num_wrap(a)).then_with(|| {
-                    // Same frame: same-parity field first
-                    let a_same =
-                        (a.structure == PictureStructure::BottomField) == bottom_field_flag;
-                    let b_same =
-                        (b.structure == PictureStructure::BottomField) == bottom_field_flag;
-                    // true (same parity) should come first → sort descending
-                    b_same.cmp(&a_same)
-                })
-            });
-        } else {
-            refs.sort_by_key(|p| core::cmp::Reverse(frame_num_wrap(p)));
+            // Spec 8.2.4.2.2 / 8.2.4.2.5: frames by descending FrameNumWrap,
+            // then long-term frames by LongTermFrameIdx, each split into
+            // fields of alternating parity
+            let mut frames = Self::field_groups(refs);
+            frames.sort_by_key(|f| core::cmp::Reverse(frame_num_wrap(&f[0])));
+            let mut list = Self::alternate_parity(&frames, bottom_field_flag);
+            list.extend(self.long_term_fields(bottom_field_flag));
+            return list;
         }
+        refs.sort_by_key(|p| core::cmp::Reverse(frame_num_wrap(p)));
         // Append long-term refs sorted by ascending long_term_frame_idx (spec 8.2.4.2.1)
         refs.extend(self.long_term_ref_list());
         refs
+    }
+
+    /// Group reference fields into the frames (complementary field pairs)
+    /// they belong to: fields share a frame_num; a frame entry is its own
+    /// group. Groups keep the order of their first field.
+    fn field_groups(pics: Vec<Arc<DecodedPicture>>) -> Vec<Vec<Arc<DecodedPicture>>> {
+        let mut groups: Vec<Vec<Arc<DecodedPicture>>> = Vec::new();
+        for p in pics {
+            let pair = groups.iter_mut().find(|g| {
+                p.structure != PictureStructure::Frame
+                    && g[0].structure != PictureStructure::Frame
+                    && g[0].frame_num == p.frame_num
+            });
+            match pair {
+                Some(g) => g.push(p),
+                None => groups.push(vec![p]),
+            }
+        }
+        groups
+    }
+
+    /// Fields of `frames` (in frame order) alternating in parity, starting
+    /// with the current field's: one cursor takes the next frame holding a
+    /// reference field of the current parity, the other the next holding
+    /// one of the other parity; when one runs out the other continues
+    /// (spec 8.2.4.2.5). A frame entry provides both parities.
+    fn alternate_parity(
+        frames: &[Vec<Arc<DecodedPicture>>],
+        bottom_field_flag: bool,
+    ) -> Vec<Arc<DecodedPicture>> {
+        let field = |f: &Vec<Arc<DecodedPicture>>, bottom: bool| {
+            f.iter()
+                .find(|p| match p.structure {
+                    PictureStructure::Frame => true,
+                    PictureStructure::BottomField => bottom,
+                    PictureStructure::TopField => !bottom,
+                })
+                .cloned()
+        };
+        let same: Vec<_> = frames
+            .iter()
+            .filter_map(|f| field(f, bottom_field_flag))
+            .collect();
+        let other: Vec<_> = frames
+            .iter()
+            .filter_map(|f| field(f, !bottom_field_flag))
+            .collect();
+        let mut out = Vec::with_capacity(same.len() + other.len());
+        let (mut a, mut b) = (same.into_iter(), other.into_iter());
+        loop {
+            let (x, y) = (a.next(), b.next());
+            if x.is_none() && y.is_none() {
+                break;
+            }
+            out.extend(x);
+            out.extend(y);
+        }
+        out
+    }
+
+    /// Long-term reference fields for a field picture's lists: frames by
+    /// ascending LongTermFrameIdx, split into alternating-parity fields.
+    fn long_term_fields(&self, bottom_field_flag: bool) -> Vec<Arc<DecodedPicture>> {
+        let mut lt = self.long_term_refs();
+        lt.sort_by_key(|(_, idx)| *idx);
+        let mut frames: Vec<Vec<Arc<DecodedPicture>>> = Vec::new();
+        let mut idxs: Vec<u32> = Vec::new();
+        for (p, idx) in lt {
+            match idxs.iter().position(|&i| i == idx) {
+                Some(k) => frames[k].push(p),
+                None => {
+                    idxs.push(idx);
+                    frames.push(vec![p]);
+                }
+            }
+        }
+        Self::alternate_parity(&frames, bottom_field_flag)
+    }
+
+    /// B-slice field list (spec 8.2.4.2.4 / 8.2.4.2.5): frames ordered by
+    /// the POC of their reference fields (the smaller when both are), those
+    /// not after the current field first (`after_first` reverses that, for
+    /// list 1), split into alternating-parity fields, then the long-term
+    /// fields.
+    fn b_field_list(
+        &self,
+        current_poc: i32,
+        bottom_field_flag: bool,
+        after_first: bool,
+    ) -> Vec<Arc<DecodedPicture>> {
+        let short_term: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| e.reference == ReferenceStatus::ShortTerm)
+            .map(|e| e.pic.clone())
+            .collect();
+        let frames = Self::field_groups(short_term);
+        let poc =
+            |f: &Vec<Arc<DecodedPicture>>| f.iter().map(|p| p.pic_order_cnt).min().unwrap_or(0);
+        let mut before: Vec<_> = frames
+            .iter()
+            .filter(|f| poc(f) <= current_poc)
+            .cloned()
+            .collect();
+        before.sort_by_key(|f| core::cmp::Reverse(poc(f)));
+        let mut after: Vec<_> = frames
+            .iter()
+            .filter(|f| poc(f) > current_poc)
+            .cloned()
+            .collect();
+        after.sort_by_key(|f| poc(f));
+        let ordered: Vec<_> = if after_first {
+            after.into_iter().chain(before).collect()
+        } else {
+            before.into_iter().chain(after).collect()
+        };
+        let mut list = Self::alternate_parity(&ordered, bottom_field_flag);
+        list.extend(self.long_term_fields(bottom_field_flag));
+        list
     }
 
     /// Every short-term reference picture (frame or field), in no particular order.
@@ -596,6 +721,9 @@ impl Dpb {
         is_field_pic: bool,
         bottom_field_flag: bool,
     ) -> Vec<Arc<DecodedPicture>> {
+        if is_field_pic {
+            return self.b_field_list(current_poc, bottom_field_flag, false);
+        }
         let short_term: Vec<_> = self
             .entries
             .iter()
@@ -619,11 +747,6 @@ impl Dpb {
 
         before.extend(after);
 
-        // For field pictures: within each frame_num group, same-parity first
-        if is_field_pic {
-            Self::field_parity_interleave(&mut before, bottom_field_flag);
-        }
-
         // Append long-term refs (spec 8.2.4.2.3)
         before.extend(self.long_term_ref_list());
         before
@@ -639,6 +762,26 @@ impl Dpb {
         is_field_pic: bool,
         bottom_field_flag: bool,
     ) -> Vec<Arc<DecodedPicture>> {
+        let mut after = if is_field_pic {
+            self.b_field_list(current_poc, bottom_field_flag, true)
+        } else {
+            self.frame_list_l1_b(current_poc)
+        };
+
+        // Spec 8.2.4.2.4: if L1 == L0 and has more than one entry, swap first two
+        let l0 = self.ref_list_l0_b(current_poc, is_field_pic, bottom_field_flag);
+        if after.len() > 1
+            && after.len() == l0.len()
+            && after.iter().zip(l0.iter()).all(|(a, b)| Arc::ptr_eq(a, b))
+        {
+            after.swap(0, 1);
+        }
+
+        after
+    }
+
+    /// Frame-picture list 1 before the L0 comparison (spec 8.2.4.2.3).
+    fn frame_list_l1_b(&self, current_poc: i32) -> Vec<Arc<DecodedPicture>> {
         let short_term: Vec<_> = self
             .entries
             .iter()
@@ -662,51 +805,9 @@ impl Dpb {
 
         after.extend(before);
 
-        // For field pictures: within each frame_num group, same-parity first
-        if is_field_pic {
-            Self::field_parity_interleave(&mut after, bottom_field_flag);
-        }
-
         // Append long-term refs (spec 8.2.4.2.4)
         after.extend(self.long_term_ref_list());
-
-        // Spec 8.2.4.2.4: if L1 == L0 and has more than one entry, swap first two
-        let l0 = self.ref_list_l0_b(current_poc, is_field_pic, bottom_field_flag);
-        if after.len() > 1
-            && after.len() == l0.len()
-            && after
-                .iter()
-                .zip(l0.iter())
-                .all(|(a, b)| a.pic_order_cnt == b.pic_order_cnt)
-        {
-            after.swap(0, 1);
-        }
-
         after
-    }
-
-    /// For field pictures: within runs of entries sharing the same frame_num,
-    /// put same-parity fields before opposite-parity (spec 8.2.4.2.5).
-    fn field_parity_interleave(list: &mut [Arc<DecodedPicture>], bottom_field_flag: bool) {
-        let mut i = 0;
-        while i < list.len() {
-            let fn_val = list[i].frame_num;
-            let mut j = i + 1;
-            while j < list.len() && list[j].frame_num == fn_val {
-                j += 1;
-            }
-            // [i..j) is a run with the same frame_num
-            if j - i == 2 {
-                let a_same =
-                    (list[i].structure == PictureStructure::BottomField) == bottom_field_flag;
-                let b_same =
-                    (list[i + 1].structure == PictureStructure::BottomField) == bottom_field_flag;
-                if !a_same && b_same {
-                    list.swap(i, i + 1);
-                }
-            }
-            i = j;
-        }
     }
 
     /// Apply ref_pic_list_modification to reorder a reference list (spec 8.2.4.3).

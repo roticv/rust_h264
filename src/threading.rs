@@ -290,6 +290,7 @@ impl ThreadedDecoder {
             1u32 << (last.sps.log2_max_frame_num_minus4 + 4).min(31),
             last.header.field_pic_flag,
             &last.header.mmco_ops,
+            last.header.adaptive_ref_pic_marking,
             last.header.long_term_reference_flag,
         );
         // A picture with MMCO 5 starts a new output period, as in

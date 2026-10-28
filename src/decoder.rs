@@ -84,6 +84,7 @@ pub(crate) struct PictureState {
     pub(crate) last_qp_delta_nonzero: bool,
     // Slice header info for finalization
     pub(crate) mmco_ops: Vec<(u32, u32)>,
+    pub(crate) adaptive_ref_pic_marking: bool,
     pub(crate) long_term_reference_flag: bool,
     pub(crate) is_intra_slice: bool,
     /// Deblocking settings of each slice so far, indexed by slice ID
@@ -297,6 +298,7 @@ impl Decoder {
                 ps.max_frame_num,
                 ps.field_pic_flag,
                 &ps.mmco_ops,
+                ps.adaptive_ref_pic_marking,
                 ps.long_term_reference_flag,
             );
         }
@@ -395,6 +397,9 @@ pub(crate) struct SlicePlan {
     pub(crate) ref_pic_list: Vec<Arc<DecodedPicture>>,
     pub(crate) ref_pic_list_l0: Vec<Arc<DecodedPicture>>,
     pub(crate) ref_pic_list_l1: Vec<Arc<DecodedPicture>>,
+    /// Which entries of the B-slice lists are long-term references
+    pub(crate) long_term_l0: Vec<bool>,
+    pub(crate) long_term_l1: Vec<bool>,
     pub(crate) use_weight: u8,
     pub(crate) implicit_weights: Vec<Vec<i32>>,
     /// MBAFF implicit weights for field MBs, per MB parity (0 = top), indexed
@@ -426,9 +431,16 @@ pub(crate) fn prepare_slice(
 ) -> Result<SlicePlan, DecodeError> {
     #[cfg(feature = "profile")]
     let _setup_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::SliceSetup);
+    // The slice header starts with first_mb_in_slice, slice_type and
+    // pic_parameter_set_id; the rest of it depends on that PPS
+    let pps_id = {
+        let mut peek = BitstreamReader::new(&nal.rbsp);
+        peek.read_ue()?;
+        peek.read_ue()?;
+        peek.read_ue()?
+    };
     let pps = pps_table
-        .values()
-        .next()
+        .get(&pps_id)
         .ok_or(DecodeError::InvalidSyntax("no PPS available"))?;
     let sps = sps_table
         .get(&pps.seq_parameter_set_id)
@@ -557,6 +569,14 @@ pub(crate) fn prepare_slice(
         );
     }
 
+    let is_long_term = |list: &[Arc<DecodedPicture>]| -> Vec<bool> {
+        list.iter()
+            .map(|p| long_term.iter().any(|(q, _)| Arc::ptr_eq(p, q)))
+            .collect()
+    };
+    let long_term_l0 = is_long_term(&_ref_pic_list_l0);
+    let long_term_l1 = is_long_term(&_ref_pic_list_l1);
+
     // Weighted prediction mode:
     // 0 = no weighting (default)
     // 1 = explicit weights (P-slice weighted_pred_flag=1, or B-slice weighted_bipred_idc=1)
@@ -588,13 +608,20 @@ pub(crate) fn prepare_slice(
         }
     };
     let implicit_weights: Vec<Vec<i32>> = if use_weight == 2 {
+        // A long-term reference gets the default weight (spec 8.4.2.3.1)
         _ref_pic_list_l0
             .iter()
-            .map(|ref_l0| {
+            .zip(&long_term_l0)
+            .map(|(ref_l0, &lt0)| {
                 _ref_pic_list_l1
                     .iter()
-                    .map(|ref_l1| {
-                        implicit_weight(current_poc, ref_l0.pic_order_cnt, ref_l1.pic_order_cnt)
+                    .zip(&long_term_l1)
+                    .map(|(ref_l1, &lt1)| {
+                        if lt0 || lt1 {
+                            32
+                        } else {
+                            implicit_weight(current_poc, ref_l0.pic_order_cnt, ref_l1.pic_order_cnt)
+                        }
                     })
                     .collect()
             })
@@ -614,6 +641,9 @@ pub(crate) fn prepare_slice(
                 .map(|k0| {
                     (0.._ref_pic_list_l1.len() * 2)
                         .map(|k1| {
+                            if long_term_l0[k0 / 2] || long_term_l1[k1 / 2] {
+                                return 32;
+                            }
                             implicit_weight(
                                 field_poc[p],
                                 field_ref_poc(&_ref_pic_list_l0, p, k0),
@@ -678,6 +708,8 @@ pub(crate) fn prepare_slice(
         ref_pic_list,
         ref_pic_list_l0: _ref_pic_list_l0,
         ref_pic_list_l1: _ref_pic_list_l1,
+        long_term_l0,
+        long_term_l1,
         use_weight,
         implicit_weights,
         implicit_weights_field,
@@ -787,6 +819,7 @@ pub(crate) fn run_slice(
             prev_mb_qp: slice_qp,
             last_qp_delta_nonzero: false,
             mmco_ops: header.mmco_ops.clone(),
+            adaptive_ref_pic_marking: header.adaptive_ref_pic_marking,
             long_term_reference_flag: header.long_term_reference_flag,
             is_intra_slice: header.slice_type == SliceType::I,
             slice_deblock: Vec::new(),
@@ -838,6 +871,7 @@ pub(crate) fn run_slice(
         prev_mb_qp: _,
         last_qp_delta_nonzero: _,
         mmco_ops: _ps_mmco_ops,
+        adaptive_ref_pic_marking: _,
         long_term_reference_flag: _ps_lt_ref_flag,
         is_intra_slice: _ps_is_intra,
         mut slice_deblock,
@@ -970,6 +1004,8 @@ pub(crate) fn run_slice(
         ref_pic_list,
         ref_pic_list_l0: _ref_pic_list_l0,
         ref_pic_list_l1: _ref_pic_list_l1,
+        long_term_l0: &plan.long_term_l0,
+        long_term_l1: &plan.long_term_l1,
         num_ref_idx_l0_active: header.num_ref_idx_l0_active,
         num_ref_idx_l1_active: header.num_ref_idx_l1_active,
         wctx: &wctx,
@@ -1243,6 +1279,7 @@ pub(crate) fn run_slice(
         prev_mb_qp,
         last_qp_delta_nonzero,
         mmco_ops: header.mmco_ops.clone(),
+        adaptive_ref_pic_marking: header.adaptive_ref_pic_marking,
         long_term_reference_flag: header.long_term_reference_flag,
         is_intra_slice: header.slice_type == SliceType::I,
         slice_deblock,
@@ -1464,6 +1501,7 @@ pub(crate) fn apply_reference_marking(
     max_frame_num: u32,
     field_pic_flag: bool,
     mmco_ops: &[(u32, u32)],
+    adaptive_ref_pic_marking: bool,
     long_term_reference_flag: bool,
 ) {
     if nal_unit_type == NalUnitType::SliceIdr {
@@ -1526,7 +1564,10 @@ pub(crate) fn apply_reference_marking(
         }
     }
 
-    dpb.insert(pic, reference);
+    // The sliding window applies only without adaptive marking (spec
+    // 8.2.5.3); an IDR clears the DPB instead
+    let sliding_window = !adaptive_ref_pic_marking && nal_unit_type != NalUnitType::SliceIdr;
+    dpb.insert_marked(pic, reference, sliding_window);
     if nal_ref_idc > 0 {
         // A picture with MMCO 5 continues as frame_num 0
         dpb.set_prev_ref_frame_num(if has_mmco5(mmco_ops) { 0 } else { frame_num });

@@ -33,6 +33,9 @@ pub(crate) struct SliceParams<'a> {
     pub ref_pic_list: &'a [Arc<DecodedPicture>],
     pub ref_pic_list_l0: &'a [Arc<DecodedPicture>],
     pub ref_pic_list_l1: &'a [Arc<DecodedPicture>],
+    /// Which entries of `ref_pic_list_l0` / `ref_pic_list_l1` are long-term
+    pub long_term_l0: &'a [bool],
+    pub long_term_l1: &'a [bool],
     pub num_ref_idx_l0_active: u32,
     pub num_ref_idx_l1_active: u32,
     pub wctx: &'a WeightContext<'a>,
@@ -564,6 +567,13 @@ impl SliceContext<'_> {
         sp: &SliceParams,
     ) {
         let direct_spatial = sp.direct_spatial_mv_pred_flag;
+        // Spatial direct zeroes MVs from a still co-located block only when
+        // RefPicList1[0] is a short-term reference (spec 8.4.1.2.2)
+        let col_pic_spatial = sp
+            .ref_pic_list_l1
+            .first()
+            .filter(|_| !sp.long_term_l1.first().copied().unwrap_or(false))
+            .map(|p| p.as_ref());
         let direct_8x8_inference_flag = sp.direct_8x8_inference_flag;
         let current_poc = sp.current_poc;
         let ref_pic_list_l0 = sp.ref_pic_list_l0;
@@ -583,7 +593,7 @@ impl SliceContext<'_> {
                     self.ref_idx_store_l1,
                     mb_idx,
                     self.mb_width as usize,
-                    ref_pic_list_l1.first().map(|p| p.as_ref()),
+                    col_pic_spatial,
                     first_blk,
                     self.mb_slice_id,
                     self.this_slice_id,
@@ -619,7 +629,7 @@ impl SliceContext<'_> {
                         mb_field_decoding: self.mb_field_decoding,
                     },
                 );
-                let col_pic = ref_pic_list_l1.first().map(|p| p.as_ref());
+                let col_pic = col_pic_spatial;
                 for group in 0..4 {
                     let first_blk = group * 4;
                     let (mv_l0, mv_l1, ri_l0, ri_l1, _, _) = apply_spatial_direct_col_zero(
@@ -651,7 +661,7 @@ impl SliceContext<'_> {
                         self.ref_idx_store_l1,
                         mb_idx,
                         self.mb_width as usize,
-                        ref_pic_list_l1.first().map(|p| p.as_ref()),
+                        col_pic_spatial,
                         blk,
                         self.mb_slice_id,
                         self.this_slice_id,
@@ -677,6 +687,7 @@ impl SliceContext<'_> {
                 let (mv_l0, mv_l1, ri_l0, ri_l1, _, _) = derive_temporal_direct_blk(
                     col_pic,
                     ref_pic_list_l0,
+                    sp.long_term_l0,
                     (current_poc, sp.current_field_poc),
                     mb_idx,
                     first_blk,
@@ -700,6 +711,7 @@ impl SliceContext<'_> {
                     let (mv_l0, mv_l1, ri_l0, ri_l1, _, _) = derive_temporal_direct_blk(
                         col_pic,
                         ref_pic_list_l0,
+                        sp.long_term_l0,
                         (current_poc, sp.current_field_poc),
                         mb_idx,
                         first_blk,
@@ -721,6 +733,7 @@ impl SliceContext<'_> {
                     let (mv_l0, mv_l1, ri_l0, ri_l1, _, _) = derive_temporal_direct_blk(
                         col_pic,
                         ref_pic_list_l0,
+                        sp.long_term_l0,
                         (current_poc, sp.current_field_poc),
                         mb_idx,
                         blk,

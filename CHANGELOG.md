@@ -48,6 +48,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and CABAC CBP contexts treated I_PCM as having no coded blocks.
   - Direct and skipped B macroblocks without `direct_8x8_inference_flag`
     predicted chroma with one motion vector per 8x8 block.
+  - Slices always used the first PPS received instead of the one their
+    header names.
+  - Pictures marking references adaptively (MMCO) also ran the sliding
+    window, dropping a reference too many.
+  - Spatial direct mode applied the co-located zero-motion rule with a
+    long-term RefPicList1[0]; temporal direct scaled motion for long-term
+    references and implicit weights weighted them.
+  - Field reference lists alternated parity frame by frame instead of
+    taking the next field of each parity in turn (spec 8.2.4.2.5).
 - Temporal direct mode used no motion when the co-located block predicted from
   list 1 only, and identified the co-located references of a multi-slice
   picture through the last slice's reference list.

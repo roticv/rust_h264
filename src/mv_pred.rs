@@ -722,6 +722,7 @@ pub(crate) fn apply_spatial_direct_col_zero(
 pub(crate) fn derive_temporal_direct_blk(
     col_pic: &DecodedPicture,
     ref_pic_list_l0: &[Arc<DecodedPicture>],
+    long_term_l0: &[bool],
     (current_poc, current_field_poc): (i32, [i32; 2]),
     mb_idx: usize,
     blk: usize,
@@ -793,7 +794,9 @@ pub(crate) fn derive_temporal_direct_blk(
     };
 
     let td = (poc1 - poc0).clamp(-128, 127);
-    let scale = if td == 0 {
+    // A long-term reference is not scaled: mvL0 = mvCol, mvL1 = 0
+    let long_term = long_term_l0.get(frame_idx).copied().unwrap_or(false);
+    let scale = if td == 0 || long_term {
         256
     } else {
         let tb = (poc - poc0).clamp(-128, 127);

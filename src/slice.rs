@@ -54,6 +54,9 @@ pub struct SliceHeader {
     pub direct_spatial_mv_pred_flag: bool,
     /// MMCO operations: (op_code, parameter). Currently only op=1 (mark short-term unused).
     pub mmco_ops: Vec<(u32, u32)>,
+    /// adaptive_ref_pic_marking_mode_flag: marking by `mmco_ops` instead of
+    /// the sliding window (spec 8.2.5.3)
+    pub adaptive_ref_pic_marking: bool,
     /// Ref pic list modification ops for L0: (idc, abs_diff_pic_num_minus1).
     pub ref_list_mod_l0: Vec<(u32, u32)>,
     /// Ref pic list modification ops for L1.
@@ -280,12 +283,13 @@ pub fn parse_slice_header(
     let mut no_output_of_prior_pics_flag = false;
     let mut long_term_reference_flag = false;
     let mut mmco_ops: Vec<(u32, u32)> = Vec::new();
+    let mut adaptive_ref_pic_marking = false;
     if nal_unit_type == NalUnitType::SliceIdr {
         no_output_of_prior_pics_flag = r.read_bit()? != 0;
         long_term_reference_flag = r.read_bit()? != 0;
     } else if nal_ref_idc > 0 {
-        let adaptive_ref_pic_marking_mode_flag = r.read_bit()? != 0;
-        if adaptive_ref_pic_marking_mode_flag {
+        adaptive_ref_pic_marking = r.read_bit()? != 0;
+        if adaptive_ref_pic_marking {
             loop {
                 let op = r.read_ue()?;
                 if op == 0 {
@@ -370,6 +374,7 @@ pub fn parse_slice_header(
         num_ref_idx_l1_active,
         direct_spatial_mv_pred_flag,
         mmco_ops,
+        adaptive_ref_pic_marking,
         ref_list_mod_l0,
         ref_list_mod_l1,
         cabac_init_idc,
