@@ -48,12 +48,24 @@ mod tests {
 
     const GOLDEN_STREAMS: &[(&str, &str)] = &[
         (
+            "bench_720p_300f_ponly",
+            "40b5d71eb6c765f362c0949049a7ad9cafe767ddfd380052f43a8078a61eed9a",
+        ),
+        (
             "bench_720p_300f_ponly_complex",
             "ba921841a20df11940a73bc4203e5daa669a29b9aba721737a4932727240c165",
         ),
         (
+            "bench_720p_300f_bframes",
+            "d5abf889fe64e840c2c5689c4851bf0c1a3d9e4d71b26a0ff7a72462ca838aae",
+        ),
+        (
             "bench_720p_300f_bframes_complex",
             "3259ba108ef4b105abba2accbb1cf41565a2908b3042b5276ea389c9a008ae3f",
+        ),
+        (
+            "bench_1080p_100f",
+            "38a94a608ca0af062d2d5654cd7882b74988ab3b59516bb3a91fd97fa156ce32",
         ),
         (
             "bench_1080p_100f_complex",

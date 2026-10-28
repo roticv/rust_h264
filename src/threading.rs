@@ -528,6 +528,7 @@ mod tests {
     fn threaded_matches_serial_bench_corpus() {
         let dir = format!("{}/testdata", env!("CARGO_MANIFEST_DIR"));
         for name in [
+            "bench_720p_300f_bframes",
             "bench_720p_300f_bframes_complex",
             "bench_1080p_100f_complex",
             "bench_1080p_100f_ponly",

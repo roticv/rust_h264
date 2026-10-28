@@ -394,6 +394,9 @@ decoder in every configuration.
 | 1080p P-only complex (100f)   | 77.4 fps | 76.6 fps | **112.0 fps** | 100.3 fps |
 | 720p B-frames complex (300f)  | 166.1 fps | 199.3 fps | **228.0 fps** | 220.3 fps |
 | 720p P-only complex (300f)    | 171.8 fps | 167.9 fps | **250.8 fps** | 231.2 fps |
+| 1080p B-frames mandelbrot (100f) | 57.1 fps | — | **82.8 fps** | — |
+| 720p B-frames mandelbrot (300f)  | 118.5 fps | — | **185.5 fps** | — |
+| 720p P-only mandelbrot (300f)    | 111.3 fps | — | **202.2 fps** | — |
 
 - **Row-level synchronization** (current): about **1.4-1.46x over serial at
   4 threads** on the complex streams, for P-only content as much as for
@@ -408,12 +411,14 @@ decoder in every configuration.
 - 8 threads is slower than 4 here. Pictures waiting on references hold
   their threads, and with more in flight some run on the efficiency cores,
   which slows the reference chain everyone else waits on.
-- The three non-"complex" bench streams (`bench_1080p_100f`,
-  `bench_720p_300f_ponly`, `bench_720p_300f_bframes`) turned out to be
-  High 4:4:4, which this decoder does not support; their earlier numbers
-  measured decoding of unsupported content and have been removed. The
-  decoder now rejects such streams, and the benchmark harness and golden
-  digests cover only the four 4:2:0 streams.
+- The three mandelbrot streams (`bench_1080p_100f`,
+  `bench_720p_300f_ponly`, `bench_720p_300f_bframes`) were originally
+  encoded as High 4:4:4, which this decoder does not support, so their
+  earlier numbers measured decoding of unsupported content. They were
+  regenerated as 4:2:0 with the same source and x264 options (`mandelbrot`
+  at 60 fps, `--preset medium --crf 23`, `no-deblock`, bframes/ref as
+  named) and decode byte-identical to FFmpeg; their rows above (best of 15,
+  measured separately from the others) are 1.45-1.82x at 4 threads.
 - Single-threaded cost of the row waits (an atomic load per motion
   compensation call on complete pictures) is within noise: best-of-20
   serial throughput is 0.2-0.6% lower than before the change.
