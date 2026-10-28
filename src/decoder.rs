@@ -102,6 +102,10 @@ pub(crate) struct PictureState {
     pub(crate) frame_height: u32,
     /// MaxFrameNum from the SPS, for the picture numbers MMCO commands give.
     pub(crate) max_frame_num: u32,
+    /// Top-left of the display window in this picture's coded planes, in luma
+    /// samples (field lines for field pictures).
+    pub(crate) crop_x: u32,
+    pub(crate) crop_y: u32,
 }
 
 /// Streaming H.264 decoder.
@@ -386,6 +390,10 @@ pub(crate) struct SlicePlan {
     pub(crate) coded_width: u32,
     pub(crate) coded_height: u32,
     pub(crate) total_mbs: usize,
+    /// Display window origin in this picture's coded planes (luma samples;
+    /// field lines for field pictures).
+    pub(crate) crop_x: u32,
+    pub(crate) crop_y: u32,
 }
 
 /// Header-level half of slice decoding (see [`SlicePlan`]).
@@ -583,6 +591,14 @@ pub(crate) fn prepare_slice(
     let coded_width = mb_width * 16;
     let coded_height = mb_height * 16;
     let total_mbs = (mb_width * mb_height) as usize;
+    // Display window origin. The top offset is in frame lines, so a field
+    // picture starts half as many of its own lines down.
+    let crop_x = sps.crop_left();
+    let crop_y = if is_field_pic {
+        sps.crop_top() / 2
+    } else {
+        sps.crop_top()
+    };
 
     let slice_qp = header.qp_y(pps);
 
@@ -609,6 +625,8 @@ pub(crate) fn prepare_slice(
         coded_width,
         coded_height,
         total_mbs,
+        crop_x,
+        crop_y,
     })
 }
 
@@ -712,6 +730,8 @@ pub(crate) fn run_slice(
             bottom_field_flag: header.bottom_field_flag,
             frame_height,
             max_frame_num: 1u32 << (sps.log2_max_frame_num_minus4 + 4).min(31),
+            crop_x: plan.crop_x,
+            crop_y: plan.crop_y,
         }
     };
 
@@ -759,6 +779,8 @@ pub(crate) fn run_slice(
         bottom_field_flag: _ps_bottom,
         frame_height: _ps_frame_height,
         max_frame_num,
+        crop_x,
+        crop_y,
     } = ps;
 
     // Increment slice ID for continuation slices so boundary checks work
@@ -1126,6 +1148,8 @@ pub(crate) fn run_slice(
         bottom_field_flag: header.bottom_field_flag,
         frame_height,
         max_frame_num,
+        crop_x,
+        crop_y,
     })
 }
 
@@ -1149,7 +1173,9 @@ pub(crate) fn deblock_picture(ps: &mut PictureState) {
 pub(crate) fn picture_meta(ps: &PictureState) -> PictureMeta {
     PictureMeta {
         width: ps.mb_width * 16,
-        height: (ps.frame.height.div_ceil(16)) * 16,
+        // Coded height of this picture's planes, not the display height rounded
+        // up: cropping may remove a macroblock or more.
+        height: ps.mb_height * 16,
         frame_num: ps.frame_num,
         pic_order_cnt: ps.poc,
         mb_width: ps.mb_width,
@@ -1396,7 +1422,8 @@ pub(crate) fn finish_output(
     #[cfg(feature = "profile")]
     let _output_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::Output);
 
-    // Crop frame from coded dimensions (MB-aligned) to display dimensions
+    // Crop the coded (MB-aligned) planes to the display window, which starts
+    // at (crop_x, crop_y) (spec 7.4.2.1.1, frame_crop_*_offset).
     let coded_w = (ps.mb_width * 16) as usize;
     if coded_w == 0 {
         return None;
@@ -1404,39 +1431,37 @@ pub(crate) fn finish_output(
     let coded_h = ps.frame.y.len() / coded_w;
     let display_w = ps.frame.width as usize;
     let display_h = ps.frame.height as usize;
-    if coded_w != display_w || coded_h != display_h {
-        // Ensure display dimensions don't exceed coded dimensions or frame buffer
-        if display_w > coded_w || display_h > coded_h || coded_w * coded_h > ps.frame.y.len() {
+    let (x0, y0) = (ps.crop_x as usize, ps.crop_y as usize);
+    if coded_w != display_w || coded_h != display_h || x0 != 0 || y0 != 0 {
+        // The window must lie inside the coded picture and the frame buffer
+        if x0 + display_w > coded_w
+            || y0 + display_h > coded_h
+            || coded_w * coded_h > ps.frame.y.len()
+        {
             return None;
         }
         let chroma_coded_w = coded_w / 2;
         let chroma_w = display_w / 2;
         let chroma_h = display_h / 2;
+        let (cx0, cy0) = (x0 / 2, y0 / 2);
 
-        if coded_w == display_w {
+        if x0 == 0 && y0 == 0 && coded_w == display_w {
+            // Bottom crop only: the display rows are a prefix of the planes
             ps.frame.y.truncate(display_w * display_h);
             ps.frame.u.truncate(chroma_w * chroma_h);
             ps.frame.v.truncate(chroma_w * chroma_h);
         } else {
-            // Luma: copy display_w pixels per row from coded_w-stride buffer
-            let mut y = vec![0u8; display_w * display_h];
-            for r in 0..display_h {
-                y[r * display_w..(r + 1) * display_w]
-                    .copy_from_slice(&ps.frame.y[r * coded_w..r * coded_w + display_w]);
-            }
-            let mut u = vec![0u8; chroma_w * chroma_h];
-            let mut v = vec![0u8; chroma_w * chroma_h];
-            for r in 0..chroma_h {
-                u[r * chroma_w..(r + 1) * chroma_w].copy_from_slice(
-                    &ps.frame.u[r * chroma_coded_w..r * chroma_coded_w + chroma_w],
-                );
-                v[r * chroma_w..(r + 1) * chroma_w].copy_from_slice(
-                    &ps.frame.v[r * chroma_coded_w..r * chroma_coded_w + chroma_w],
-                );
-            }
-            ps.frame.y = y;
-            ps.frame.u = u;
-            ps.frame.v = v;
+            let crop = |plane: &[u8], stride: usize, x: usize, y: usize, w: usize, h: usize| {
+                let mut out = vec![0u8; w * h];
+                for r in 0..h {
+                    let src = (y + r) * stride + x;
+                    out[r * w..(r + 1) * w].copy_from_slice(&plane[src..src + w]);
+                }
+                out
+            };
+            ps.frame.y = crop(&ps.frame.y, coded_w, x0, y0, display_w, display_h);
+            ps.frame.u = crop(&ps.frame.u, chroma_coded_w, cx0, cy0, chroma_w, chroma_h);
+            ps.frame.v = crop(&ps.frame.v, chroma_coded_w, cx0, cy0, chroma_w, chroma_h);
         }
     }
 
@@ -2722,6 +2747,48 @@ mod tests {
 
         let hex = crate::sha256::sha256_hex(&output);
         assert_eq!(hex, expected_sha256, "SHA-256 mismatch for {}", h264_name);
+    }
+
+    #[test]
+    fn test_crop_left_top() {
+        // x264 128x96 progressive, cropped 16 px left, 32 px top and 8 px right with
+        // h264_metadata; the display window starts at the left/top offset.
+        // SHA-256 of ffmpeg's decode.
+        decode_and_compare_hash(
+            "crop_left_top",
+            4,
+            104,
+            64,
+            "6aafd150e5a3b37f80f93dbefa6f9bdc889b263a109b8e3610864ba92307e205",
+        );
+    }
+
+    #[test]
+    fn test_crop_mbaff() {
+        // x264 128x96 MBAFF, cropped 16 px left, 16 px top and 16 px bottom (frame lines) with
+        // h264_metadata; the display window starts at the left/top offset.
+        // SHA-256 of ffmpeg's decode.
+        decode_and_compare_hash(
+            "crop_mbaff",
+            6,
+            112,
+            64,
+            "67d9b2f60df5f671aaafbb6efbaefdf4bf8b8640e0c2dbaf38b2c711d876e0c5",
+        );
+    }
+
+    #[test]
+    fn test_crop_field() {
+        // JM field pictures (jm_field_p_test), cropped 8 px left, 8 px top and 8 px right with
+        // h264_metadata; the display window starts at the left/top offset.
+        // SHA-256 of ffmpeg's decode.
+        decode_and_compare_hash(
+            "crop_field",
+            4,
+            48,
+            56,
+            "ea608973a2ca218e6365424268cfb1372bdd75570d33e2777bc252061b94b2c4",
+        );
     }
 
     #[test]

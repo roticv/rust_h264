@@ -155,6 +155,26 @@ impl Sps {
             .saturating_sub(crop_y)
     }
 
+    /// Luma samples cropped off the left edge (spec 7.4.2.1.1).
+    pub fn crop_left(&self) -> u32 {
+        if self.frame_cropping_flag {
+            self.frame_crop_left_offset
+                .saturating_mul(self.crop_unit_x())
+        } else {
+            0
+        }
+    }
+
+    /// Luma frame lines cropped off the top edge (spec 7.4.2.1.1).
+    pub fn crop_top(&self) -> u32 {
+        if self.frame_cropping_flag {
+            self.frame_crop_top_offset
+                .saturating_mul(self.crop_unit_y())
+        } else {
+            0
+        }
+    }
+
     fn crop_unit_x(&self) -> u32 {
         if self.chroma_format_idc == 0 {
             1
