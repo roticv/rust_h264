@@ -6,7 +6,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::dpb::{DecodedPicture, Motion};
+use crate::dpb::{DecodedPicture, Motion, PictureStructure, ViewSource};
 use crate::inter_pred;
 use crate::residual::OFFSET_TO_BLOCK;
 use crate::slice::PredWeightTable;
@@ -413,6 +413,7 @@ pub(crate) fn derive_spatial_direct_blk(
     direct_8x8_inference_flag: bool,
     mctx: MbaffCtx,
     cur_poc: i32,
+    cur_bottom: bool,
 ) -> DirectMvResult {
     let base = derive_spatial_direct_base(
         [
@@ -433,7 +434,103 @@ pub(crate) fn derive_spatial_direct_blk(
         direct_8x8_inference_flag,
         mctx,
         cur_poc,
+        cur_bottom,
     )
+}
+
+/// How the current picture and its co-located picture are coded (spec
+/// Table 8-6), for mapping references and vertical motion.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColKind {
+    /// Same structure, or an MBAFF frame (per-MB frame/field handled by
+    /// `colocated_pos`)
+    Same,
+    /// Frame picture, co-located field of a field pair (Fld_To_Frm)
+    FrameFromField,
+    /// Field picture, co-located frame (Frm_To_Fld, or a field MB pair of
+    /// an MBAFF frame)
+    FieldFromFrame,
+}
+
+/// The co-located picture whose motion direct mode reads, the index of
+/// the co-located 4x4 block in it, and how it relates to the current
+/// picture. `col_pic` is RefPicList1[0]; for a PAFF view the motion lives
+/// in the picture(s) behind it (spec 8.4.1.2.1, Table 8-6):
+/// - a frame picture with a field pair uses the field closer in POC, MB
+///   `W * (mb_y / 2) + mb_x`, block row `2 * (mb_y % 2) + y8`;
+/// - a field picture with a frame uses MB `2 * W * mb_y + mb_x + W * y8`,
+///   block row `2 * y8` (in an MBAFF frame: the pair's MB of the current
+///   parity when the pair is field coded, else that MB of the pair).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn locate_colocated<'a>(
+    col_pic: &'a DecodedPicture,
+    mb_idx: usize,
+    blk: usize,
+    direct_8x8_inference_flag: bool,
+    mctx: MbaffCtx,
+    cur_poc: i32,
+    cur_bottom: bool,
+) -> (&'a DecodedPicture, usize, ColKind) {
+    let w = (col_pic.mb_width as usize).max(1);
+    let (mb_x, mb_y) = (mb_idx % w, mb_idx / w);
+    let (x8, y8) = ((blk / 4) & 1, blk / 8);
+    match &col_pic.view_source {
+        Some(ViewSource::Pair(fields)) if !mctx.mbaff => {
+            let [top, bottom] = fields;
+            let parity = ((top.pic_order_cnt as i64 - cur_poc as i64).abs()
+                >= (bottom.pic_order_cnt as i64 - cur_poc as i64).abs())
+                as usize;
+            let col_mb = w * (mb_y / 2) + mb_x;
+            let row = 2 * (mb_y % 2) + y8;
+            (
+                &fields[parity],
+                col_mb * 16 + OFFSET_TO_BLOCK[row][3 * x8],
+                ColKind::FrameFromField,
+            )
+        }
+        Some(ViewSource::FieldOf(frame)) => {
+            let mb_field = &frame.motion().mb_field;
+            if !mb_field.is_empty() {
+                // MBAFF frame: the field MB pair at the current MB's place
+                let pair = mb_idx;
+                if mb_field.get(pair).copied().unwrap_or(false) {
+                    let col_mb = 2 * pair + cur_bottom as usize;
+                    const INFERENCE_MAP: [usize; 4] = [0, 5, 10, 15];
+                    let b = if direct_8x8_inference_flag {
+                        INFERENCE_MAP[blk / 4]
+                    } else {
+                        blk
+                    };
+                    return (frame, col_mb * 16 + b, ColKind::Same);
+                }
+                let col_mb = 2 * pair + y8;
+                return (
+                    frame,
+                    col_mb * 16 + OFFSET_TO_BLOCK[2 * y8][3 * x8],
+                    ColKind::FieldFromFrame,
+                );
+            }
+            let col_mb = 2 * w * mb_y + mb_x + w * y8;
+            (
+                frame,
+                col_mb * 16 + OFFSET_TO_BLOCK[2 * y8][3 * x8],
+                ColKind::FieldFromFrame,
+            )
+        }
+        _ => (
+            col_pic,
+            colocated_pos(
+                col_pic.field_poc,
+                col_pic.motion(),
+                mb_idx,
+                blk,
+                direct_8x8_inference_flag,
+                mctx,
+                cur_poc,
+            ),
+            ColKind::Same,
+        ),
+    }
 }
 
 /// Index into the co-located picture's per-4x4 motion arrays for 4x4 block
@@ -635,6 +732,7 @@ pub(crate) fn derive_spatial_direct_base(
 ///
 /// Only the colocated block lookup depends on `col_blk`; the spatial median/ref result
 /// is unchanged across 8x8 representatives within the same macroblock.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_spatial_direct_col_zero(
     base: DirectMvResult,
     col_pic: Option<&DecodedPicture>,
@@ -643,6 +741,7 @@ pub(crate) fn apply_spatial_direct_col_zero(
     direct_8x8_inference_flag: bool,
     mctx: MbaffCtx,
     cur_poc: i32,
+    cur_bottom: bool,
 ) -> DirectMvResult {
     let (mut mv_l0, mut mv_l1, ref_idx_l0, ref_idx_l1, pred_l0, pred_l1) = base;
 
@@ -655,18 +754,18 @@ pub(crate) fn apply_spatial_direct_col_zero(
     // When colZeroFlag is set, zero out spatial MVs for lists where ref_idx == 0.
     // When direct_8x8_inference_flag is set, use the representative 4x4 block
     // per 8x8 group (same mapping as temporal direct).
-    if let Some(col) = col_pic {
-        // Co-located motion data is only final once the whole picture is.
-        let col_motion = col.motion();
-        let col_pos = colocated_pos(
-            col.field_poc,
-            col_motion,
+    if let Some(col_pic) = col_pic {
+        let (col, col_pos, _) = locate_colocated(
+            col_pic,
             mb_idx,
             col_blk,
             direct_8x8_inference_flag,
             mctx,
             cur_poc,
+            cur_bottom,
         );
+        // Co-located motion data is only final once the whole picture is.
+        let col_motion = col.motion();
         if col_pos < col_motion.ref_idx_l0.len() && !col.is_intra {
             let col_ref_l0 = col_motion.ref_idx_l0[col_pos];
             // Determine which co-located MV to use for the zero check:
@@ -728,19 +827,20 @@ pub(crate) fn derive_temporal_direct_blk(
     blk: usize,
     direct_8x8_inference_flag: bool,
     mctx: MbaffCtx,
+    cur_bottom: bool,
 ) -> ([i16; 2], [i16; 2], i8, i8, bool, bool) {
     const INTRA: ([i16; 2], [i16; 2], i8, i8, bool, bool) = ([0, 0], [0, 0], 0, 0, true, true);
-    let col_motion = col_pic.motion();
-    let col_pos = colocated_pos(
-        col_pic.field_poc,
-        col_motion,
+    let (col, col_pos, kind) = locate_colocated(
+        col_pic,
         mb_idx,
         blk,
         direct_8x8_inference_flag,
         mctx,
         current_poc,
+        cur_bottom,
     );
-    if col_pic.is_intra || col_pos >= col_motion.ref_idx_l0.len() {
+    let col_motion = col.motion();
+    if col.is_intra || col_pos >= col_motion.ref_idx_l0.len() {
         return INTRA;
     }
     // mvCol/refIdxCol: L0 motion, or L1 when the co-located block has no L0
@@ -760,19 +860,62 @@ pub(crate) fn derive_temporal_direct_blk(
         return INTRA;
     };
 
-    // The current L0 entry of the frame the co-located block referenced
+    // The current L0 entry of the picture the co-located block referenced;
+    // a field picture's references are keyed by POC and parity
+    let col_is_field = col.structure != PictureStructure::Frame;
     let frame_idx = ref_pic_list_l0
         .iter()
-        .position(|p| p.pic_order_cnt == col_ref_poc)
+        .position(|p| {
+            if col_is_field {
+                field_ref_key(p) == col_ref_poc
+            } else {
+                p.pic_order_cnt == col_ref_poc
+            }
+        })
         .unwrap_or(0);
-    let cur_field = mctx.mbaff && mctx.mb_field_decoding[mb_idx / 2];
-    let col_field = mctx.mbaff
-        && col_motion
-            .mb_field
-            .get(col_pos / 32)
-            .copied()
-            .unwrap_or(false);
-    let (ref0, poc, poc0, poc1) = if cur_field {
+    let (cur_field, col_field) = match kind {
+        ColKind::FrameFromField => (false, true),
+        ColKind::FieldFromFrame => (true, false),
+        ColKind::Same => (
+            mctx.mbaff && mctx.mb_field_decoding[mb_idx / 2],
+            mctx.mbaff
+                && col_motion
+                    .mb_field
+                    .get(col_pos / 32)
+                    .copied()
+                    .unwrap_or(false),
+        ),
+    };
+    let (ref0, poc, poc0, poc1) = if kind == ColKind::FrameFromField {
+        // The frame (or field pair) holding the referenced field
+        let (field_poc, bottom) = (col_ref_poc >> 1, (col_ref_poc & 1) as usize);
+        let ref0 = ref_pic_list_l0
+            .iter()
+            .position(|p| p.field_poc[bottom] == field_poc)
+            .unwrap_or(0);
+        let poc0 = ref_pic_list_l0.get(ref0).map_or(0, |p| p.pic_order_cnt);
+        (ref0, current_poc, poc0, col_pic.pic_order_cnt)
+    } else if kind == ColKind::FieldFromFrame && !mctx.mbaff {
+        // The field of the referenced frame with the current parity
+        let frame_num = ref_pic_list_l0
+            .iter()
+            .find(|p| frame_poc_of(p, ref_pic_list_l0) == col_ref_poc)
+            .map(|p| p.frame_num);
+        let parity = if cur_bottom {
+            PictureStructure::BottomField
+        } else {
+            PictureStructure::TopField
+        };
+        let ref0 = frame_num
+            .and_then(|f| {
+                ref_pic_list_l0
+                    .iter()
+                    .position(|p| p.frame_num == f && p.structure == parity)
+            })
+            .unwrap_or(0);
+        let poc0 = ref_pic_list_l0.get(ref0).map_or(0, |p| p.pic_order_cnt);
+        (ref0, current_poc, poc0, col_pic.pic_order_cnt)
+    } else if cur_field {
         let parity = mb_idx % 2;
         // A field reference keeps its parity relative to the MB; a frame
         // reference becomes the same-parity field
@@ -819,6 +962,26 @@ pub(crate) fn derive_temporal_direct_blk(
         true,
         true,
     )
+}
+
+/// Identity of a reference field as a field picture's co-located motion
+/// records it: POC and parity.
+pub(crate) fn field_ref_key(p: &DecodedPicture) -> i32 {
+    p.pic_order_cnt
+        .wrapping_mul(2)
+        .wrapping_add((p.structure == PictureStructure::BottomField) as i32)
+}
+
+/// PicOrderCnt of the frame a field reference belongs to: its frame's for a
+/// field view, else the smaller POC of it and its pair in `list`.
+fn frame_poc_of(p: &DecodedPicture, list: &[Arc<DecodedPicture>]) -> i32 {
+    if let Some(ViewSource::FieldOf(frame)) = &p.view_source {
+        return frame.pic_order_cnt;
+    }
+    list.iter()
+        .filter(|q| q.frame_num == p.frame_num && q.structure != p.structure)
+        .map(|q| q.pic_order_cnt)
+        .fold(p.pic_order_cnt, i32::min)
 }
 
 /// Motion vector prediction using the median of neighbors A, B, C (spec 8.4.1.3).

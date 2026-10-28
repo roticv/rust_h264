@@ -603,6 +603,7 @@ impl SliceContext<'_> {
                         mb_field_decoding: self.mb_field_decoding,
                     },
                     current_poc,
+                    self.bottom_field_flag,
                 );
                 let base = mb_idx * 16;
                 for blk in blk_start..blk_start + 4 {
@@ -643,6 +644,7 @@ impl SliceContext<'_> {
                             mb_field_decoding: self.mb_field_decoding,
                         },
                         current_poc,
+                        self.bottom_field_flag,
                     );
                     for blk in first_blk..first_blk + 4 {
                         self.mv_store_l0[base + blk] = mv_l0;
@@ -671,6 +673,7 @@ impl SliceContext<'_> {
                             mb_field_decoding: self.mb_field_decoding,
                         },
                         current_poc,
+                        self.bottom_field_flag,
                     );
                     self.mv_store_l0[mb_idx * 16 + blk] = mv_l0;
                     self.ref_idx_store_l0[mb_idx * 16 + blk] = ri_l0;
@@ -696,6 +699,7 @@ impl SliceContext<'_> {
                         mbaff: self.mbaff,
                         mb_field_decoding: self.mb_field_decoding,
                     },
+                    self.bottom_field_flag,
                 );
                 let base = mb_idx * 16;
                 for blk in blk_start..blk_start + 4 {
@@ -720,6 +724,7 @@ impl SliceContext<'_> {
                             mbaff: self.mbaff,
                             mb_field_decoding: self.mb_field_decoding,
                         },
+                        self.bottom_field_flag,
                     );
                     for blk in first_blk..first_blk + 4 {
                         self.mv_store_l0[base + blk] = mv_l0;
@@ -742,6 +747,7 @@ impl SliceContext<'_> {
                             mbaff: self.mbaff,
                             mb_field_decoding: self.mb_field_decoding,
                         },
+                        self.bottom_field_flag,
                     );
                     self.mv_store_l0[mb_idx * 16 + blk] = mv_l0;
                     self.ref_idx_store_l0[mb_idx * 16 + blk] = ri_l0;
@@ -1836,6 +1842,10 @@ impl SliceContext<'_> {
                             .wrapping_mul(2)
                             .wrapping_add(parity as i32)
                     }),
+                    // Field pictures: both fields of a frame can share a POC
+                    None if self.field_pic_flag => list
+                        .get(ri)
+                        .map_or(-1, |pic| crate::mv_pred::field_ref_key(pic)),
                     None => list.get(ri).map_or(-1, |pic| pic.pic_order_cnt),
                 }
             };
@@ -1873,11 +1883,20 @@ impl SliceContext<'_> {
         for mb in from..to {
             let shift = (self.mbaff && self.mb_field_decoding[mb / 2]) as usize;
             for i in mb * 16..mb * 16 + 16 {
+                // A field picture's references are fields, told apart by
+                // parity as well as POC (both fields may share a POC)
+                let field_pic = self.field_pic_flag;
                 let frame_poc = |list: &[Arc<DecodedPicture>], ri: i8| {
                     (ri >= 0)
                         .then(|| list.get(ri as usize >> shift))
                         .flatten()
-                        .map_or(-1, |p| p.pic_order_cnt)
+                        .map_or(-1, |p| {
+                            if field_pic {
+                                crate::mv_pred::field_ref_key(p)
+                            } else {
+                                p.pic_order_cnt
+                            }
+                        })
                 };
                 self.ref_poc_store_l0[i] = frame_poc(l0_list, self.ref_idx_store_l0[i]);
                 self.ref_poc_store_l1[i] = frame_poc(sp.ref_pic_list_l1, self.ref_idx_store_l1[i]);

@@ -114,6 +114,17 @@ pub struct DecodedPicture {
     progress: RowProgress,
     /// Set before the last row is published.
     motion: OnceLock<Motion>,
+    /// For a PAFF view (see `field_view`, `pair_frame`), the picture(s) it
+    /// was made from; direct mode reads the co-located motion there
+    pub(crate) view_source: Option<ViewSource>,
+}
+
+/// The decoded picture(s) behind a PAFF view.
+pub(crate) enum ViewSource {
+    /// A frame view of a complementary field pair: [top, bottom]
+    Pair([Arc<DecodedPicture>; 2]),
+    /// A field view of a decoded frame
+    FieldOf(Arc<DecodedPicture>),
 }
 
 impl core::fmt::Debug for DecodedPicture {
@@ -143,6 +154,7 @@ impl DecodedPicture {
             planes,
             progress,
             motion: OnceLock::new(),
+            view_source: None,
         }
     }
 
@@ -154,6 +166,89 @@ impl DecodedPicture {
         } else {
             len.div_ceil(row_bytes) as u32
         }
+    }
+
+    /// Field `bottom` of a decoded frame, as a separate picture for field
+    /// pictures referencing it: every other line, the field's POC. Motion
+    /// data is not carried over (direct mode treats it as intra).
+    pub(crate) fn field_view(self: &Arc<Self>, bottom: bool) -> DecodedPicture {
+        self.wait_complete();
+        let lines = |plane: &[u8], stride: usize| -> Vec<u8> {
+            plane
+                .chunks(stride.max(1))
+                .skip(bottom as usize)
+                .step_by(2)
+                .flatten()
+                .copied()
+                .collect()
+        };
+        let w = self.width as usize;
+        let poc = self.field_poc[bottom as usize];
+        let meta = PictureMeta {
+            width: self.width,
+            height: self.height / 2,
+            frame_num: self.frame_num,
+            pic_order_cnt: poc,
+            field_poc: [poc, poc],
+            mb_width: self.mb_width,
+            is_intra: self.is_intra,
+            structure: if bottom {
+                PictureStructure::BottomField
+            } else {
+                PictureStructure::TopField
+            },
+        };
+        let total_mbs = self.mb_width as usize * (self.height as usize / 32);
+        let mut view = DecodedPicture::new_complete(
+            meta,
+            lines(self.luma(), w),
+            lines(self.chroma(0), w / 2),
+            lines(self.chroma(1), w / 2),
+            Motion::unavailable(total_mbs),
+        );
+        view.view_source = Some(ViewSource::FieldOf(self.clone()));
+        view
+    }
+
+    /// The frame of a complementary field pair, for frame pictures
+    /// referencing it: the fields' lines interleaved, POC the smaller of
+    /// theirs. Motion data is not carried over.
+    pub(crate) fn pair_frame(
+        top: &Arc<DecodedPicture>,
+        bottom: &Arc<DecodedPicture>,
+    ) -> DecodedPicture {
+        top.wait_complete();
+        bottom.wait_complete();
+        let interleave = |t: &[u8], b: &[u8], stride: usize| -> Vec<u8> {
+            let stride = stride.max(1);
+            let mut out = Vec::with_capacity(t.len() + b.len());
+            for (lt, lb) in t.chunks(stride).zip(b.chunks(stride)) {
+                out.extend_from_slice(lt);
+                out.extend_from_slice(lb);
+            }
+            out
+        };
+        let w = top.width as usize;
+        let meta = PictureMeta {
+            width: top.width,
+            height: top.height * 2,
+            frame_num: top.frame_num,
+            pic_order_cnt: top.pic_order_cnt.min(bottom.pic_order_cnt),
+            field_poc: [top.pic_order_cnt, bottom.pic_order_cnt],
+            mb_width: top.mb_width,
+            is_intra: top.is_intra && bottom.is_intra,
+            structure: PictureStructure::Frame,
+        };
+        let total_mbs = top.mb_width as usize * (top.height as usize / 8);
+        let mut view = DecodedPicture::new_complete(
+            meta,
+            interleave(top.luma(), bottom.luma(), w),
+            interleave(top.chroma(0), bottom.chroma(0), w / 2),
+            interleave(top.chroma(1), bottom.chroma(1), w / 2),
+            Motion::unavailable(total_mbs),
+        );
+        view.view_source = Some(ViewSource::Pair([top.clone(), bottom.clone()]));
+        view
     }
 
     /// A fully decoded picture.
@@ -383,6 +478,11 @@ impl Drop for PictureWriter {
 struct DpbEntry {
     pic: Arc<DecodedPicture>,
     reference: ReferenceStatus,
+    /// A frame's two fields, for field pictures referencing it (PAFF)
+    field_views: core::cell::OnceCell<[Arc<DecodedPicture>; 2]>,
+    /// The frame of a complementary field pair, cached on the pair's
+    /// second field, for frame pictures referencing it (PAFF)
+    frame_view: core::cell::OnceCell<Arc<DecodedPicture>>,
 }
 
 /// The Decoded Picture Buffer.
@@ -520,7 +620,12 @@ impl Dpb {
                 self.sliding_window_mark();
             }
         }
-        self.entries.push(DpbEntry { pic, reference });
+        self.entries.push(DpbEntry {
+            pic,
+            reference,
+            field_views: core::cell::OnceCell::new(),
+            frame_view: core::cell::OnceCell::new(),
+        });
         self.remove_unused();
     }
 
@@ -542,12 +647,7 @@ impl Dpb {
         is_field_pic: bool,
         bottom_field_flag: bool,
     ) -> Vec<Arc<DecodedPicture>> {
-        let mut refs: Vec<_> = self
-            .entries
-            .iter()
-            .filter(|e| e.reference == ReferenceStatus::ShortTerm)
-            .map(|e| e.pic.clone())
-            .collect();
+        let mut refs: Vec<_> = self.short_term_refs(is_field_pic);
 
         let frame_num_wrap = |p: &DecodedPicture| {
             if p.frame_num > frame_num {
@@ -633,7 +733,7 @@ impl Dpb {
     /// Long-term reference fields for a field picture's lists: frames by
     /// ascending LongTermFrameIdx, split into alternating-parity fields.
     fn long_term_fields(&self, bottom_field_flag: bool) -> Vec<Arc<DecodedPicture>> {
-        let mut lt = self.long_term_refs();
+        let mut lt = self.long_term_refs(true);
         lt.sort_by_key(|(_, idx)| *idx);
         let mut frames: Vec<Vec<Arc<DecodedPicture>>> = Vec::new();
         let mut idxs: Vec<u32> = Vec::new();
@@ -660,12 +760,7 @@ impl Dpb {
         bottom_field_flag: bool,
         after_first: bool,
     ) -> Vec<Arc<DecodedPicture>> {
-        let short_term: Vec<_> = self
-            .entries
-            .iter()
-            .filter(|e| e.reference == ReferenceStatus::ShortTerm)
-            .map(|e| e.pic.clone())
-            .collect();
+        let short_term: Vec<_> = self.short_term_refs(true);
         let frames = Self::field_groups(short_term);
         let poc =
             |f: &Vec<Arc<DecodedPicture>>| f.iter().map(|p| p.pic_order_cnt).min().unwrap_or(0);
@@ -691,23 +786,70 @@ impl Dpb {
         list
     }
 
-    /// Every short-term reference picture (frame or field), in no particular order.
-    /// Every long-term reference picture with its LongTermFrameIdx.
-    pub fn long_term_refs(&self) -> Vec<(Arc<DecodedPicture>, u32)> {
-        self.entries
-            .iter()
-            .filter_map(|e| match e.reference {
-                ReferenceStatus::LongTerm(idx) => Some((e.pic.clone(), idx)),
-                _ => None,
-            })
-            .collect()
+    /// Reference pictures with status `status` (ShortTerm, or any
+    /// LongTerm), as the current picture structure sees them, with their
+    /// LongTermFrameIdx. A field picture sees a frame as its two fields; a
+    /// frame picture sees a complementary reference field pair as one frame
+    /// and cannot use a lone reference field (spec 8.2.4.2.1, 8.2.4.2.2). The
+    /// views are built once per DPB entry, so repeated calls return the same
+    /// pictures.
+    fn ref_pictures(&self, long_term: bool, is_field_pic: bool) -> Vec<(Arc<DecodedPicture>, u32)> {
+        let status = |e: &DpbEntry| match e.reference {
+            ReferenceStatus::ShortTerm if !long_term => Some(0),
+            ReferenceStatus::LongTerm(idx) if long_term => Some(idx),
+            _ => None,
+        };
+        let mut out = Vec::new();
+        for (i, e) in self.entries.iter().enumerate() {
+            let Some(idx) = status(e) else { continue };
+            let is_frame = e.pic.structure == PictureStructure::Frame;
+            if is_field_pic {
+                if is_frame {
+                    let views = e.field_views.get_or_init(|| {
+                        [false, true].map(|bottom| Arc::new(e.pic.field_view(bottom)))
+                    });
+                    out.extend(views.iter().map(|v| (v.clone(), idx)));
+                } else {
+                    out.push((e.pic.clone(), idx));
+                }
+            } else if is_frame {
+                out.push((e.pic.clone(), idx));
+            } else {
+                // The first field of a complete pair, earlier in the DPB
+                let partner = self.entries[..i].iter().find(|o| {
+                    o.pic.structure != PictureStructure::Frame
+                        && o.pic.structure != e.pic.structure
+                        && o.pic.frame_num == e.pic.frame_num
+                        && status(o) == Some(idx)
+                });
+                if let Some(o) = partner {
+                    let (top, bottom) = if e.pic.structure == PictureStructure::TopField {
+                        (&e.pic, &o.pic)
+                    } else {
+                        (&o.pic, &e.pic)
+                    };
+                    let frame = e
+                        .frame_view
+                        .get_or_init(|| Arc::new(DecodedPicture::pair_frame(top, bottom)));
+                    out.push((frame.clone(), idx));
+                }
+            }
+        }
+        out
     }
 
-    pub fn short_term_refs(&self) -> Vec<Arc<DecodedPicture>> {
-        self.entries
-            .iter()
-            .filter(|e| e.reference == ReferenceStatus::ShortTerm)
-            .map(|e| e.pic.clone())
+    /// Every long-term reference picture with its LongTermFrameIdx, as the
+    /// current picture structure sees them (see `ref_pictures`).
+    pub fn long_term_refs(&self, is_field_pic: bool) -> Vec<(Arc<DecodedPicture>, u32)> {
+        self.ref_pictures(true, is_field_pic)
+    }
+
+    /// Every short-term reference picture, as the current picture
+    /// structure sees them, in no particular order.
+    pub fn short_term_refs(&self, is_field_pic: bool) -> Vec<Arc<DecodedPicture>> {
+        self.ref_pictures(false, is_field_pic)
+            .into_iter()
+            .map(|(p, _)| p)
             .collect()
     }
 
@@ -724,12 +866,7 @@ impl Dpb {
         if is_field_pic {
             return self.b_field_list(current_poc, bottom_field_flag, false);
         }
-        let short_term: Vec<_> = self
-            .entries
-            .iter()
-            .filter(|e| e.reference == ReferenceStatus::ShortTerm)
-            .map(|e| e.pic.clone())
-            .collect();
+        let short_term: Vec<_> = self.short_term_refs(false);
 
         let mut before: Vec<_> = short_term
             .iter()
@@ -782,12 +919,7 @@ impl Dpb {
 
     /// Frame-picture list 1 before the L0 comparison (spec 8.2.4.2.3).
     fn frame_list_l1_b(&self, current_poc: i32) -> Vec<Arc<DecodedPicture>> {
-        let short_term: Vec<_> = self
-            .entries
-            .iter()
-            .filter(|e| e.reference == ReferenceStatus::ShortTerm)
-            .map(|e| e.pic.clone())
-            .collect();
+        let short_term: Vec<_> = self.short_term_refs(false);
 
         let mut after: Vec<_> = short_term
             .iter()
@@ -1266,16 +1398,9 @@ impl Dpb {
     /// Get list of long-term reference pictures, sorted by ascending long_term_frame_idx.
     /// Used to append to reference lists after short-term refs (spec 8.2.4.2.1, 8.2.4.2.3).
     pub fn long_term_ref_list(&self) -> Vec<Arc<DecodedPicture>> {
-        let mut refs: Vec<_> = self
-            .entries
-            .iter()
-            .filter(|e| matches!(e.reference, ReferenceStatus::LongTerm(_)))
-            .collect::<Vec<_>>();
-        refs.sort_by_key(|e| match e.reference {
-            ReferenceStatus::LongTerm(idx) => idx,
-            _ => u32::MAX,
-        });
-        refs.iter().map(|e| e.pic.clone()).collect()
+        let mut refs = self.long_term_refs(false);
+        refs.sort_by_key(|(_, idx)| *idx);
+        refs.into_iter().map(|(p, _)| p).collect()
     }
 
     /// Remove entries that are unused for reference (freeing memory).
@@ -1437,7 +1562,11 @@ mod tests {
         }
         assert_eq!(Dpb::frame_num_for_pic_num(1 - 3, 16), 14);
         dpb.mark_short_term_unused(Dpb::frame_num_for_pic_num(1 - 3, 16));
-        let mut left: Vec<u32> = dpb.short_term_refs().iter().map(|p| p.frame_num).collect();
+        let mut left: Vec<u32> = dpb
+            .short_term_refs(false)
+            .iter()
+            .map(|p| p.frame_num)
+            .collect();
         left.sort_unstable();
         assert_eq!(left, [0, 13, 15]);
         assert_eq!(Dpb::frame_num_for_pic_num(3, 16), 3);

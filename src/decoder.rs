@@ -530,8 +530,8 @@ pub(crate) fn prepare_slice(
 
     // Apply ref_pic_list_modification (spec 8.2.4.3)
     // A command may name any short-term reference, not only one in the list.
-    let short_term = dpb.short_term_refs();
-    let long_term = dpb.long_term_refs();
+    let short_term = dpb.short_term_refs(is_field_pic);
+    let long_term = dpb.long_term_refs(is_field_pic);
     if is_p_slice && !header.ref_list_mod_l0.is_empty() {
         Dpb::apply_ref_list_modification(
             &mut ref_pic_list,

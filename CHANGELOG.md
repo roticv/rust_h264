@@ -57,6 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     references and implicit weights weighted them.
   - Field reference lists alternated parity frame by frame instead of
     taking the next field of each parity in turn (spec 8.2.4.2.5).
+  - PAFF (streams mixing frame and field pictures): field pictures could
+    not reference a decoded frame, nor frame pictures a field pair. The DPB
+    now provides each as the other on demand, and direct mode reads the
+    co-located motion across the two structures (spec Table 8-6).
+  - Field pictures whose fields share a POC confused the two fields in
+    temporal direct mode and in deblocking.
 - Temporal direct mode used no motion when the co-located block predicted from
   list 1 only, and identified the co-located references of a multi-slice
   picture through the last slice's reference list.
