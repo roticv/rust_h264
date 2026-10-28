@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **MBAFF streams from x264 (`--interlaced`)**, which failed with "invalid
+  coded_block_pattern" or decoded with corrupted macroblocks, now decode
+  byte-identical to FFmpeg. Pairs mixing frame and field coding were handled
+  with simplified neighbour rules; they now follow spec Table 6-4 everywhere
+  (motion vector prediction, CABAC and CAVLC contexts, intra prediction modes
+  and availability). Also fixed for MBAFF:
+  - the field flag of skipped macroblocks, and of a skipped top macroblock above
+    a coded bottom one;
+  - reference fields, explicit and implicit weights, and chroma offsets of field
+    macroblocks in every inter path, including CAVLC B slices and direct mode;
+  - direct mode with a co-located pair coded the other way, and temporal
+    direct for field macroblocks;
+  - CABAC 8x8 significance contexts and the CAVLC 8x8 coefficient order in
+    field macroblocks;
+  - deblocking of field macroblocks and of edges between frame and field
+    pairs.
+- CAVLC macroblocks with the 8x8 transform deblocked the inner edges of their
+  8x8 blocks.
+- Temporal direct mode used no motion when the co-located block predicted from
+  list 1 only, and identified the co-located references of a multi-slice
+  picture through the last slice's reference list.
+
 ## [0.5.0] - 2026-10-28
 
 Thanks to petitstrawberry, codepaws and Brandon Hoult, whose forks and pull

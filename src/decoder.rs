@@ -47,6 +47,8 @@ pub(crate) struct PictureState {
     pub(crate) frame: Frame,
     pub(crate) frame_num: u32,
     pub(crate) poc: i32,
+    /// Top and bottom field POCs (see `Dpb::frame_field_pocs`)
+    pub(crate) field_poc: [i32; 2],
     pub(crate) nal_unit_type: NalUnitType,
     pub(crate) nal_ref_idc: u8,
     // Per-MB arrays that persist across slices
@@ -57,6 +59,7 @@ pub(crate) struct PictureState {
     pub(crate) mv_store_l1: Vec<[i16; 2]>,
     pub(crate) ref_idx_store_l0: Vec<i8>,
     pub(crate) ref_poc_store_l0: Vec<i32>,
+    pub(crate) ref_poc_store_l1: Vec<i32>,
     pub(crate) ref_idx_store_l1: Vec<i8>,
     pub(crate) mvd_store: Vec<[i16; 2]>,
     pub(crate) mvd_store_l1: Vec<[i16; 2]>,
@@ -381,6 +384,11 @@ pub(crate) struct SlicePlan {
     pub(crate) ref_pic_list_l1: Vec<Arc<DecodedPicture>>,
     pub(crate) use_weight: u8,
     pub(crate) implicit_weights: Vec<Vec<i32>>,
+    /// MBAFF implicit weights for field MBs, per MB parity (0 = top), indexed
+    /// by field ref_idx: `[parity][l0][l1]` = L0 weight
+    pub(crate) implicit_weights_field: [Vec<Vec<i32>>; 2],
+    /// Top and bottom field POCs of the current picture
+    pub(crate) field_poc: [i32; 2],
     pub(crate) slice_qp: i32,
     pub(crate) width: u32,
     pub(crate) frame_height: u32,
@@ -536,6 +544,21 @@ pub(crate) fn prepare_slice(
 
     // Implicit weighted prediction: compute L0 weight from POC distances.
     // implicit_weights[l0_idx][l1_idx] = w0. L1 weight = 64 - w0. Fixed log2_denom=5.
+    let implicit_weight = |cur: i32, poc0: i32, poc1: i32| {
+        let td = (poc1 - poc0).clamp(-128, 127);
+        if td == 0 {
+            32
+        } else {
+            let tb = (cur - poc0).clamp(-128, 127);
+            let tx = (16384 + (td.abs() / 2)) / td;
+            let w1 = (tb * tx + 32) >> 8;
+            if !(-64..=128).contains(&w1) {
+                32
+            } else {
+                64 - w1
+            }
+        }
+    };
     let implicit_weights: Vec<Vec<i32>> = if use_weight == 2 {
         _ref_pic_list_l0
             .iter()
@@ -543,25 +566,38 @@ pub(crate) fn prepare_slice(
                 _ref_pic_list_l1
                     .iter()
                     .map(|ref_l1| {
-                        let td = (ref_l1.pic_order_cnt - ref_l0.pic_order_cnt).clamp(-128, 127);
-                        if td == 0 {
-                            32
-                        } else {
-                            let tb = (current_poc - ref_l0.pic_order_cnt).clamp(-128, 127);
-                            let tx = (16384 + (td.abs() / 2)) / td;
-                            let w1 = (tb * tx + 32) >> 8;
-                            if !(-64..=128).contains(&w1) {
-                                32
-                            } else {
-                                64 - w1
-                            }
-                        }
+                        implicit_weight(current_poc, ref_l0.pic_order_cnt, ref_l1.pic_order_cnt)
                     })
                     .collect()
             })
             .collect()
     } else {
         vec![]
+    };
+    let field_poc = Dpb::frame_field_pocs(sps, &header, current_poc);
+    // MBAFF field MBs predict from fields: field ref_idx k of an MB of parity
+    // p is the field of parity p ^ (k & 1) of frame entry k / 2, and the
+    // implicit weights use field POCs (spec 8.4.2.3.1).
+    let implicit_weights_field: [Vec<Vec<i32>>; 2] = if use_weight == 2 && header.mbaff_frame_flag {
+        let field_ref_poc =
+            |list: &[Arc<DecodedPicture>], p: usize, k: usize| list[k / 2].field_poc[p ^ (k & 1)];
+        [0, 1].map(|p| {
+            (0.._ref_pic_list_l0.len() * 2)
+                .map(|k0| {
+                    (0.._ref_pic_list_l1.len() * 2)
+                        .map(|k1| {
+                            implicit_weight(
+                                field_poc[p],
+                                field_ref_poc(&_ref_pic_list_l0, p, k0),
+                                field_ref_poc(&_ref_pic_list_l1, p, k1),
+                            )
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+    } else {
+        [vec![], vec![]]
     };
 
     // The coded size comes from the SPS macroblock counts (spec 7.4.2.1.1);
@@ -616,6 +652,8 @@ pub(crate) fn prepare_slice(
         ref_pic_list_l1: _ref_pic_list_l1,
         use_weight,
         implicit_weights,
+        implicit_weights_field,
+        field_poc,
         slice_qp,
         width,
         frame_height,
@@ -659,6 +697,7 @@ pub(crate) fn run_slice(
     let _ref_pic_list_l1: &[Arc<DecodedPicture>] = &plan.ref_pic_list_l1;
     let use_weight = plan.use_weight;
     let implicit_weights = &plan.implicit_weights;
+    let implicit_weights_field = &plan.implicit_weights_field;
     let (width, frame_height, height) = (plan.width, plan.frame_height, plan.height);
     let (mb_width, mb_height) = (plan.mb_width, plan.mb_height);
     let (coded_width, coded_height) = (plan.coded_width, plan.coded_height);
@@ -668,6 +707,7 @@ pub(crate) fn run_slice(
         use_weight,
         wt: header.weight_table.as_ref(),
         implicit_weights,
+        implicit_weights_field,
     };
 
     // Create or reuse PictureState for multi-slice support.
@@ -691,6 +731,7 @@ pub(crate) fn run_slice(
             },
             frame_num: header.frame_num,
             poc: current_poc,
+            field_poc: plan.field_poc,
             nal_unit_type: plan.nal_unit_type,
             nal_ref_idc: plan.nal_ref_idc,
             nc_luma: vec![0u8; total_mbs * 16],
@@ -700,6 +741,7 @@ pub(crate) fn run_slice(
             mv_store_l1: vec![[0i16; 2]; total_mbs * 16],
             ref_idx_store_l0: vec![-1i8; total_mbs * 16],
             ref_poc_store_l0: vec![-1i32; total_mbs * 16],
+            ref_poc_store_l1: vec![-1i32; total_mbs * 16],
             ref_idx_store_l1: vec![-1i8; total_mbs * 16],
             mvd_store: vec![[0i16; 2]; total_mbs * 16],
             mvd_store_l1: vec![[0i16; 2]; total_mbs * 16],
@@ -740,6 +782,7 @@ pub(crate) fn run_slice(
         mut frame,
         frame_num: _ps_frame_num,
         poc: _ps_poc,
+        field_poc: ps_field_poc,
         nal_unit_type: _ps_nal_type,
         nal_ref_idc: _ps_nal_ref_idc,
         mut nc_luma,
@@ -749,6 +792,7 @@ pub(crate) fn run_slice(
         mut mv_store_l1,
         mut ref_idx_store_l0,
         mut ref_poc_store_l0,
+        mut ref_poc_store_l1,
         mut ref_idx_store_l1,
         mut mvd_store,
         mut mvd_store_l1,
@@ -825,6 +869,7 @@ pub(crate) fn run_slice(
     };
 
     let mut mb_skip_run: i32 = -1; // -1 = not initialized for P slices
+    let mut mbaff_skip_lookahead: Option<bool> = None;
 
     let stride = coded_width as usize;
     let mbaff = header.mbaff_frame_flag;
@@ -850,6 +895,7 @@ pub(crate) fn run_slice(
                 mv_store_l1: &mut mv_store_l1,
                 ref_idx_store_l0: &mut ref_idx_store_l0,
                 ref_poc_store_l0: &mut ref_poc_store_l0,
+                ref_poc_store_l1: &mut ref_poc_store_l1,
                 ref_idx_store_l1: &mut ref_idx_store_l1,
                 mvd_store: &mut mvd_store,
                 mvd_store_l1: &mut mvd_store_l1,
@@ -859,6 +905,7 @@ pub(crate) fn run_slice(
                 mb_chroma_pred: &mut mb_chroma_pred,
                 mb_is_8x8dct: &mut mb_is_8x8dct,
                 mb_skip: &mut mb_skip,
+                mbaff_skip_lookahead: &mut mbaff_skip_lookahead,
                 mb_is_direct: &mut mb_is_direct,
                 blk_is_direct: &mut blk_is_direct,
                 is_i16x16: &mut is_i16x16,
@@ -883,6 +930,7 @@ pub(crate) fn run_slice(
         is_b_slice,
         use_weight,
         current_poc,
+        current_field_poc: plan.field_poc,
         direct_spatial_mv_pred_flag: header.direct_spatial_mv_pred_flag,
         direct_8x8_inference_flag: sps.direct_8x8_inference_flag,
         transform_8x8_mode_flag: pps.transform_8x8_mode_flag,
@@ -918,6 +966,7 @@ pub(crate) fn run_slice(
     // MBs of this slice from `fin_from` on still need their deblocking info
     // filled in (finalize_mb_info_range).
     let mut fin_from = mb_idx;
+    let slice_first_mb = mb_idx;
     let unit_len = deblock_unit_len(mb_width as usize, mbaff);
     while mb_idx < total_mbs {
         // Frame threading: deblock and publish rows as they become final.
@@ -933,7 +982,10 @@ pub(crate) fn run_slice(
                     &mut frame,
                     &mb_info,
                     mb_width as usize,
-                    mbaff,
+                    deblock::Interlace {
+                        mbaff_field: mbaff.then_some(&_mb_field_decoding[..]),
+                        field_pic: header.field_pic_flag,
+                    },
                     &mb_slice_id,
                     &slice_deblock,
                     ps_chroma_qp_offset,
@@ -949,6 +1001,22 @@ pub(crate) fn run_slice(
 
         // Stamp this MB with the current slice ID for boundary detection
         mb_slice_id[mb_idx] = this_slice_id;
+        // MBAFF: a pair's mb_field_decoding_flag defaults to the inferred
+        // value (spec 7.4.4: left pair in the same slice, else the pair
+        // above, else frame). It is used as is when neither MB of the pair
+        // carries the flag, and for context derivation until it is decoded.
+        if mbaff && mb_idx.is_multiple_of(2) {
+            let pair = mb_idx / 2;
+            let mbw = mb_width as usize;
+            _mb_field_decoding[pair] =
+                if !pair.is_multiple_of(mbw) && mb_slice_id[mb_idx - 2] == this_slice_id {
+                    _mb_field_decoding[pair - 1]
+                } else if pair >= mbw && mb_slice_id[mb_idx - 2 * mbw] == this_slice_id {
+                    _mb_field_decoding[pair - mbw]
+                } else {
+                    false
+                };
+        }
         // Compute pixel position
         let (mb_x, mb_y) = if mbaff {
             let pair_addr = mb_idx / 2;
@@ -1004,7 +1072,13 @@ pub(crate) fn run_slice(
             if mb_skip_run > 0 {
                 mb_skip_run -= 1;
                 mb_skip[mb_idx] = true; // Mark as skipped for MBAFF field flag inference
-                                        // Set layout for skip MBs (field_flag already known)
+                                        // MBAFF: when a run ends on a skipped top MB, the bottom MB is
+                                        // coded and its mb_field_decoding_flag (the next bit) applies
+                                        // to the whole pair, so read it before decoding this MB.
+                if mbaff && mb_idx.is_multiple_of(2) && mb_skip_run == 0 {
+                    _mb_field_decoding[mb_idx / 2] = reader.read_bit()? != 0;
+                }
+                // Set layout for skip MBs (field_flag already known)
                 {
                     let mut ctx = make_ctx!();
                     ctx.set_mb_layout(mb_idx, mb_x, mb_y);
@@ -1040,9 +1114,9 @@ pub(crate) fn run_slice(
             // MBAFF: read mb_field_decoding_flag for this pair
             // (spec 7.3.4: read before first non-skipped MB of pair)
             if mbaff {
-                let is_top = mb_idx % 2 == 0;
-                let top_was_skipped = !is_top && mb_skip[mb_idx - 1];
-                if is_top || top_was_skipped {
+                // A bottom MB after a skipped top MB had its flag read with
+                // the top MB (above), so only top MBs read it here.
+                if mb_idx.is_multiple_of(2) {
                     _mb_field_decoding[mb_idx / 2] = reader.read_bit()? != 0;
                 }
             }
@@ -1086,7 +1160,7 @@ pub(crate) fn run_slice(
             crate::profile::PhaseTimer::start(crate::profile::Phase::FinalizeMbInfo);
         let mut ctx = make_ctx!();
         ctx.finalize_mb_info_range(fin_from, end_mb, &params);
-        ctx.fill_ref_poc_table(&params);
+        ctx.fill_ref_poc_table(slice_first_mb, end_mb, &params);
     }
     if let Some(sync) = sync.as_mut() {
         let ready = sync.ready_mb(end_mb, unit_len);
@@ -1095,7 +1169,10 @@ pub(crate) fn run_slice(
             &mut frame,
             &mb_info,
             mb_width as usize,
-            mbaff,
+            deblock::Interlace {
+                mbaff_field: mbaff.then_some(&_mb_field_decoding[..]),
+                field_pic: header.field_pic_flag,
+            },
             &mb_slice_id,
             &slice_deblock,
             ps_chroma_qp_offset,
@@ -1109,6 +1186,7 @@ pub(crate) fn run_slice(
         frame,
         frame_num: header.frame_num,
         poc: current_poc,
+        field_poc: ps_field_poc,
         nal_unit_type: plan.nal_unit_type,
         nal_ref_idc: plan.nal_ref_idc,
         nc_luma,
@@ -1118,6 +1196,7 @@ pub(crate) fn run_slice(
         mv_store_l1,
         ref_idx_store_l0,
         ref_poc_store_l0,
+        ref_poc_store_l1,
         ref_idx_store_l1,
         mvd_store,
         mvd_store_l1,
@@ -1165,7 +1244,10 @@ pub(crate) fn deblock_picture(ps: &mut PictureState) {
         &ps.slice_deblock,
         ps.chroma_qp_index_offset,
         ps.second_chroma_qp_index_offset,
-        ps.mbaff_frame_flag,
+        deblock::Interlace {
+            mbaff_field: ps.mbaff_frame_flag.then_some(&ps.mb_field_decoding[..]),
+            field_pic: ps.field_pic_flag,
+        },
     );
 }
 
@@ -1178,6 +1260,7 @@ pub(crate) fn picture_meta(ps: &PictureState) -> PictureMeta {
         height: ps.mb_height * 16,
         frame_num: ps.frame_num,
         pic_order_cnt: ps.poc,
+        field_poc: ps.field_poc,
         mb_width: ps.mb_width,
         is_intra: ps.is_intra_slice,
         structure: if ps.field_pic_flag {
@@ -1198,8 +1281,14 @@ pub(crate) fn take_motion(ps: &mut PictureState) -> Motion {
         mv_l0: core::mem::take(&mut ps.mv_store_l0),
         ref_idx_l0: core::mem::take(&mut ps.ref_idx_store_l0),
         ref_poc_l0: core::mem::take(&mut ps.ref_poc_store_l0),
+        ref_poc_l1: core::mem::take(&mut ps.ref_poc_store_l1),
         mv_l1: core::mem::take(&mut ps.mv_store_l1),
         ref_idx_l1: core::mem::take(&mut ps.ref_idx_store_l1),
+        mb_field: if ps.mbaff_frame_flag {
+            ps.mb_field_decoding.clone()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -1260,12 +1349,13 @@ impl RowSync {
         frame: &mut Frame,
         mb_info: &[MbInfo],
         mb_width: usize,
-        mbaff: bool,
+        interlace: deblock::Interlace,
         mb_slice_id: &[u16],
         slice_deblock: &[deblock::SliceDeblock],
         chroma_qp_offset: i32,
         second_chroma_qp_offset: i32,
     ) {
+        let mbaff = interlace.mbaff_field.is_some();
         let unit_len = deblock_unit_len(mb_width, mbaff);
         if unit_len == 0 {
             return;
@@ -1287,7 +1377,7 @@ impl RowSync {
                 slice_deblock,
                 chroma_qp_offset,
                 second_chroma_qp_offset,
-                mbaff,
+                interlace,
                 start..start + unit_len,
             );
             self.next_unit += 1;
@@ -1315,7 +1405,10 @@ impl RowSync {
                 &ps.slice_deblock,
                 ps.chroma_qp_index_offset,
                 ps.second_chroma_qp_index_offset,
-                ps.mbaff_frame_flag,
+                deblock::Interlace {
+                    mbaff_field: ps.mbaff_frame_flag.then_some(&ps.mb_field_decoding[..]),
+                    field_pic: ps.field_pic_flag,
+                },
                 start..ps.mb_info.len(),
             );
         }
@@ -2774,6 +2867,115 @@ mod tests {
             112,
             64,
             "67d9b2f60df5f671aaafbb6efbaefdf4bf8b8640e0c2dbaf38b2c711d876e0c5",
+        );
+    }
+
+    // x264 --interlaced (MBAFF) streams, SHA-256 of ffmpeg's decode. Mixed
+    // frame/field pairs exercise the spec Table 6-4 neighbours throughout.
+
+    #[test]
+    fn test_mbaff_x264_cavlc_p() {
+        // Ultrafast CAVLC 128x96: P skip runs ending on a top MB (the field
+        // flag read with the bottom MB applies to the skipped top MB), field
+        // chroma MV offsets and the last row of the bottom field
+        decode_and_compare_hash(
+            "mbaff_x264_cavlc_p",
+            3,
+            128,
+            96,
+            "d8327b18175e2c0978c01ff73ee03a60305a941d56980c6bfa8c60b5a8759e6f",
+        );
+    }
+
+    #[test]
+    fn test_mbaff_x264_cabac_p() {
+        // As above with CABAC: the bottom MB's skip flag and the field flag
+        // are decoded ahead of a skipped top MB
+        decode_and_compare_hash(
+            "mbaff_x264_cabac_p",
+            3,
+            128,
+            96,
+            "d8327b18175e2c0978c01ff73ee03a60305a941d56980c6bfa8c60b5a8759e6f",
+        );
+    }
+
+    #[test]
+    fn test_mbaff_x264_cavlc_8x8() {
+        // Medium CAVLC 128x96 with the 8x8 transform: deblocking skips the
+        // inner edges of CAVLC 8x8 MBs
+        decode_and_compare_hash(
+            "mbaff_x264_cavlc_8x8",
+            3,
+            128,
+            96,
+            "786472f892fe99e4edf5b3202e792f45897d28dfef9e29c82a97903cc9469ac8",
+        );
+    }
+
+    #[test]
+    fn test_mbaff_x264_cavlc_b() {
+        // Ultrafast CAVLC 176x144 with B-frames: field MBs read ref_idx over
+        // twice the references and predict from fields
+        decode_and_compare_hash(
+            "mbaff_x264_cavlc_b",
+            12,
+            176,
+            144,
+            "9f5b727b3e50f8040ad0210cc271365ddc4dd0cbaca0be821decda00c070c520",
+        );
+    }
+
+    #[test]
+    fn test_mbaff_x264_bff() {
+        // Medium CABAC 352x240 (16 rows cropped), bottom field first:
+        // luma CBP contexts across mixed pairs, field 8x8 significance
+        // contexts, implicit weights from field POCs, mixed-edge deblocking
+        decode_and_compare_hash(
+            "mbaff_x264_bff",
+            14,
+            352,
+            240,
+            "be6402d7a9dc4d4b0e249a2b2330e882d363b42c996191a22e5cf6576c38af31",
+        );
+    }
+
+    #[test]
+    fn test_mbaff_x264_cavlc_weighted() {
+        // Medium CAVLC 352x240 with weighted P: CAVLC 8x8 field scan, intra
+        // above-right of bottom field MBs, explicit weights of field refs
+        decode_and_compare_hash(
+            "mbaff_x264_cavlc_weighted",
+            14,
+            352,
+            240,
+            "c8f2561cff263e6e03f07b1302efd85df83f474208ca3e7f2577c823df65d6cb",
+        );
+    }
+
+    #[test]
+    fn test_mbaff_x264_temporal_slices() {
+        // Medium CABAC 352x240, 4 slices, temporal direct: co-located MBs of
+        // the other frame/field kind, field flag contexts at slice edges
+        decode_and_compare_hash(
+            "mbaff_x264_temporal_slices",
+            14,
+            352,
+            240,
+            "0a3e1140e92d2345c90e11e8ca80d8742d3289b63b0d7ab4c6e3fbefdca54bd5",
+        );
+    }
+
+    #[test]
+    fn test_mbaff_x264_intra_modes() {
+        // CABAC 352x240 at QP 2: intra 4x4/8x8 mode prediction from the left
+        // MB of a pair coded the other way
+        decode_and_compare_hash(
+            "mbaff_x264_intra_modes",
+            7,
+            352,
+            240,
+            "18a8f32c86f4e4d06d523ca9296e400f4f8bb3b6c41e3eee16664872d14e9bc4",
         );
     }
 

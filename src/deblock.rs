@@ -126,15 +126,16 @@ pub fn filter_frame_params(
         }],
         chroma_qp_index_offset,
         chroma_qp_index_offset,
-        false,
+        Interlace::default(),
         0..mb_info.len(),
     );
 }
 
-/// Apply deblocking with MBAFF support. `mb_slice_id` gives each MB's slice,
-/// an index into `slices`; Cr uses the second chroma QP offset.
+/// Apply deblocking with MBAFF and field picture support. `mb_slice_id`
+/// gives each MB's slice, an index into `slices`; Cr uses the second chroma
+/// QP offset.
 #[allow(clippy::too_many_arguments)]
-pub fn filter_frame_mbaff(
+pub(crate) fn filter_frame_mbaff(
     frame: &mut Frame,
     mb_info: &[MbInfo],
     mb_width: usize,
@@ -142,7 +143,7 @@ pub fn filter_frame_mbaff(
     slices: &[SliceDeblock],
     chroma_qp_index_offset: i32,
     second_chroma_qp_index_offset: i32,
-    mbaff: bool,
+    interlace: Interlace,
 ) {
     filter_frame_inner(
         frame,
@@ -152,7 +153,7 @@ pub fn filter_frame_mbaff(
         slices,
         chroma_qp_index_offset,
         second_chroma_qp_index_offset,
-        mbaff,
+        interlace,
         0..mb_info.len(),
     );
 }
@@ -171,7 +172,7 @@ pub(crate) fn filter_mb_range(
     slices: &[SliceDeblock],
     chroma_qp_index_offset: i32,
     second_chroma_qp_index_offset: i32,
-    mbaff: bool,
+    interlace: Interlace,
     mbs: core::ops::Range<usize>,
 ) {
     filter_frame_inner(
@@ -182,7 +183,7 @@ pub(crate) fn filter_mb_range(
         slices,
         chroma_qp_index_offset,
         second_chroma_qp_index_offset,
-        mbaff,
+        interlace,
         mbs,
     );
 }
@@ -196,9 +197,27 @@ fn filter_frame_inner(
     slices: &[SliceDeblock],
     chroma_qp_index_offset: i32,
     second_chroma_qp_index_offset: i32,
-    mbaff: bool,
+    interlace: Interlace,
     mbs: core::ops::Range<usize>,
 ) {
+    if let Some(mb_field) = interlace.mbaff_field {
+        for m in mbs.start..mbs.end.min(mb_info.len()) {
+            filter_mb_mbaff(
+                frame,
+                mb_info,
+                mb_width,
+                mb_slice_id,
+                slices,
+                [chroma_qp_index_offset, second_chroma_qp_index_offset],
+                mb_field,
+                m,
+            );
+        }
+        return;
+    }
+    // Field pictures: intra horizontal MB edges get bS 3 and vertical MV
+    // differences are in field units (spec 8.7.2.1)
+    let mvy_limit = if interlace.field_pic { 2 } else { 4 };
     // The frame is still at its coded size here (cropping happens on output),
     // so a row is mb_width MBs long whatever frame.width says
     let stride_y = mb_width * 16;
@@ -214,22 +233,8 @@ fn filter_frame_inner(
 
     for mb_idx in mbs.start..mbs.end.min(mb_info.len()) {
         // Compute spatial position and column/row for neighbor checks
-        let (mb_x, mb_y, mb_col, mb_row) = if mbaff {
-            let pair_addr = mb_idx / 2;
-            let pair_col = pair_addr % mb_width;
-            let pair_row = pair_addr / mb_width;
-            let is_bottom = mb_idx % 2 != 0;
-            (
-                pair_col * 16,
-                pair_row * 32 + if is_bottom { 16 } else { 0 },
-                pair_col,
-                pair_row * 2 + if is_bottom { 1 } else { 0 },
-            )
-        } else {
-            let col = mb_idx % mb_width;
-            let row = mb_idx / mb_width;
-            (col * 16, row * 16, col, row)
-        };
+        let (mb_col, mb_row) = (mb_idx % mb_width, mb_idx / mb_width);
+        let (mb_x, mb_y) = (mb_col * 16, mb_row * 16);
         let mb_q = &mb_info[mb_idx];
 
         // This MB's edges are filtered as its own slice's header says
@@ -266,15 +271,7 @@ fn filter_frame_inner(
             }
 
             // Left neighbor MB
-            let left_mb_idx = if !is_mb_edge {
-                mb_idx // internal edge, same MB
-            } else if mbaff {
-                // MBAFF: left = same position (top/bottom) in left pair
-                let pair_addr = mb_idx / 2;
-                (pair_addr - 1) * 2 + (mb_idx % 2)
-            } else {
-                mb_idx - 1
-            };
+            let left_mb_idx = if is_mb_edge { mb_idx - 1 } else { mb_idx };
             if is_mb_edge && other_slice(left_mb_idx) {
                 continue;
             }
@@ -308,7 +305,8 @@ fn filter_frame_inner(
                 } else {
                     blk_idx(edge - 1, seg)
                 };
-                seg_bs[seg] = derive_bs(mb_p, mb_q, blk_p, blk_q, is_mb_edge);
+                let intra_bs = if is_mb_edge { 4 } else { 3 };
+                seg_bs[seg] = derive_bs(mb_p, mb_q, blk_p, blk_q, intra_bs, mvy_limit);
             }
             // Luma: filter each segment independently
             for seg in 0..4 {
@@ -336,11 +334,7 @@ fn filter_frame_inner(
 
             // Chroma: per-pixel bS from all 4 luma segments
             if edge % 2 == 0 {
-                let c_edge_x = if mbaff {
-                    (mb_idx / 2 % mb_width) * 8 + (edge / 2) * 4
-                } else {
-                    mb_col * 8 + (edge / 2) * 4
-                };
+                let c_edge_x = mb_col * 8 + (edge / 2) * 4;
                 for cseg in 0..2 {
                     let cy = mb_y / 2 + cseg * 4;
                     let c_bs = [
@@ -386,17 +380,8 @@ fn filter_frame_inner(
             let is_mb_edge = edge == 0;
 
             // Check if there's an above neighbor
-            if is_mb_edge {
-                if mbaff {
-                    // Top MB of first pair row has no above
-                    let pair_addr = mb_idx / 2;
-                    let pair_row = pair_addr / mb_width;
-                    if mb_idx % 2 == 0 && pair_row == 0 {
-                        continue;
-                    }
-                } else if mb_row == 0 {
-                    continue;
-                }
+            if is_mb_edge && mb_row == 0 {
+                continue;
             }
 
             // 8x8 transform: skip internal odd edges (spec 8.7.2.1).
@@ -405,19 +390,10 @@ fn filter_frame_inner(
             }
 
             // Above neighbor MB
-            let above_mb_idx = if !is_mb_edge {
-                mb_idx // internal edge, same MB
-            } else if mbaff {
-                if mb_idx % 2 != 0 {
-                    // Bottom MB: above = top of same pair
-                    mb_idx - 1
-                } else {
-                    // Top MB: above = bottom of above pair
-                    let pair_addr = mb_idx / 2;
-                    (pair_addr - mb_width) * 2 + 1
-                }
-            } else {
+            let above_mb_idx = if is_mb_edge {
                 mb_idx - mb_width
+            } else {
+                mb_idx
             };
             if is_mb_edge && other_slice(above_mb_idx) {
                 continue;
@@ -451,7 +427,12 @@ fn filter_frame_inner(
                 } else {
                     blk_idx(seg, edge - 1)
                 };
-                seg_bs[seg] = derive_bs(mb_p, mb_q, blk_p, blk_q, is_mb_edge);
+                let intra_bs = if is_mb_edge && !interlace.field_pic {
+                    4
+                } else {
+                    3
+                };
+                seg_bs[seg] = derive_bs(mb_p, mb_q, blk_p, blk_q, intra_bs, mvy_limit);
             }
 
             // Luma: filter each segment independently
@@ -521,6 +502,467 @@ fn filter_frame_inner(
     }
 }
 
+/// Interlaced structure of the picture being deblocked.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Interlace<'a> {
+    /// MBAFF frame: `mb_field_decoding_flag` of each macroblock pair.
+    pub(crate) mbaff_field: Option<&'a [bool]>,
+    /// Field picture: horizontal MB edges next to intra MBs get bS 3 and
+    /// vertical MV differences count from 2 (field units).
+    pub(crate) field_pic: bool,
+}
+
+#[inline]
+fn is_intra(mb: &MbInfo) -> bool {
+    mb.mb_type == MbType::Intra || mb.mb_type == MbType::Ipcm
+}
+
+/// Sample layout of one macroblock: rows `y0 + r` at line step `ls`
+/// starting at column offset `x0` (the line step and offset place an MBAFF
+/// field MB on every other frame line), and likewise for chroma.
+#[derive(Clone, Copy)]
+struct MbGeom {
+    x0: usize,
+    y0: usize,
+    ls: usize,
+    cx0: usize,
+    cy0: usize,
+    cls: usize,
+}
+
+impl MbGeom {
+    fn mbaff(mb_idx: usize, mb_width: usize, field: bool) -> Self {
+        let (stride_y, stride_c) = (mb_width * 16, mb_width * 8);
+        let pair = mb_idx / 2;
+        let (col, prow, bottom) = (pair % mb_width, pair / mb_width, mb_idx % 2);
+        if field {
+            MbGeom {
+                x0: bottom * stride_y + col * 16,
+                y0: prow * 16,
+                ls: 2 * stride_y,
+                cx0: bottom * stride_c + col * 8,
+                cy0: prow * 8,
+                cls: 2 * stride_c,
+            }
+        } else {
+            MbGeom {
+                x0: col * 16,
+                y0: prow * 32 + 16 * bottom,
+                ls: stride_y,
+                cx0: col * 8,
+                cy0: prow * 16 + 8 * bottom,
+                cls: stride_c,
+            }
+        }
+    }
+}
+
+/// Edge filter parameters for luma and both chroma planes.
+#[derive(Clone, Copy)]
+struct EdgeQp {
+    luma: (usize, i32, i32),
+    chroma: [(usize, i32, i32); 2],
+}
+
+impl EdgeQp {
+    fn new(qp_p: i32, qp_q: i32, off_a: i32, off_b: i32, cqp_offset: [i32; 2]) -> Self {
+        let params = |qp: i32| {
+            let index_a = (qp + off_a).clamp(0, 51) as usize;
+            let index_b = (qp + off_b).clamp(0, 51) as usize;
+            (index_a, ALPHA_TABLE[index_a], BETA_TABLE[index_b])
+        };
+        let chroma = cqp_offset.map(|o| params((chroma_qp(qp_p, o) + chroma_qp(qp_q, o) + 1) >> 1));
+        EdgeQp {
+            luma: params((qp_p.wrapping_add(qp_q).wrapping_add(1)) >> 1),
+            chroma,
+        }
+    }
+}
+
+#[inline]
+fn tc0_for(index_a: usize, bs: i32) -> i32 {
+    if bs < 4 {
+        TC0_TABLE[index_a][(bs - 1) as usize]
+    } else {
+        0
+    }
+}
+
+/// Filter the vertical edge at luma column `ex` (chroma `ex / 2` when even)
+/// of an MB with geometry `g`; `bs[k]` covers luma rows `4k..4k + 4`.
+fn filter_v_edge(frame: &mut Frame, g: MbGeom, ex: usize, bs: [i32; 4], qp: EdgeQp) {
+    let (index_a, alpha, beta) = qp.luma;
+    for (seg, &b) in bs.iter().enumerate() {
+        if b != 0 {
+            let tc0 = tc0_for(index_a, b);
+            filter_edge_v(
+                &mut frame.y,
+                g.ls,
+                g.x0 + ex,
+                g.y0 + seg * 4,
+                4,
+                b,
+                alpha,
+                beta,
+                tc0,
+            );
+        }
+    }
+    if ex.is_multiple_of(8) {
+        for (plane, (c_index_a, c_alpha, c_beta)) in
+            [(&mut frame.u, qp.chroma[0]), (&mut frame.v, qp.chroma[1])]
+        {
+            for cy in 0..8 {
+                let b = bs[cy / 2];
+                if b != 0 {
+                    let tc0 = tc0_for(c_index_a, b);
+                    filter_edge_v_chroma(
+                        plane,
+                        g.cls,
+                        g.cx0 + ex / 2,
+                        g.cy0 + cy,
+                        1,
+                        b,
+                        c_alpha,
+                        c_beta,
+                        tc0,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Filter the horizontal edge at luma row `ey` of an MB with geometry `g`;
+/// `bs[k]` covers luma columns `4k..4k + 4`.
+fn filter_h_edge(frame: &mut Frame, g: MbGeom, ey: usize, bs: [i32; 4], qp: EdgeQp) {
+    let (index_a, alpha, beta) = qp.luma;
+    for (seg, &b) in bs.iter().enumerate() {
+        if b != 0 {
+            let tc0 = tc0_for(index_a, b);
+            filter_edge_h(
+                &mut frame.y,
+                g.ls,
+                g.x0 + seg * 4,
+                g.y0 + ey,
+                4,
+                b,
+                alpha,
+                beta,
+                tc0,
+            );
+        }
+    }
+    if ey.is_multiple_of(8) {
+        for (plane, (c_index_a, c_alpha, c_beta)) in
+            [(&mut frame.u, qp.chroma[0]), (&mut frame.v, qp.chroma[1])]
+        {
+            for cx in 0..8 {
+                let b = bs[cx / 2];
+                if b != 0 {
+                    let tc0 = tc0_for(c_index_a, b);
+                    filter_edge_h_chroma(
+                        plane,
+                        g.cls,
+                        g.cx0 + cx,
+                        g.cy0 + ey / 2,
+                        1,
+                        b,
+                        c_alpha,
+                        c_beta,
+                        tc0,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// bS of the four segments of an edge between `p` and `q` (blocks `blk_p`
+/// / `blk_q` per segment). `intra_bs` is used when either MB is intra;
+/// `mixed` marks a frame/field MB edge, which gets at least 1.
+#[allow(clippy::too_many_arguments)]
+fn edge_bs(
+    p: &MbInfo,
+    q: &MbInfo,
+    blk_p: impl Fn(usize) -> usize,
+    blk_q: impl Fn(usize) -> usize,
+    intra_bs: i32,
+    mixed: bool,
+    mvy_limit: i32,
+) -> [i32; 4] {
+    if is_intra(p) || is_intra(q) {
+        return [intra_bs; 4];
+    }
+    core::array::from_fn(|seg| {
+        let (bp, bq) = (blk_p(seg), blk_q(seg));
+        if p.nnz[bp] || q.nnz[bq] {
+            2
+        } else if mixed || check_mv_diff(p, q, bp, bq, mvy_limit) {
+            1
+        } else {
+            0
+        }
+    })
+}
+
+/// Deblock macroblock `m` of an MBAFF frame (spec 8.7 with MbaffFrameFlag,
+/// following FFmpeg's `ff_h264_filter_mb`). Field MBs are filtered on their
+/// own field lines; edges between a frame and a field pair use the sample
+/// geometry of spec Table 6-4:
+/// - a left edge to a pair of the other kind takes, per row, the left MB and
+///   QP that hold the neighbouring sample (bS 4 next to intra, else 1 or 2);
+/// - the top edge of a frame MB below a field pair is filtered twice, once
+///   against each field of that pair;
+/// - the top edge of a field MB uses the same-parity lines of the pair above.
+#[allow(clippy::too_many_arguments)]
+fn filter_mb_mbaff(
+    frame: &mut Frame,
+    mb_info: &[MbInfo],
+    mb_width: usize,
+    mb_slice_id: &[u16],
+    slices: &[SliceDeblock],
+    cqp_offset: [i32; 2],
+    mb_field: &[bool],
+    m: usize,
+) {
+    let pair = m / 2;
+    let (col, prow, bottom) = (pair % mb_width, pair / mb_width, m % 2 == 1);
+    let Some(&field) = mb_field.get(pair) else {
+        return;
+    };
+    let g = MbGeom::mbaff(m, mb_width, field);
+    let q = &mb_info[m];
+    let slice_id = mb_slice_id.get(m).copied().unwrap_or(0);
+    let slice = slices
+        .get(usize::from(slice_id))
+        .or(slices.last())
+        .copied()
+        .unwrap_or_default();
+    if slice.disable_deblocking_filter_idc == 1 {
+        return;
+    }
+    let off_a = slice.slice_alpha_c0_offset_div2.wrapping_mul(2);
+    let off_b = slice.slice_beta_offset_div2.wrapping_mul(2);
+    let other_slice = |n: usize| {
+        slice.disable_deblocking_filter_idc == 2
+            && mb_slice_id.get(n).copied().unwrap_or(slice_id) != slice_id
+    };
+    let mvy_limit = if field { 2 } else { 4 };
+    let pair_field = |mb: usize| mb_field.get(mb / 2).copied().unwrap_or(false);
+
+    // -- Left MB edge --
+    if col > 0 && !other_slice((pair - 1) * 2) {
+        let lp = pair - 1;
+        if pair_field(lp * 2) == field {
+            let p = &mb_info[lp * 2 + bottom as usize];
+            let bs = edge_bs(
+                p,
+                q,
+                |s| blk_idx(3, s),
+                |s| blk_idx(0, s),
+                4,
+                false,
+                mvy_limit,
+            );
+            filter_v_edge(
+                frame,
+                g,
+                0,
+                bs,
+                EdgeQp::new(p.qp_y, q.qp_y, off_a, off_b, cqp_offset),
+            );
+        } else {
+            filter_mixed_left_edge(
+                frame, mb_info, g, q, lp, field, bottom, off_a, off_b, cqp_offset,
+            );
+        }
+    }
+    // -- Internal vertical edges --
+    for edge in 1..4 {
+        if (edge & 1) != 0 && q.is_8x8dct {
+            continue;
+        }
+        let bs = edge_bs(
+            q,
+            q,
+            |s| blk_idx(edge - 1, s),
+            |s| blk_idx(edge, s),
+            3,
+            false,
+            mvy_limit,
+        );
+        filter_v_edge(
+            frame,
+            g,
+            edge * 4,
+            bs,
+            EdgeQp::new(q.qp_y, q.qp_y, off_a, off_b, cqp_offset),
+        );
+    }
+
+    // -- Top MB edge --
+    let above = if !field && bottom {
+        Some(m - 1)
+    } else if prow > 0 {
+        let ap = pair - mb_width;
+        Some(if field && !bottom && pair_field(ap * 2) {
+            ap * 2
+        } else {
+            ap * 2 + 1
+        })
+    } else {
+        None
+    };
+    if let Some(pm) = above.filter(|&pm| !other_slice(pm)) {
+        if !field && !bottom && pair_field(pm) {
+            // Frame MB below a field pair: filter against each field
+            let ap = pm / 2;
+            for j in 0..2 {
+                let p = &mb_info[ap * 2 + j];
+                let bs = if is_intra(p) || is_intra(q) {
+                    [3; 4]
+                } else {
+                    core::array::from_fn(|s| {
+                        1 + (q.nnz[blk_idx(s, 0)] || p.nnz[blk_idx(s, 3)]) as i32
+                    })
+                };
+                let gj = MbGeom {
+                    x0: j * g.ls + g.x0,
+                    y0: g.y0 / 2,
+                    ls: 2 * g.ls,
+                    cx0: j * g.cls + g.cx0,
+                    cy0: g.cy0 / 2,
+                    cls: 2 * g.cls,
+                };
+                filter_h_edge(
+                    frame,
+                    gj,
+                    0,
+                    bs,
+                    EdgeQp::new(p.qp_y, q.qp_y, off_a, off_b, cqp_offset),
+                );
+            }
+        } else {
+            let p = &mb_info[pm];
+            let p_field = pair_field(pm);
+            let intra_bs = if field || p_field { 3 } else { 4 };
+            let bs = edge_bs(
+                p,
+                q,
+                |s| blk_idx(s, 3),
+                |s| blk_idx(s, 0),
+                intra_bs,
+                p_field != field,
+                mvy_limit,
+            );
+            filter_h_edge(
+                frame,
+                g,
+                0,
+                bs,
+                EdgeQp::new(p.qp_y, q.qp_y, off_a, off_b, cqp_offset),
+            );
+        }
+    }
+    // -- Internal horizontal edges --
+    for edge in 1..4 {
+        if (edge & 1) != 0 && q.is_8x8dct {
+            continue;
+        }
+        let bs = edge_bs(
+            q,
+            q,
+            |s| blk_idx(s, edge - 1),
+            |s| blk_idx(s, edge),
+            3,
+            false,
+            mvy_limit,
+        );
+        filter_h_edge(
+            frame,
+            g,
+            edge * 4,
+            bs,
+            EdgeQp::new(q.qp_y, q.qp_y, off_a, off_b, cqp_offset),
+        );
+    }
+}
+
+/// Left MB edge of `q` next to left pair `lp` coded the other way (frame vs
+/// field). Each of the 16 rows of `q` borders the left MB holding the
+/// sample beside it: for a field `q` the left frame pair's top MB for rows
+/// 0-7 and bottom MB for rows 8-15, for a frame `q` the left field pair's
+/// MB of the row's parity. bS is 4 next to an intra MB, else 1, or 2 with
+/// coefficients on either side; the QP is that of the row's left MB.
+#[allow(clippy::too_many_arguments)]
+fn filter_mixed_left_edge(
+    frame: &mut Frame,
+    mb_info: &[MbInfo],
+    g: MbGeom,
+    q: &MbInfo,
+    lp: usize,
+    field: bool,
+    bottom: bool,
+    off_a: i32,
+    off_b: i32,
+    cqp_offset: [i32; 2],
+) {
+    let left = [&mb_info[lp * 2], &mb_info[lp * 2 + 1]];
+    // bS per pair of rows (index i), as FFmpeg orders them
+    let bs8: [i32; 8] = core::array::from_fn(|i| {
+        let l = left[if field { i >> 2 } else { i & 1 }];
+        if is_intra(q) || is_intra(l) {
+            return 4;
+        }
+        let l_row = if field {
+            i & 3
+        } else {
+            (i >> 2) + if bottom { 2 } else { 0 }
+        };
+        1 + (q.nnz[blk_idx(0, i >> 1)] || l.nnz[blk_idx(3, l_row)]) as i32
+    });
+    let qps = left.map(|l| EdgeQp::new(l.qp_y, q.qp_y, off_a, off_b, cqp_offset));
+    for r in 0..16 {
+        let (i, j) = if field {
+            (r >> 1, r >> 3)
+        } else {
+            (2 * (r >> 2) + (r & 1), r & 1)
+        };
+        let (index_a, alpha, beta) = qps[j].luma;
+        let b = bs8[i];
+        filter_edge_v(
+            &mut frame.y,
+            g.ls,
+            g.x0,
+            g.y0 + r,
+            1,
+            b,
+            alpha,
+            beta,
+            tc0_for(index_a, b),
+        );
+    }
+    for (c, plane) in [&mut frame.u, &mut frame.v].into_iter().enumerate() {
+        // Chroma row cy takes the bS of row pair cy (as FFmpeg)
+        for (cy, &b) in bs8.iter().enumerate() {
+            let j = if field { cy >> 2 } else { cy & 1 };
+            let (c_index_a, c_alpha, c_beta) = qps[j].chroma[c];
+            filter_edge_v_chroma(
+                plane,
+                g.cls,
+                g.cx0,
+                g.cy0 + cy,
+                1,
+                b,
+                c_alpha,
+                c_beta,
+                tc0_for(c_index_a, b),
+            );
+        }
+    }
+}
+
 /// Convert (column, row) in 4x4-block units to raster-scan 4x4 block index.
 /// Layout: col 0-1 = left 8x8, col 2-3 = right 8x8; row 0-1 = top 8x8, row 2-3 = bottom.
 /// Raster: 0,1,4,5 / 2,3,6,7 / 8,9,12,13 / 10,11,14,15
@@ -536,13 +978,19 @@ fn blk_idx(col: usize, row: usize) -> usize {
 ///
 /// `mb_p`/`mb_q`: macroblock info for each side of the edge.
 /// `blk_p`/`blk_q`: 4x4 block index (0-15 raster) within each MB.
-/// `is_mb_edge`: true if the edge is on a macroblock boundary.
-fn derive_bs(mb_p: &MbInfo, mb_q: &MbInfo, blk_p: usize, blk_q: usize, is_mb_edge: bool) -> i32 {
-    let intra_p = mb_p.mb_type == MbType::Intra || mb_p.mb_type == MbType::Ipcm;
-    let intra_q = mb_q.mb_type == MbType::Intra || mb_q.mb_type == MbType::Ipcm;
-
-    if intra_p || intra_q {
-        return if is_mb_edge { 4 } else { 3 };
+/// `intra_bs`: bS when either MB is intra (4 on most MB edges, else 3).
+/// `mvy_limit`: vertical MV difference that counts as different motion, 4
+/// quarter samples, or 2 for field MBs whose MVs are in field units.
+fn derive_bs(
+    mb_p: &MbInfo,
+    mb_q: &MbInfo,
+    blk_p: usize,
+    blk_q: usize,
+    intra_bs: i32,
+    mvy_limit: i32,
+) -> i32 {
+    if is_intra(mb_p) || is_intra(mb_q) {
+        return intra_bs;
     }
 
     // bS=2: either side has non-zero coded coefficients
@@ -551,7 +999,7 @@ fn derive_bs(mb_p: &MbInfo, mb_q: &MbInfo, blk_p: usize, blk_q: usize, is_mb_edg
     }
 
     // bS=1 or 0: check reference indices and motion vectors
-    if check_mv_diff(mb_p, mb_q, blk_p, blk_q) {
+    if check_mv_diff(mb_p, mb_q, blk_p, blk_q, mvy_limit) {
         return 1;
     }
 
@@ -559,8 +1007,9 @@ fn derive_bs(mb_p: &MbInfo, mb_q: &MbInfo, blk_p: usize, blk_q: usize, is_mb_edg
 }
 
 /// Check if two 4x4 blocks have different motion (spec 8.7.2.1 conditions for bS=1).
-/// Returns true if reference pictures differ or |MV_diff| >= 4 in any component.
-fn check_mv_diff(mb_p: &MbInfo, mb_q: &MbInfo, blk_p: usize, blk_q: usize) -> bool {
+/// Returns true if reference pictures differ or the MVs differ by 4 or more
+/// horizontally or `mvy_limit` or more vertically.
+fn check_mv_diff(mb_p: &MbInfo, mb_q: &MbInfo, blk_p: usize, blk_q: usize, mvy_limit: i32) -> bool {
     let list_count = mb_p.list_count.max(mb_q.list_count);
 
     if list_count <= 1 {
@@ -578,7 +1027,7 @@ fn check_mv_diff(mb_p: &MbInfo, mb_q: &MbInfo, blk_p: usize, blk_q: usize) -> bo
         if mb_p.ref_poc_l0[blk_p] != mb_q.ref_poc_l0[blk_q] {
             return true;
         }
-        if mv_diff_ge4(mb_p.mv_l0[blk_p], mb_q.mv_l0[blk_q]) {
+        if mv_differs(mb_p.mv_l0[blk_p], mb_q.mv_l0[blk_q], mvy_limit) {
             return true;
         }
         return false;
@@ -595,6 +1044,7 @@ fn check_mv_diff(mb_p: &MbInfo, mb_q: &MbInfo, blk_p: usize, blk_q: usize) -> bo
         mb_q.ref_idx_l0[blk_q],
         mb_q.ref_poc_l0[blk_q],
         mb_q.mv_l0[blk_q],
+        mvy_limit,
     ) && refs_and_mvs_match(
         mb_p.ref_idx_l1[blk_p],
         mb_p.ref_poc_l1[blk_p],
@@ -602,6 +1052,7 @@ fn check_mv_diff(mb_p: &MbInfo, mb_q: &MbInfo, blk_p: usize, blk_q: usize) -> bo
         mb_q.ref_idx_l1[blk_q],
         mb_q.ref_poc_l1[blk_q],
         mb_q.mv_l1[blk_q],
+        mvy_limit,
     );
 
     if straight_match {
@@ -616,6 +1067,7 @@ fn check_mv_diff(mb_p: &MbInfo, mb_q: &MbInfo, blk_p: usize, blk_q: usize) -> bo
         mb_q.ref_idx_l1[blk_q],
         mb_q.ref_poc_l1[blk_q],
         mb_q.mv_l1[blk_q],
+        mvy_limit,
     ) && refs_and_mvs_match(
         mb_p.ref_idx_l1[blk_p],
         mb_p.ref_poc_l1[blk_p],
@@ -623,6 +1075,7 @@ fn check_mv_diff(mb_p: &MbInfo, mb_q: &MbInfo, blk_p: usize, blk_q: usize) -> bo
         mb_q.ref_idx_l0[blk_q],
         mb_q.ref_poc_l0[blk_q],
         mb_q.mv_l0[blk_q],
+        mvy_limit,
     );
 
     !swapped_match
@@ -637,6 +1090,7 @@ fn refs_and_mvs_match(
     ref_b: i8,
     poc_b: i32,
     mv_b: [i16; 2],
+    mvy_limit: i32,
 ) -> bool {
     if ref_a < 0 && ref_b < 0 {
         return true; // both unused
@@ -647,13 +1101,15 @@ fn refs_and_mvs_match(
     if poc_a != poc_b {
         return false; // different pictures
     }
-    !mv_diff_ge4(mv_a, mv_b)
+    !mv_differs(mv_a, mv_b, mvy_limit)
 }
 
-/// Returns true if |mv_a - mv_b| >= 4 in either component (quarter-pel).
+/// Returns true if the MVs differ by 4 or more horizontally or `mvy_limit`
+/// or more vertically (quarter-pel).
 #[inline]
-fn mv_diff_ge4(mv_a: [i16; 2], mv_b: [i16; 2]) -> bool {
-    (mv_a[0] - mv_b[0]).unsigned_abs() >= 4 || (mv_a[1] - mv_b[1]).unsigned_abs() >= 4
+fn mv_differs(mv_a: [i16; 2], mv_b: [i16; 2], mvy_limit: i32) -> bool {
+    (mv_a[0] as i32 - mv_b[0] as i32).abs() >= 4
+        || (mv_a[1] as i32 - mv_b[1] as i32).abs() >= mvy_limit
 }
 
 /// Filter one 4-sample segment of a vertical edge.
@@ -1122,7 +1578,7 @@ mod tests {
             slices,
             cb,
             cr,
-            false,
+            Interlace::default(),
         );
         frame
     }

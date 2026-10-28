@@ -191,10 +191,16 @@ Baseline, Main and High profile 8-bit 4:2:0 decoding is complete: I/P/B slices w
 - Full spec 8.7.2.1 per-4x4-block boundary strength derivation:
   bS=4 (intra MB edge), bS=3 (intra internal), bS=2 (non-zero coefficients),
   bS=1 (different refs or |MV_diff|>=4), bS=0 (none). B-slice dual-list
-  straight+swapped comparison.
+  straight+swapped comparison. Field MBs and field pictures: vertical MV limit 2
+  and bS=3 for intra horizontal MB edges
 - 8x8 transform: internal odd edges (positions 4 and 12 within MB) skipped
   per spec 8.7.2.1 — they fall inside 8x8 transform blocks
-- MBAFF-aware: pair-based MB position, left/above neighbor addressing for MB pairs
+- MBAFF (`filter_mb_mbaff`, ported from FFmpeg's `ff_h264_filter_mb`): field MBs
+  are filtered on their own field lines (`MbGeom`); a left edge to a pair coded the
+  other way takes bS/QP per row from the left MB holding that row's neighbour; the
+  top edge of a frame MB below a field pair is filtered twice, once per field; a
+  field MB's top edge uses the same-parity lines above. Field MB refs compare as
+  fields (`ref_poc` holds field POC and parity)
 - Each MB uses its own slice's settings (`SliceDeblock` by slice ID), including
   disable_deblocking_filter_idc 2 (no filtering across slice edges); Cr uses
   second_chroma_qp_index_offset
@@ -220,23 +226,38 @@ Baseline, Main and High profile 8-bit 4:2:0 decoding is complete: I/P/B slices w
 - MB-pair addressing: `mb_idx = pair_addr * 2 + {0=top, 1=bottom}`, pair-based pixel coordinates
 - `mb_field_decoding_flag`: per-pair flag decoded via CABAC (contexts 70-72) and CAVLC (1 bit),
   with correct skip/non-skip ordering for I/P/B slices
-- MBAFF neighbor derivation (spec Tables 6-3, 6-4): `mbaff_left_neighbor`, `mbaff_above_neighbor`
-  with y-coordinate remapping for all 4 frame/field mode combinations
-- All 4 MV neighbor functions (left, above, above-right, above-left) MBAFF-aware
-  with MVy scaling (×2 field→frame, /2 frame→field) at cross-mode boundaries
-- All CABAC/CAVLC context functions MBAFF-aware: `cabac_amvd`, `cabac_neighbor_ref`,
-  `cabac_neighbor_nz_luma/chroma`, `predict_i4x4_mode`, `compute_nc`
+- MBAFF neighbor derivation (spec 6.4.12.2, Table 6-4): `neighbor::mbaff_neighbor_loc`
+  maps a neighbouring sample location to the MB and position holding it, geometrically
+  (sample row → pair line → MB of that pair). Every cross-MB lookup goes through it:
+  MV prediction (`mbaff_mv_at`, MVy ×2 field→frame, /2 frame→field, ref_idx scaled),
+  CABAC contexts (`cabac_amvd` with |mvd| scaling, `cabac_neighbor_ref`, coded_block_flag,
+  per-8x8-row luma CBP bits in `cabac_cbp_context`), CAVLC nC, intra 4x4/8x8 mode
+  prediction, intra above-left/above-right availability (`intra_corner_avail`)
+- `mb_field_decoding_flag` of a pair: inferred at the top MB (left pair, else above
+  pair, in the same slice, else frame); CABAC contexts 70-72 count only same-slice
+  pairs; for a skipped top MB the bottom MB's skip flag (CABAC) or the flag after the
+  skip run (CAVLC) is read first, so the flag decoded with the bottom MB applies to both
 - Field-coded MB pair support: per-MB `ly_stride`/`ly_offset`/`lc_stride`/`lc_offset` for
   doubled-stride field pixel layout; field-aware MC via `luma_mc_stride` with `ref_y_offset`
   for top/bottom field reference access; field-aware intra prediction neighbor reads
 - Field reference list: `effective_num_ref` doubles ref count for field MBs (each frame ref
   becomes same-parity + opposite-parity field entries); `frame_ref_idx` maps field ref_idx
-  to frame-level reference list index; `mc_params` determines field offset from ref_idx parity
+  to frame-level reference list index (every MC path, CAVLC and CABAC, P, B and direct);
+  `mc_params` determines field offset from ref_idx parity; chroma MVs of field MBs get the
+  ±2 opposite-parity offset (`chroma_mv_offset`)
+- Weighted prediction of field MBs (`WeightContext::mb` → `MbWeights`): explicit weights
+  use `ref_idx >> 1`, implicit weights come from per-parity tables over field POCs
+  (`SlicePlan::implicit_weights_field`); pictures carry `field_poc` (top/bottom POCs)
+- Direct mode: the co-located MB of a pair coded the other way follows spec Table 8-6
+  (`colocated_pos`; frame MB → field closer in POC, field MB → top/bottom MB by 8x8 row);
+  temporal direct maps the co-located reference to fields, scales by field POCs, and
+  doubles or halves the co-located vertical MV (`derive_temporal_direct_blk`)
 - Field-coded CABAC contexts: significance/last coefficient flag offsets switch to field
-  tables (ctxIdx 277+/338+) per spec Table 9-34; field-coded bottom MB "above" neighbor
-  uses same-field MB from above pair (not top of current pair)
+  tables (ctxIdx 277+/338+) per spec Table 9-34, with the field column of Table 9-43 for
+  8x8 significance; the field 8x8 scans (CABAC, and the CAVLC 4-way interleave) follow
+  spec Table 8-13; field-coded bottom MB "above" neighbor uses same-field MB from above
+  pair (not top of current pair)
 - POC computation: `min(TopFieldOrderCnt, BottomFieldOrderCnt)` for types 0 and 1
-- Deblocking: pair-based iteration with correct left/above neighbor addressing
 - CABAC end-of-slice: `cabac_terminate` after bottom MBs only
 
 **Error Handling** (`src/error.rs`)
@@ -248,7 +269,8 @@ Baseline, Main and High profile 8-bit 4:2:0 decoding is complete: I/P/B slices w
   deblocking, DPB) plus whole-stream tests that compare decoded output against FFmpeg
   (YUV or SHA-256) for every stream in `testdata/`: synthetic CAVLC/CABAC clips, x264
   presets with and without deblocking, High profile, multi-slice, weighted prediction,
-  long-term references and POC types from the JM encoder, MBAFF and field pictures,
+  long-term references and POC types from the JM encoder, MBAFF and field pictures
+  (including `mbaff_x264_*`: x264 --interlaced streams mixing frame and field pairs),
   non-16-aligned sizes, up to 1080p
 - `testdata/unsupported_*.h264`: one tiny stream per rejected format
 - `testdata/fuzz_regressions/`: crash inputs replayed to check they don't panic

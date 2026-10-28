@@ -59,6 +59,12 @@ impl SliceContext<'_> {
             (raw_mb_type - inter_limit, false)
         };
         if is_inter && sp.is_b_slice {
+            // Field MBs in MBAFF address each frame reference as two fields
+            let num_ref_l0 = self.effective_num_ref(mb_idx, sp.num_ref_idx_l0_active);
+            let num_ref_l1 = self.effective_num_ref(mb_idx, sp.num_ref_idx_l1_active);
+            // Reference list index of a (field) ref_idx; see `frame_ref_idx`
+            let field_mb = self.mbaff && self.mb_field_decoding[mb_idx / 2];
+            let fri = move |r: i8| if field_mb { r / 2 } else { r };
             // === Inter (B) macroblock ===
             // Table 7-11: mb_type 0=B_Direct_16x16, 1=B_L0_16x16,
             // 2=B_L1_16x16, 3=B_Bi_16x16, 4-21=16x8/8x16 variants, 22=B_8x8
@@ -81,11 +87,7 @@ impl SliceContext<'_> {
                 1 | 2 => {
                     // B_L0_16x16 (mb_type=1) or B_L1_16x16 (mb_type=2)
                     let is_l0 = mb_type == 1;
-                    let num_active = if is_l0 {
-                        sp.num_ref_idx_l0_active
-                    } else {
-                        sp.num_ref_idx_l1_active
-                    };
+                    let num_active = if is_l0 { num_ref_l0 } else { num_ref_l1 };
 
                     let ref_idx = if num_active > 1 {
                         reader.read_te(num_active - 1)? as i8
@@ -204,13 +206,13 @@ impl SliceContext<'_> {
                 }
                 3 => {
                     // B_Bi_16x16: both L0 and L1, averaged
-                    let ref_idx_l0 = if sp.num_ref_idx_l0_active > 1 {
-                        reader.read_te(sp.num_ref_idx_l0_active - 1)? as i8
+                    let ref_idx_l0 = if num_ref_l0 > 1 {
+                        reader.read_te(num_ref_l0 - 1)? as i8
                     } else {
                         0
                     };
-                    let ref_idx_l1 = if sp.num_ref_idx_l1_active > 1 {
-                        reader.read_te(sp.num_ref_idx_l1_active - 1)? as i8
+                    let ref_idx_l1 = if num_ref_l1 > 1 {
+                        reader.read_te(num_ref_l1 - 1)? as i8
                     } else {
                         0
                     };
@@ -325,15 +327,15 @@ impl SliceContext<'_> {
                     let mut part_ref_l0 = [-1i8; 2];
                     let mut part_ref_l1 = [-1i8; 2];
                     for p in 0..2 {
-                        if pred_flags[p].0 && sp.num_ref_idx_l0_active > 1 {
-                            part_ref_l0[p] = reader.read_te(sp.num_ref_idx_l0_active - 1)? as i8;
+                        if pred_flags[p].0 && num_ref_l0 > 1 {
+                            part_ref_l0[p] = reader.read_te(num_ref_l0 - 1)? as i8;
                         } else if pred_flags[p].0 {
                             part_ref_l0[p] = 0;
                         }
                     }
                     for p in 0..2 {
-                        if pred_flags[p].1 && sp.num_ref_idx_l1_active > 1 {
-                            part_ref_l1[p] = reader.read_te(sp.num_ref_idx_l1_active - 1)? as i8;
+                        if pred_flags[p].1 && num_ref_l1 > 1 {
+                            part_ref_l1[p] = reader.read_te(num_ref_l1 - 1)? as i8;
                         } else if pred_flags[p].1 {
                             part_ref_l1[p] = 0;
                         }
@@ -490,8 +492,8 @@ impl SliceContext<'_> {
                             continue;
                         } // B_Direct_8x8: no ref_idx
                         let (_, _, pl0, _) = B_SUB_TABLE[sub_mb_types[smb] as usize];
-                        if pl0 && sp.num_ref_idx_l0_active > 1 {
-                            sub_ref_l0[smb] = reader.read_te(sp.num_ref_idx_l0_active - 1)? as i8;
+                        if pl0 && num_ref_l0 > 1 {
+                            sub_ref_l0[smb] = reader.read_te(num_ref_l0 - 1)? as i8;
                         } else if pl0 {
                             sub_ref_l0[smb] = 0;
                         }
@@ -501,8 +503,8 @@ impl SliceContext<'_> {
                             continue;
                         }
                         let (_, _, _, pl1) = B_SUB_TABLE[sub_mb_types[smb] as usize];
-                        if pl1 && sp.num_ref_idx_l1_active > 1 {
-                            sub_ref_l1[smb] = reader.read_te(sp.num_ref_idx_l1_active - 1)? as i8;
+                        if pl1 && num_ref_l1 > 1 {
+                            sub_ref_l1[smb] = reader.read_te(num_ref_l1 - 1)? as i8;
                         } else if pl1 {
                             sub_ref_l1[smb] = 0;
                         }
@@ -788,6 +790,8 @@ impl SliceContext<'_> {
                 && cbp_luma != 0
                 && no_sub_less_8x8_b
                 && reader.read_bit()? != 0;
+            // Deblocking skips the internal 4x4 edges of 8x8-transform MBs
+            self.mb_is_8x8dct[mb_idx] = use_8x8_dct_b;
 
             let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
                 let mb_qp_delta = reader.read_se()?;
@@ -888,7 +892,7 @@ impl SliceContext<'_> {
                     // Bi-prediction: average L0 and L1
                     let mut pred_l0 = vec![0u8; sub_part.w * sub_part.h];
                     let mut pred_l1 = vec![0u8; sub_part.w * sub_part.h];
-                    let ref_l0 = ref_pic_safe(sp.ref_pic_list_l0, sub_part.ref_idx_l0)
+                    let ref_l0 = ref_pic_safe(sp.ref_pic_list_l0, fri(sub_part.ref_idx_l0))
                         .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
                     let (
                         mc_y_l0,
@@ -910,7 +914,7 @@ impl SliceContext<'_> {
                         ref_stride_l0,
                         ref_y_off_l0,
                     );
-                    let ref_l1 = ref_pic_safe(sp.ref_pic_list_l1, sub_part.ref_idx_l1)
+                    let ref_l1 = ref_pic_safe(sp.ref_pic_list_l1, fri(sub_part.ref_idx_l1))
                         .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
                     let (
                         mc_y_l1,
@@ -932,17 +936,19 @@ impl SliceContext<'_> {
                         ref_stride_l1,
                         ref_y_off_l1,
                     );
-                    sp.wctx.apply_bi(
-                        &pred_l0,
-                        &pred_l1,
-                        &mut luma_pred,
-                        sub_part.ref_idx_l0 as usize,
-                        sub_part.ref_idx_l1 as usize,
-                        false,
-                        0,
-                    );
+                    sp.wctx
+                        .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
+                        .apply_bi(
+                            &pred_l0,
+                            &pred_l1,
+                            &mut luma_pred,
+                            sub_part.ref_idx_l0 as usize,
+                            sub_part.ref_idx_l1 as usize,
+                            false,
+                            0,
+                        );
                 } else if sub_part.pred_l0 {
-                    let ref_pic = ref_pic_safe(sp.ref_pic_list_l0, sub_part.ref_idx_l0)
+                    let ref_pic = ref_pic_safe(sp.ref_pic_list_l0, fri(sub_part.ref_idx_l0))
                         .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
                     let (mc_y, ref_stride, ref_y_off, _mc_cy, _c_ref_stride, _c_ref_off) =
                         self.mc_params(mb_idx, mb_y, ref_pic.width as usize, sub_part.ref_idx_l0);
@@ -959,16 +965,12 @@ impl SliceContext<'_> {
                         ref_y_off,
                     );
                     if sp.use_weight == 1 {
-                        sp.wctx.apply_uni(
-                            &mut luma_pred,
-                            0,
-                            sub_part.ref_idx_l0 as usize,
-                            false,
-                            0,
-                        );
+                        sp.wctx
+                            .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
+                            .apply_uni(&mut luma_pred, 0, sub_part.ref_idx_l0 as usize, false, 0);
                     }
                 } else if sub_part.pred_l1 {
-                    let ref_pic = ref_pic_safe(sp.ref_pic_list_l1, sub_part.ref_idx_l1)
+                    let ref_pic = ref_pic_safe(sp.ref_pic_list_l1, fri(sub_part.ref_idx_l1))
                         .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
                     let (mc_y, ref_stride, ref_y_off, _mc_cy, _c_ref_stride, _c_ref_off) =
                         self.mc_params(mb_idx, mb_y, ref_pic.width as usize, sub_part.ref_idx_l1);
@@ -985,13 +987,9 @@ impl SliceContext<'_> {
                         ref_y_off,
                     );
                     if sp.use_weight == 1 {
-                        sp.wctx.apply_uni(
-                            &mut luma_pred,
-                            1,
-                            sub_part.ref_idx_l1 as usize,
-                            false,
-                            0,
-                        );
+                        sp.wctx
+                            .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
+                            .apply_uni(&mut luma_pred, 1, sub_part.ref_idx_l1 as usize, false, 0);
                     }
                 }
 
@@ -1061,19 +1059,19 @@ impl SliceContext<'_> {
             for sub_part in sub_parts.iter() {
                 if sub_part.pred_l0 && sub_part.pred_l1 {
                     // We'll handle L0/L1 separately inside; store L0 params as placeholder
-                    let ref_l0 = ref_pic_safe(sp.ref_pic_list_l0, sub_part.ref_idx_l0);
+                    let ref_l0 = ref_pic_safe(sp.ref_pic_list_l0, fri(sub_part.ref_idx_l0));
                     let w = ref_l0
                         .map(|r| r.width as usize)
                         .unwrap_or(self.width as usize);
                     sub_mc.push(self.mc_params(mb_idx, mb_y, w, sub_part.ref_idx_l0));
                 } else if sub_part.pred_l0 {
-                    let ref_pic = ref_pic_safe(sp.ref_pic_list_l0, sub_part.ref_idx_l0);
+                    let ref_pic = ref_pic_safe(sp.ref_pic_list_l0, fri(sub_part.ref_idx_l0));
                     let w = ref_pic
                         .map(|r| r.width as usize)
                         .unwrap_or(self.width as usize);
                     sub_mc.push(self.mc_params(mb_idx, mb_y, w, sub_part.ref_idx_l0));
                 } else {
-                    let ref_pic = ref_pic_safe(sp.ref_pic_list_l1, sub_part.ref_idx_l1);
+                    let ref_pic = ref_pic_safe(sp.ref_pic_list_l1, fri(sub_part.ref_idx_l1));
                     let w = ref_pic
                         .map(|r| r.width as usize)
                         .unwrap_or(self.width as usize);
@@ -1085,7 +1083,7 @@ impl SliceContext<'_> {
                 Vec::with_capacity(sub_parts.len());
             for sub_part in sub_parts.iter() {
                 if sub_part.pred_l0 && sub_part.pred_l1 {
-                    let ref_l1 = ref_pic_safe(sp.ref_pic_list_l1, sub_part.ref_idx_l1);
+                    let ref_l1 = ref_pic_safe(sp.ref_pic_list_l1, fri(sub_part.ref_idx_l1));
                     let w = ref_l1
                         .map(|r| r.width as usize)
                         .unwrap_or(self.width as usize);
@@ -1152,9 +1150,9 @@ impl SliceContext<'_> {
 
                     let mut part_pred = [0u8; 64];
                     if sub_part.pred_l0 && sub_part.pred_l1 {
-                        let ref_l0 = ref_pic_safe(sp.ref_pic_list_l0, sub_part.ref_idx_l0)
+                        let ref_l0 = ref_pic_safe(sp.ref_pic_list_l0, fri(sub_part.ref_idx_l0))
                             .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
-                        let ref_l1 = ref_pic_safe(sp.ref_pic_list_l1, sub_part.ref_idx_l1)
+                        let ref_l1 = ref_pic_safe(sp.ref_pic_list_l1, fri(sub_part.ref_idx_l1))
                             .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
                         let (
                             _mc_y_l0,
@@ -1184,15 +1182,17 @@ impl SliceContext<'_> {
                         };
                         let mut c_l0 = vec![0u8; cw * ch];
                         let mut c_l1 = vec![0u8; cw * ch];
-                        let cmv_y_off_l0 = crate::slice_context::chroma_field_mv_offset_impl(
-                            self.field_pic_flag,
-                            self.bottom_field_flag,
+                        let cmv_y_off_l0 = crate::slice_context::chroma_mv_offset_impl(
+                            (self.field_pic_flag, self.bottom_field_flag),
+                            (self.mbaff, self.width, self.lc_stride, self.lc_offset),
                             ref_l0,
+                            c_ref_off_l0,
                         );
-                        let cmv_y_off_l1 = crate::slice_context::chroma_field_mv_offset_impl(
-                            self.field_pic_flag,
-                            self.bottom_field_flag,
+                        let cmv_y_off_l1 = crate::slice_context::chroma_mv_offset_impl(
+                            (self.field_pic_flag, self.bottom_field_flag),
+                            (self.mbaff, self.width, self.lc_stride, self.lc_offset),
                             ref_l1,
+                            c_ref_off_l1,
                         );
                         inter_pred::chroma_mc(
                             cr_l0,
@@ -1219,22 +1219,24 @@ impl SliceContext<'_> {
                             &mut c_l1,
                         );
                         let chroma_comp = if scale_idx == 4 { 0 } else { 1 };
-                        sp.wctx.apply_bi(
-                            &c_l0,
-                            &c_l1,
-                            &mut part_pred,
-                            sub_part.ref_idx_l0 as usize,
-                            sub_part.ref_idx_l1 as usize,
-                            true,
-                            chroma_comp,
-                        );
+                        sp.wctx
+                            .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
+                            .apply_bi(
+                                &c_l0,
+                                &c_l1,
+                                &mut part_pred,
+                                sub_part.ref_idx_l0 as usize,
+                                sub_part.ref_idx_l1 as usize,
+                                true,
+                                chroma_comp,
+                            );
                     } else {
                         let (ref_list, ref_idx, mv) = if sub_part.pred_l0 {
                             (sp.ref_pic_list_l0, sub_part.ref_idx_l0, sub_part.mv_l0)
                         } else {
                             (sp.ref_pic_list_l1, sub_part.ref_idx_l1, sub_part.mv_l1)
                         };
-                        let ref_pic = ref_pic_safe(ref_list, ref_idx)
+                        let ref_pic = ref_pic_safe(ref_list, fri(ref_idx))
                             .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
                         let (_mc_y, _rs, _ref_y_off, mc_cy, c_ref_stride, c_ref_off) = sub_mc[sp_i];
                         let cr = if scale_idx == 4 {
@@ -1242,10 +1244,11 @@ impl SliceContext<'_> {
                         } else {
                             ref_pic.chroma_ref(1, c_ref_off)
                         };
-                        let cmv_y_off = crate::slice_context::chroma_field_mv_offset_impl(
-                            self.field_pic_flag,
-                            self.bottom_field_flag,
+                        let cmv_y_off = crate::slice_context::chroma_mv_offset_impl(
+                            (self.field_pic_flag, self.bottom_field_flag),
+                            (self.mbaff, self.width, self.lc_stride, self.lc_offset),
                             ref_pic,
+                            c_ref_off,
                         );
                         inter_pred::chroma_mc(
                             cr,
@@ -1267,6 +1270,7 @@ impl SliceContext<'_> {
                                 (1, sub_part.ref_idx_l1 as usize)
                             };
                             sp.wctx
+                                .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
                                 .apply_uni(&mut part_pred, list, ri_val, true, chroma_comp);
                         }
                     }
@@ -1488,6 +1492,8 @@ impl SliceContext<'_> {
                 && cbp_luma != 0
                 && no_sub_less_8x8
                 && reader.read_bit()? != 0;
+            // Deblocking skips the internal 4x4 edges of 8x8-transform MBs
+            self.mb_is_8x8dct[mb_idx] = use_8x8_dct;
 
             let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
                 let mb_qp_delta = reader.read_se()?;
@@ -1611,6 +1617,7 @@ impl SliceContext<'_> {
                 );
                 if sp.use_weight == 1 {
                     sp.wctx
+                        .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
                         .apply_uni(&mut luma_pred, 0, sub_part.ref_idx as usize, false, 0);
                 }
                 for r in 0..sub_part.h {
@@ -1766,10 +1773,11 @@ impl SliceContext<'_> {
                             part_ref_pic.chroma_ref(1, c_ref_off)
                         };
                         let mut part_pred = [0u8; 64];
-                        let cmv_y_off = crate::slice_context::chroma_field_mv_offset_impl(
-                            self.field_pic_flag,
-                            self.bottom_field_flag,
+                        let cmv_y_off = crate::slice_context::chroma_mv_offset_impl(
+                            (self.field_pic_flag, self.bottom_field_flag),
+                            (self.mbaff, self.width, self.lc_stride, self.lc_offset),
                             part_ref_pic,
+                            c_ref_off,
                         );
                         inter_pred::chroma_mc(
                             chroma_ref,
@@ -1785,13 +1793,15 @@ impl SliceContext<'_> {
                         );
                         if sp.use_weight == 1 {
                             let chroma_comp = if scale_idx == 4 { 0 } else { 1 };
-                            sp.wctx.apply_uni(
-                                &mut part_pred,
-                                0,
-                                sub_part.ref_idx as usize,
-                                true,
-                                chroma_comp,
-                            );
+                            sp.wctx
+                                .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
+                                .apply_uni(
+                                    &mut part_pred,
+                                    0,
+                                    sub_part.ref_idx as usize,
+                                    true,
+                                    chroma_comp,
+                                );
                         }
                         for r in 0..ch {
                             for c in 0..cw {
@@ -1829,37 +1839,8 @@ impl SliceContext<'_> {
         let left_mb_avail = self
             .left_mb(mb_idx)
             .is_some_and(|left| self.is_intra_neighbor_avail(left, sp));
-        let above_left_mb_avail = self
-            .above_mb(mb_idx)
-            .and_then(|above| self.left_mb(above))
-            .is_some_and(|al| self.is_intra_neighbor_avail(al, sp));
-        let above_right_mb_avail = if !self.mbaff {
-            mb_idx >= self.mb_width as usize
-                && (mb_idx % self.mb_width as usize) + 1 < self.mb_width as usize
-                && self.mb_slice_id[mb_idx - self.mb_width as usize + 1] == self.this_slice_id
-                && self.is_intra_neighbor_avail(mb_idx - self.mb_width as usize + 1, sp)
-        } else if !mb_idx.is_multiple_of(2) {
-            // MBAFF bottom MBs: above-right is in the next pair (not yet decoded)
-            false
-        } else {
-            self.above_mb(mb_idx)
-                .and_then(|above| {
-                    let above_pair = above / 2;
-                    let above_col = above_pair % self.mb_width as usize;
-                    if above_col + 1 >= self.mb_width as usize {
-                        return None;
-                    }
-                    let ar_mb = (above_pair + 1) * 2 + (above % 2);
-                    if self.mb_slice_id.get(ar_mb).copied() != Some(self.this_slice_id) {
-                        return None;
-                    }
-                    if !self.is_intra_neighbor_avail(ar_mb, sp) {
-                        return None;
-                    }
-                    Some(ar_mb)
-                })
-                .is_some()
-        };
+        let above_left_mb_avail = self.intra_corner_avail(mb_idx, -1, -1, sp);
+        let above_right_mb_avail = self.intra_corner_avail(mb_idx, 16, -1, sp);
 
         // Variables shared between I4x4/I16x16 for chroma reconstruction
         let intra_chroma_pred_mode;
@@ -1872,6 +1853,8 @@ impl SliceContext<'_> {
 
             // Check 8x8 transform flag
             let use_8x8_intra = sp.transform_8x8_mode_flag && reader.read_bit()? != 0;
+            // Deblocking skips the internal 4x4 edges of 8x8-transform MBs
+            self.mb_is_8x8dct[mb_idx] = use_8x8_intra;
 
             let intra_avail = self.intra_avail_map(sp);
 

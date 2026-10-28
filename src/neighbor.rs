@@ -3,7 +3,7 @@
 //! Functions for deriving neighbor-dependent context values used in
 //! CABAC syntax element decoding and CAVLC nC computation.
 
-use crate::residual::OFFSET_TO_BLOCK;
+use crate::residual::{BLOCK_INDEX_TO_OFFSET, OFFSET_TO_BLOCK};
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
@@ -57,6 +57,18 @@ pub(crate) fn cabac_amvd(
         // Within MB: block to the left at (py, px-4)
         let blk = OFFSET_TO_BLOCK[py / 4][(px - 4) / 4];
         mvd_store[mb_idx * 16 + blk][comp].unsigned_abs() as u32
+    } else if mbaff {
+        mbaff_amvd(
+            mvd_store,
+            mb_idx,
+            mb_width,
+            -1,
+            py as i32,
+            comp,
+            mb_slice_id,
+            cur_slice_id,
+            _mb_field_decoding,
+        )
     } else if has_left {
         // Left MB: rightmost column, same row
         if mb_slice_id[left_mb_idx] != cur_slice_id {
@@ -73,6 +85,18 @@ pub(crate) fn cabac_amvd(
     let top_mvd = if py > 0 {
         let blk = OFFSET_TO_BLOCK[(py - 4) / 4][px / 4];
         mvd_store[mb_idx * 16 + blk][comp].unsigned_abs() as u32
+    } else if mbaff {
+        mbaff_amvd(
+            mvd_store,
+            mb_idx,
+            mb_width,
+            px as i32,
+            -1,
+            comp,
+            mb_slice_id,
+            cur_slice_id,
+            _mb_field_decoding,
+        )
     } else if has_above {
         if mb_slice_id[above_mb_idx] != cur_slice_id {
             0
@@ -85,6 +109,78 @@ pub(crate) fn cabac_amvd(
     };
 
     left_mvd + top_mvd
+}
+
+/// MBAFF cross-MB |mvd| for the CABAC mvd context, with the vertical
+/// component scaled between frame and field MBs (spec 9.3.3.1.1.7).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn mbaff_amvd(
+    mvd_store: &[[i16; 2]],
+    mb_idx: usize,
+    mb_width: usize,
+    xn: i32,
+    yn: i32,
+    comp: usize,
+    mb_slice_id: &[u16],
+    cur_slice_id: u16,
+    mb_field_decoding: &[bool],
+) -> u32 {
+    let Some((mb_n, blk, cur_field, nbr_field)) = mbaff_luma_neighbor_at(
+        mb_idx,
+        mb_width,
+        mb_field_decoding,
+        xn,
+        yn,
+        mb_slice_id,
+        cur_slice_id,
+    ) else {
+        return 0;
+    };
+    let v = mvd_store[mb_n * 16 + blk][comp].unsigned_abs() as u32;
+    match (comp == 1, cur_field, nbr_field) {
+        (true, false, true) => v * 2,
+        (true, true, false) => v / 2,
+        _ => v,
+    }
+}
+
+/// MBAFF cross-MB ref_idx for the CABAC ref_idx context; a field
+/// neighbour's ref_idx is halved for a frame MB (spec 9.3.3.1.1.6).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn mbaff_neighbor_ref(
+    ref_idx_store: &[i8],
+    mb_idx: usize,
+    mb_width: usize,
+    xn: i32,
+    yn: i32,
+    mb_slice_id: &[u16],
+    cur_slice_id: u16,
+    blk_is_direct: &[bool],
+    is_b_slice: bool,
+    mb_field_decoding: &[bool],
+) -> i8 {
+    let Some((mb_n, blk, cur_field, nbr_field)) = mbaff_luma_neighbor_at(
+        mb_idx,
+        mb_width,
+        mb_field_decoding,
+        xn,
+        yn,
+        mb_slice_id,
+        cur_slice_id,
+    ) else {
+        return -1;
+    };
+    if is_b_slice && blk_is_direct[mb_n * 16 + blk] {
+        return 0;
+    }
+    let r = ref_idx_store[mb_n * 16 + blk];
+    if !cur_field && nbr_field && r >= 0 {
+        r >> 1
+    } else {
+        r
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -146,6 +242,19 @@ pub(crate) fn cabac_neighbor_ref(
         } else {
             ref_idx_store[mb_idx * 16 + blk]
         }
+    } else if mbaff {
+        mbaff_neighbor_ref(
+            ref_idx_store,
+            mb_idx,
+            mb_width,
+            -1,
+            py as i32,
+            mb_slice_id,
+            cur_slice_id,
+            blk_is_direct,
+            is_b_slice,
+            _mb_field_decoding,
+        )
     } else if has_left {
         if mb_slice_id[left_mb_idx] != cur_slice_id {
             -1
@@ -168,6 +277,19 @@ pub(crate) fn cabac_neighbor_ref(
         } else {
             ref_idx_store[mb_idx * 16 + blk]
         }
+    } else if mbaff {
+        mbaff_neighbor_ref(
+            ref_idx_store,
+            mb_idx,
+            mb_width,
+            px as i32,
+            -1,
+            mb_slice_id,
+            cur_slice_id,
+            blk_is_direct,
+            is_b_slice,
+            _mb_field_decoding,
+        )
     } else if has_above {
         if mb_slice_id[above_mb_idx] != cur_slice_id {
             -1
@@ -184,6 +306,152 @@ pub(crate) fn cabac_neighbor_ref(
     };
 
     (left_ref, top_ref)
+}
+
+/// Neighbouring location in an MBAFF frame (spec 6.4.12.2, Table 6-4).
+///
+/// For a location `(xn, yn)` relative to the upper-left sample of macroblock
+/// `mb_idx` and outside it (left, above, above-left or above-right), returns
+/// the macroblock covering it and the location `(xw, yw)` inside that
+/// macroblock. `max_w`/`max_h` are the macroblock size in the plane: 16 for
+/// luma, 8 for 4:2:0 chroma. Returns `None` when the location is outside
+/// the picture or in a macroblock not decoded yet; slice membership is left
+/// to the caller.
+///
+/// Implemented geometrically, which reproduces Table 6-4: the location is
+/// mapped to a line of the macroblock pair it falls in (a frame macroblock
+/// covers lines 0..16 or 16..32 of its pair, a field macroblock every other
+/// line), and that line to whichever macroblock of the neighbouring pair holds
+/// it. So a field top MB's above neighbour is the top (same-parity) MB of a
+/// field pair above but the bottom MB of a frame pair, and a bottom MB's left
+/// neighbour can be the top MB of a left pair coded the other way.
+pub(crate) fn mbaff_neighbor_loc(
+    mb_idx: usize,
+    mb_width: usize,
+    mb_field_decoding: &[bool],
+    xn: i32,
+    yn: i32,
+    max_w: i32,
+    max_h: i32,
+) -> Option<(usize, usize, usize)> {
+    let pair = mb_idx / 2;
+    let bottom = (mb_idx % 2) as i32;
+    let pair_h = 2 * max_h;
+    // Line of the current pair holding row yn of this MB (may fall outside)
+    let line = if mb_field_decoding[pair] {
+        2 * yn + bottom
+    } else {
+        yn + max_h * bottom
+    };
+    let (dy, line_in) = if line < 0 {
+        (-1, line + pair_h)
+    } else if line >= pair_h {
+        (1, line - pair_h)
+    } else {
+        (0, line)
+    };
+    let dx = if xn < 0 {
+        -1
+    } else if xn >= max_w {
+        1
+    } else {
+        0
+    };
+    if !(0..pair_h).contains(&line_in) || dy > 0 {
+        return None;
+    }
+    let col = (pair % mb_width) as i32 + dx;
+    let row = (pair / mb_width) as i32 + dy;
+    if col < 0 || col >= mb_width as i32 || row < 0 {
+        return None;
+    }
+    let npair = row as usize * mb_width + col as usize;
+    let (mb_n, yw) = if mb_field_decoding[npair] {
+        (npair * 2 + (line_in % 2) as usize, line_in / 2)
+    } else {
+        (npair * 2 + (line_in / max_h) as usize, line_in % max_h)
+    };
+    // Only macroblocks earlier in decoding order are available
+    if mb_n >= mb_idx {
+        return None;
+    }
+    let xw = (xn + max_w).rem_euclid(max_w);
+    Some((mb_n, xw as usize, yw as usize))
+}
+
+/// MBAFF luma neighbour block (left or above) of 4x4 block `blk`, as
+/// `(mb, blk)`, or `None` if unavailable (outside the picture or slice).
+#[inline]
+fn mbaff_luma_neighbor_blk(
+    mb_idx: usize,
+    mb_width: usize,
+    mb_field_decoding: &[bool],
+    blk: usize,
+    is_left: bool,
+    mb_slice_id: &[u16],
+    cur_slice_id: u16,
+) -> Option<(usize, usize)> {
+    let (row, col) = BLOCK_INDEX_TO_OFFSET[blk];
+    let (xn, yn) = if is_left {
+        (col as i32 - 1, row as i32)
+    } else {
+        (col as i32, row as i32 - 1)
+    };
+    let (mb_n, xw, yw) = mbaff_neighbor_loc(mb_idx, mb_width, mb_field_decoding, xn, yn, 16, 16)?;
+    if mb_slice_id[mb_n] != cur_slice_id {
+        return None;
+    }
+    Some((mb_n, OFFSET_TO_BLOCK[yw / 4][xw / 4]))
+}
+
+/// MBAFF luma neighbour 4x4 block covering pixel `(xn, yn)` (relative to
+/// `mb_idx`, outside it) as `(mb, blk, cur_field, nbr_field)`, or `None` if
+/// unavailable or in another slice.
+#[inline]
+fn mbaff_luma_neighbor_at(
+    mb_idx: usize,
+    mb_width: usize,
+    mb_field_decoding: &[bool],
+    xn: i32,
+    yn: i32,
+    mb_slice_id: &[u16],
+    cur_slice_id: u16,
+) -> Option<(usize, usize, bool, bool)> {
+    let (mb_n, xw, yw) = mbaff_neighbor_loc(mb_idx, mb_width, mb_field_decoding, xn, yn, 16, 16)?;
+    if mb_slice_id[mb_n] != cur_slice_id {
+        return None;
+    }
+    Some((
+        mb_n,
+        OFFSET_TO_BLOCK[yw / 4][xw / 4],
+        mb_field_decoding[mb_idx / 2],
+        mb_field_decoding[mb_n / 2],
+    ))
+}
+
+/// MBAFF 4:2:0 chroma neighbour block (left or above) of chroma 4x4 block
+/// `blk` (0..4, raster order), as `(mb, blk)`, or `None` if unavailable.
+#[inline]
+fn mbaff_chroma_neighbor_blk(
+    mb_idx: usize,
+    mb_width: usize,
+    mb_field_decoding: &[bool],
+    blk: usize,
+    is_left: bool,
+    mb_slice_id: &[u16],
+    cur_slice_id: u16,
+) -> Option<(usize, usize)> {
+    let (row, col) = ((blk / 2) * 4, (blk % 2) * 4);
+    let (xn, yn) = if is_left {
+        (col as i32 - 1, row as i32)
+    } else {
+        (col as i32, row as i32 - 1)
+    };
+    let (mb_n, xw, yw) = mbaff_neighbor_loc(mb_idx, mb_width, mb_field_decoding, xn, yn, 8, 8)?;
+    if mb_slice_id[mb_n] != cur_slice_id {
+        return None;
+    }
+    Some((mb_n, (yw / 4) * 2 + xw / 4))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -210,6 +478,19 @@ pub(crate) fn cabac_neighbor_nz_luma(
     if neighbor >= 0 {
         // Same MB
         nc_luma[mb_idx * 16 + neighbor as usize] > 0
+    } else if mbaff {
+        match mbaff_luma_neighbor_blk(
+            mb_idx,
+            mb_width,
+            _mb_field_decoding,
+            blk,
+            is_left,
+            mb_slice_id,
+            cur_slice_id,
+        ) {
+            Some((mb_n, blk_n)) => nc_luma[mb_n * 16 + blk_n] > 0,
+            None => is_intra,
+        }
     } else {
         // Cross-MB: decode the encoded block index
         let neighbor_blk = (-(neighbor + 1)) as usize;
@@ -290,6 +571,19 @@ pub(crate) fn cabac_neighbor_nz_chroma(
 
     if let Some(nb) = same_mb_neighbor {
         nc_chroma[mb_idx * 4 + nb] > 0
+    } else if mbaff && cross_mb_blk.is_some() {
+        match mbaff_chroma_neighbor_blk(
+            mb_idx,
+            mb_width,
+            _mb_field_decoding,
+            blk,
+            is_left,
+            mb_slice_id,
+            cur_slice_id,
+        ) {
+            Some((mb_n, blk_n)) => nc_chroma[mb_n * 4 + blk_n] > 0,
+            None => is_intra,
+        }
     } else if let Some(nb) = cross_mb_blk {
         let neighbor_mb = if is_left {
             let has_left = if !mbaff {
@@ -405,6 +699,17 @@ pub(crate) fn get_neighbor_i4x4_mode(
             6 => Some(modes[mb_idx * 16 + 3]),
             12 => Some(modes[mb_idx * 16 + 9]),
             14 => Some(modes[mb_idx * 16 + 11]),
+            0 | 2 | 8 | 10 if mbaff => mbaff_luma_neighbor_blk(
+                mb_idx,
+                mb_width,
+                _mb_field_decoding,
+                blk_idx,
+                true,
+                mb_slice_id,
+                cur_slice_id,
+            )
+            .filter(|&(n, _)| intra_avail[n])
+            .map(|(n, b)| modes[n * 16 + b]),
             0 | 2 | 8 | 10 => {
                 // Left edge of MB
                 let has_left = if !mbaff {
@@ -442,6 +747,17 @@ pub(crate) fn get_neighbor_i4x4_mode(
             9 => Some(modes[mb_idx * 16 + 3]),
             12 => Some(modes[mb_idx * 16 + 6]),
             13 => Some(modes[mb_idx * 16 + 7]),
+            0 | 1 | 4 | 5 if mbaff => mbaff_luma_neighbor_blk(
+                mb_idx,
+                mb_width,
+                _mb_field_decoding,
+                blk_idx,
+                false,
+                mb_slice_id,
+                cur_slice_id,
+            )
+            .filter(|&(n, _)| intra_avail[n])
+            .map(|(n, b)| modes[n * 16 + b]),
             0 | 1 | 4 | 5 => {
                 // Top edge of MB
                 let has_above = if !mbaff {
@@ -522,8 +838,33 @@ pub(crate) fn compute_nc(
         }
     };
 
+    let mbaff_blk = |is_left: bool| {
+        if blks_per_mb == 16 {
+            mbaff_luma_neighbor_blk(
+                mb_idx,
+                mb_width,
+                _mb_field_decoding,
+                blk_idx,
+                is_left,
+                mb_slice_id,
+                cur_slice_id,
+            )
+        } else {
+            mbaff_chroma_neighbor_blk(
+                mb_idx,
+                mb_width,
+                _mb_field_decoding,
+                blk_idx,
+                is_left,
+                mb_slice_id,
+                cur_slice_id,
+            )
+        }
+    };
     let nc_a: Option<u8> = if left_in_mb {
         Some(nc_array[mb_idx * blks_per_mb + left_blk])
+    } else if mbaff {
+        mbaff_blk(true).map(|(mb_n, blk_n)| nc_array[mb_n * blks_per_mb + blk_n])
     } else {
         let has_left = if !mbaff {
             !mb_idx.is_multiple_of(mb_width)
@@ -578,6 +919,8 @@ pub(crate) fn compute_nc(
 
     let nc_b: Option<u8> = if above_in_mb {
         Some(nc_array[mb_idx * blks_per_mb + above_blk])
+    } else if mbaff {
+        mbaff_blk(false).map(|(mb_n, blk_n)| nc_array[mb_n * blks_per_mb + blk_n])
     } else {
         let has_above = if !mbaff {
             mb_idx >= mb_width

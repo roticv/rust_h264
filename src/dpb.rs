@@ -42,10 +42,17 @@ pub struct Motion {
     pub ref_idx_l0: Vec<i8>,
     /// Per-4x4-block POC of the L0 reference picture used (for temporal direct mode mapping).
     pub ref_poc_l0: Vec<i32>,
+    /// Per-4x4-block POC of the L1 reference frame used (temporal direct
+    /// mode maps it into the current L0 list when L0 is unused).
+    pub ref_poc_l1: Vec<i32>,
     /// Per-4x4-block L1 motion vectors (for spatial direct co-located L1 check).
     pub mv_l1: Vec<[i16; 2]>,
     /// Per-4x4-block L1 reference indices (for spatial direct co-located L1 check).
     pub ref_idx_l1: Vec<i8>,
+    /// MBAFF pictures: `mb_field_decoding_flag` per MB pair (empty otherwise).
+    /// Direct mode maps a co-located pair coded differently from the current
+    /// MB (frame vs field) per spec Table 8-6.
+    pub mb_field: Vec<bool>,
 }
 
 impl Motion {
@@ -56,8 +63,10 @@ impl Motion {
             mv_l0: vec![[0; 2]; n],
             ref_idx_l0: vec![-1; n],
             ref_poc_l0: vec![-1; n],
+            ref_poc_l1: vec![-1; n],
             mv_l1: vec![[0; 2]; n],
             ref_idx_l1: vec![-1; n],
+            mb_field: Vec::new(),
         }
     }
 }
@@ -71,6 +80,8 @@ pub(crate) struct PictureMeta {
     pub(crate) height: u32,
     pub(crate) frame_num: u32,
     pub(crate) pic_order_cnt: i32,
+    /// TopFieldOrderCnt and BottomFieldOrderCnt (both the POC for a field)
+    pub(crate) field_poc: [i32; 2],
     pub(crate) mb_width: u32,
     pub(crate) is_intra: bool,
     pub(crate) structure: PictureStructure,
@@ -88,6 +99,9 @@ pub struct DecodedPicture {
     pub height: u32,
     pub frame_num: u32,
     pub pic_order_cnt: i32,
+    /// TopFieldOrderCnt and BottomFieldOrderCnt, used by MBAFF field MBs
+    /// (implicit weights, direct-mode co-located field choice)
+    pub field_poc: [i32; 2],
     /// Width in macroblocks (for indexing into the motion data).
     pub mb_width: u32,
     /// Whether this picture is intra-only (all MBs are intra).
@@ -122,6 +136,7 @@ impl DecodedPicture {
             height: meta.height,
             frame_num: meta.frame_num,
             pic_order_cnt: meta.pic_order_cnt,
+            field_poc: meta.field_poc,
             mb_width: meta.mb_width,
             is_intra: meta.is_intra,
             structure: meta.structure,
@@ -739,6 +754,27 @@ impl Dpb {
     }
 
     /// Compute Picture Order Count for the current picture (spec 8.2.1).
+    /// TopFieldOrderCnt and BottomFieldOrderCnt of a frame from its
+    /// PicOrderCnt (their minimum) and the bottom field's offset; for a field
+    /// picture both are its own POC.
+    pub(crate) fn frame_field_pocs(sps: &Sps, header: &SliceHeader, poc: i32) -> [i32; 2] {
+        if header.field_pic_flag {
+            return [poc, poc];
+        }
+        let bottom_delta = match sps.pic_order_cnt_type {
+            0 => header.delta_pic_order_cnt_bottom,
+            1 => sps
+                .offset_for_top_to_bottom_field
+                .wrapping_add(header.delta_pic_order_cnt[1]),
+            _ => 0,
+        };
+        if bottom_delta >= 0 {
+            [poc, poc.wrapping_add(bottom_delta)]
+        } else {
+            [poc.wrapping_sub(bottom_delta), poc]
+        }
+    }
+
     pub fn compute_poc(
         &mut self,
         sps: &Sps,
@@ -1056,6 +1092,7 @@ mod tests {
                 height: 16,
                 frame_num,
                 pic_order_cnt: poc,
+                field_poc: [poc, poc],
                 mb_width: 1,
                 is_intra: false,
                 structure: crate::dpb::PictureStructure::Frame,

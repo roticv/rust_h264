@@ -6,7 +6,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::dpb::DecodedPicture;
+use crate::dpb::{DecodedPicture, Motion};
 use crate::inter_pred;
 use crate::residual::OFFSET_TO_BLOCK;
 use crate::slice::PredWeightTable;
@@ -142,11 +142,93 @@ pub(crate) struct WeightContext<'a> {
     pub(crate) use_weight: u8,
     pub(crate) wt: Option<&'a PredWeightTable>,
     pub(crate) implicit_weights: &'a [Vec<i32>],
+    /// MBAFF field MBs: implicit weights per MB parity over field ref_idx
+    pub(crate) implicit_weights_field: &'a [Vec<Vec<i32>>; 2],
+}
+
+/// Weighted prediction for one macroblock: `field` is the MB's parity
+/// (0 = top) when it is an MBAFF field MB, whose ref_idx address fields.
+#[derive(Clone, Copy)]
+pub(crate) struct MbWeights<'a> {
+    ctx: &'a WeightContext<'a>,
+    field: Option<usize>,
+}
+
+impl<'a> WeightContext<'a> {
+    /// Weighting for macroblock `mb_idx`; `field_mb` is true for an MBAFF
+    /// field MB.
+    pub(crate) fn mb(&'a self, field_mb: bool, mb_idx: usize) -> MbWeights<'a> {
+        MbWeights {
+            ctx: self,
+            field: field_mb.then_some(mb_idx % 2),
+        }
+    }
+}
+
+impl MbWeights<'_> {
+    /// Explicit weight table index: a field MB's ref_idx addresses fields,
+    /// two per table entry (spec 8.4.2.3: refIdxL0WP = refIdxL0 >> 1).
+    #[inline]
+    fn wp_idx(&self, ref_idx: usize) -> usize {
+        if self.field.is_some() {
+            ref_idx >> 1
+        } else {
+            ref_idx
+        }
+    }
+
+    /// Apply weighted uni-prediction in place. No-op if use_weight != 1.
+    pub(crate) fn apply_uni(
+        &self,
+        pred: &mut [u8],
+        list: usize,
+        ref_idx: usize,
+        is_chroma: bool,
+        chroma_comp: usize,
+    ) {
+        self.ctx
+            .apply_uni(pred, list, self.wp_idx(ref_idx), is_chroma, chroma_comp);
+    }
+
+    /// Weighted bi-prediction of this MB (plain average when unweighted).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_bi(
+        &self,
+        pred_l0: &[u8],
+        pred_l1: &[u8],
+        output: &mut [u8],
+        ref_idx_l0: usize,
+        ref_idx_l1: usize,
+        is_chroma: bool,
+        chroma_comp: usize,
+    ) {
+        match (self.ctx.use_weight, self.field) {
+            (2, Some(p)) => {
+                let w0 = self.ctx.implicit_weights_field[p]
+                    .get(ref_idx_l0)
+                    .and_then(|row| row.get(ref_idx_l1));
+                match w0 {
+                    Some(&w0) => {
+                        inter_pred::weighted_bi_implicit(pred_l0, pred_l1, output, w0, 64 - w0)
+                    }
+                    None => inter_pred::bi_pred_avg(pred_l0, pred_l1, output),
+                }
+            }
+            _ => self.ctx.apply_bi(
+                pred_l0,
+                pred_l1,
+                output,
+                self.wp_idx(ref_idx_l0),
+                self.wp_idx(ref_idx_l1),
+                is_chroma,
+                chroma_comp,
+            ),
+        }
+    }
 }
 
 impl WeightContext<'_> {
-    /// Apply weighted uni-prediction in place. No-op if use_weight != 1.
-    pub(crate) fn apply_uni(
+    fn apply_uni(
         &self,
         pred: &mut [u8],
         list: usize,
@@ -183,9 +265,8 @@ impl WeightContext<'_> {
         }
     }
 
-    /// Apply weighted bi-prediction, replacing the standard (a+b+1)>>1 average.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn apply_bi(
+    fn apply_bi(
         &self,
         pred_l0: &[u8],
         pred_l1: &[u8],
@@ -331,6 +412,7 @@ pub(crate) fn derive_spatial_direct_blk(
     cur_slice_id: u16,
     direct_8x8_inference_flag: bool,
     mctx: MbaffCtx,
+    cur_poc: i32,
 ) -> DirectMvResult {
     let base = derive_spatial_direct_base(
         [
@@ -343,7 +425,61 @@ pub(crate) fn derive_spatial_direct_blk(
         cur_slice_id,
         mctx,
     );
-    apply_spatial_direct_col_zero(base, col_pic, mb_idx, col_blk, direct_8x8_inference_flag)
+    apply_spatial_direct_col_zero(
+        base,
+        col_pic,
+        mb_idx,
+        col_blk,
+        direct_8x8_inference_flag,
+        mctx,
+        cur_poc,
+    )
+}
+
+/// Index into the co-located picture's per-4x4 motion arrays for 4x4 block
+/// `blk` of `mb_idx` (spec 8.4.1.2.1, Table 8-6).
+///
+/// With `direct_8x8_inference_flag` each 8x8 uses its outer corner block. In
+/// MBAFF, when the co-located pair and the current MB differ in frame/field
+/// coding (inference is then mandatory, spec 7.4.2.1.1):
+/// - frame MB, field pair: the co-located MB is the pair's field closer in
+///   POC to the current picture (ties go to the bottom field), at block row
+///   `2 * (mb_idx % 2) + y8`;
+/// - field MB, frame pair: the upper 8x8s use the pair's top MB and the
+///   lower ones its bottom MB, at block row `2 * y8`.
+pub(crate) fn colocated_pos(
+    col_field_poc: [i32; 2],
+    col_motion: &Motion,
+    mb_idx: usize,
+    blk: usize,
+    direct_8x8_inference_flag: bool,
+    mctx: MbaffCtx,
+    cur_poc: i32,
+) -> usize {
+    const INFERENCE_MAP: [usize; 4] = [0, 5, 10, 15];
+    let pair = mb_idx / 2;
+    if mctx.mbaff && direct_8x8_inference_flag && pair < col_motion.mb_field.len() {
+        let cur_field = mctx.mb_field_decoding[pair];
+        if cur_field != col_motion.mb_field[pair] {
+            let (x8, y8) = ((blk / 4) & 1, blk / 8);
+            let (col_mb, row) = if cur_field {
+                (pair * 2 + y8, 2 * y8)
+            } else {
+                let [top, bottom] = col_field_poc;
+                let parity = ((top as i64 - cur_poc as i64).abs()
+                    >= (bottom as i64 - cur_poc as i64).abs())
+                    as usize;
+                (pair * 2 + parity, 2 * (mb_idx % 2) + y8)
+            };
+            return col_mb * 16 + OFFSET_TO_BLOCK[row][3 * x8];
+        }
+    }
+    let effective_blk = if direct_8x8_inference_flag {
+        INFERENCE_MAP[blk / 4]
+    } else {
+        blk
+    };
+    mb_idx * 16 + effective_blk
 }
 
 /// Derive the neighbor-based spatial direct result before colocated zero-MV refinement.
@@ -505,6 +641,8 @@ pub(crate) fn apply_spatial_direct_col_zero(
     mb_idx: usize,
     col_blk: usize,
     direct_8x8_inference_flag: bool,
+    mctx: MbaffCtx,
+    cur_poc: i32,
 ) -> DirectMvResult {
     let (mut mv_l0, mut mv_l1, ref_idx_l0, ref_idx_l1, pred_l0, pred_l1) = base;
 
@@ -520,13 +658,15 @@ pub(crate) fn apply_spatial_direct_col_zero(
     if let Some(col) = col_pic {
         // Co-located motion data is only final once the whole picture is.
         let col_motion = col.motion();
-        let effective_blk = if direct_8x8_inference_flag {
-            const INFERENCE_MAP: [usize; 4] = [0, 5, 10, 15];
-            INFERENCE_MAP[col_blk / 4]
-        } else {
-            col_blk
-        };
-        let col_pos = mb_idx * 16 + effective_blk;
+        let col_pos = colocated_pos(
+            col.field_poc,
+            col_motion,
+            mb_idx,
+            col_blk,
+            direct_8x8_inference_flag,
+            mctx,
+            cur_poc,
+        );
         if col_pos < col_motion.ref_idx_l0.len() && !col.is_intra {
             let col_ref_l0 = col_motion.ref_idx_l0[col_pos];
             // Determine which co-located MV to use for the zero check:
@@ -567,79 +707,115 @@ pub(crate) fn apply_spatial_direct_col_zero(
     (mv_l0, mv_l1, ref_idx_l0, ref_idx_l1, pred_l0, pred_l1)
 }
 
-/// Derive temporal direct mode MVs for a specific 4x4 block within an MB.
-/// Per spec 8.4.1.2.3, reads the co-located block's MV and scales by POC distance.
+/// Derive temporal direct mode MVs for 4x4 block `blk` of `mb_idx` (spec
+/// 8.4.1.2.3): the co-located block's motion, L0 or else L1, scaled by POC
+/// distance. `current_poc` is the picture's POC and field POCs; `col_pic` is
+/// RefPicList1[0].
+///
+/// In an MBAFF field MB the reference indices address fields and the
+/// distances use field POCs: the MB's own parity, the same-parity field of
+/// `col_pic`, and the referenced field. When the co-located MB is coded the
+/// other way (frame vs field) its vertical MV is doubled (field to frame) or
+/// halved, and a frame reference maps to the same-parity field (as FFmpeg's
+/// `pred_temp_direct_motion`).
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn derive_temporal_direct_blk(
     col_pic: &DecodedPicture,
     ref_pic_list_l0: &[Arc<DecodedPicture>],
-    current_poc: i32,
-    col_poc: i32,
+    (current_poc, current_field_poc): (i32, [i32; 2]),
     mb_idx: usize,
     blk: usize,
     direct_8x8_inference_flag: bool,
-    _mctx: MbaffCtx,
+    mctx: MbaffCtx,
 ) -> ([i16; 2], [i16; 2], i8, i8, bool, bool) {
-    // When direct_8x8_inference_flag is set (spec 8.4.1.2.3), use ONE co-located
-    // MV per 8x8 block. Per spec, the co-located partition is derived using the
-    // MV at luma4x4BlkIdx = (x8*3, y8*3) in 4x4-block raster coordinates within
-    // the co-located MB. Mapping to our BLOCK_INDEX_TO_OFFSET numbering:
-    //   8x8 blk 0 (x8=0,y8=0): raster(0,0) = pixel(0,0)   = our block 0
-    //   8x8 blk 1 (x8=1,y8=0): raster(3,0) = pixel(0,12)  = our block 5
-    //   8x8 blk 2 (x8=0,y8=1): raster(0,3) = pixel(12,0)  = our block 10
-    //   8x8 blk 3 (x8=1,y8=1): raster(3,3) = pixel(12,12) = our block 15
-    let col_blk = if direct_8x8_inference_flag {
-        const INFERENCE_MAP: [usize; 4] = [0, 5, 10, 15];
-        INFERENCE_MAP[blk / 4]
-    } else {
-        blk
-    };
-    let col_base = mb_idx * 16;
+    const INTRA: ([i16; 2], [i16; 2], i8, i8, bool, bool) = ([0, 0], [0, 0], 0, 0, true, true);
     let col_motion = col_pic.motion();
-    if col_pic.is_intra
-        || col_base + col_blk >= col_motion.ref_idx_l0.len()
-        || col_motion.ref_idx_l0[col_base + col_blk] < 0
-    {
-        // Intra co-located: zero MVs, ref_idx=0
-        return ([0, 0], [0, 0], 0, 0, true, true);
+    let col_pos = colocated_pos(
+        col_pic.field_poc,
+        col_motion,
+        mb_idx,
+        blk,
+        direct_8x8_inference_flag,
+        mctx,
+        current_poc,
+    );
+    if col_pic.is_intra || col_pos >= col_motion.ref_idx_l0.len() {
+        return INTRA;
     }
-
-    // Get co-located MV and ref_idx
-    let col_mv = col_motion.mv_l0[col_base + col_blk];
-    let _col_ref_idx = col_motion.ref_idx_l0[col_base + col_blk];
-
-    // Map co-located ref_idx to current L0 ref_idx by matching POC (spec 8.4.1.2.3).
-    // Look up the POC that the co-located picture referenced at col_ref_idx.
-    let col_ref_poc_val = col_motion.ref_poc_l0[col_base + col_blk];
-
-    // Find the entry in our current L0 list with the matching POC.
-    let ref0 = ref_pic_list_l0
-        .iter()
-        .position(|p| p.pic_order_cnt == col_ref_poc_val)
-        .unwrap_or(0);
-    let poc0 = ref_pic_list_l0
-        .get(ref0)
-        .map(|p| p.pic_order_cnt)
-        .unwrap_or(0);
-
-    // Compute dist_scale_factor: td = col_poc - poc0, tb = current_poc - poc0
-    let td = (col_poc - poc0).clamp(-128, 127);
-    let tb = (current_poc - poc0).clamp(-128, 127);
-
-    let (mv_l0, mv_l1) = if td == 0 {
-        // No scaling possible
-        (col_mv, [0, 0])
+    // mvCol/refIdxCol: L0 motion, or L1 when the co-located block has no L0
+    let (col_mv, col_ref, col_ref_poc) = if col_motion.ref_idx_l0[col_pos] >= 0 {
+        (
+            col_motion.mv_l0[col_pos],
+            col_motion.ref_idx_l0[col_pos],
+            col_motion.ref_poc_l0[col_pos],
+        )
+    } else if col_motion.ref_idx_l1.get(col_pos).is_some_and(|&r| r >= 0) {
+        (
+            col_motion.mv_l1[col_pos],
+            col_motion.ref_idx_l1[col_pos],
+            col_motion.ref_poc_l1.get(col_pos).copied().unwrap_or(-1),
+        )
     } else {
-        let tx = (16384 + (td.abs() >> 1)) / td;
-        let scale = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
-        let mx_l0 = ((scale * col_mv[0] as i32 + 128) >> 8) as i16;
-        let my_l0 = ((scale * col_mv[1] as i32 + 128) >> 8) as i16;
-        let mx_l1 = mx_l0 - col_mv[0];
-        let my_l1 = my_l0 - col_mv[1];
-        ([mx_l0, my_l0], [mx_l1, my_l1])
+        return INTRA;
     };
 
-    (mv_l0, mv_l1, ref0 as i8, 0, true, true)
+    // The current L0 entry of the frame the co-located block referenced
+    let frame_idx = ref_pic_list_l0
+        .iter()
+        .position(|p| p.pic_order_cnt == col_ref_poc)
+        .unwrap_or(0);
+    let cur_field = mctx.mbaff && mctx.mb_field_decoding[mb_idx / 2];
+    let col_field = mctx.mbaff
+        && col_motion
+            .mb_field
+            .get(col_pos / 32)
+            .copied()
+            .unwrap_or(false);
+    let (ref0, poc, poc0, poc1) = if cur_field {
+        let parity = mb_idx % 2;
+        // A field reference keeps its parity relative to the MB; a frame
+        // reference becomes the same-parity field
+        let k = 2 * frame_idx + if col_field { (col_ref & 1) as usize } else { 0 };
+        let poc0 = ref_pic_list_l0
+            .get(k / 2)
+            .map_or(0, |p| p.field_poc[parity ^ (k & 1)]);
+        (
+            k,
+            current_field_poc[parity],
+            poc0,
+            col_pic.field_poc[parity],
+        )
+    } else {
+        let poc0 = ref_pic_list_l0
+            .get(frame_idx)
+            .map_or(0, |p| p.pic_order_cnt);
+        (frame_idx, current_poc, poc0, col_pic.pic_order_cnt)
+    };
+
+    let td = (poc1 - poc0).clamp(-128, 127);
+    let scale = if td == 0 {
+        256
+    } else {
+        let tb = (poc - poc0).clamp(-128, 127);
+        let tx = (16384 + (td.abs() >> 1)) / td;
+        ((tb * tx + 32) >> 6).clamp(-1024, 1023)
+    };
+    let mvx = col_mv[0] as i32;
+    let mvy = match (cur_field, col_field) {
+        (true, false) => col_mv[1] as i32 / 2,
+        (false, true) => col_mv[1] as i32 * 2,
+        _ => col_mv[1] as i32,
+    };
+    let mx = (scale * mvx + 128) >> 8;
+    let my = (scale * mvy + 128) >> 8;
+    (
+        [mx as i16, my as i16],
+        [(mx - mvx) as i16, (my - mvy) as i16],
+        ref0 as i8,
+        0,
+        true,
+        true,
+    )
 }
 
 /// Motion vector prediction using the median of neighbors A, B, C (spec 8.4.1.3).
@@ -806,142 +982,48 @@ pub(crate) fn predict_mv(
 // Neighbor derivation depends on whether the current and neighbor MB pairs are
 // frame-coded or field-coded.
 
-/// Compute the left neighbor MB address and remapped y-offset for MBAFF.
-/// Returns `None` if no left neighbor exists.
-/// Returns `Some((left_mb, remapped_py))`.
-///
-/// Per spec 6.4.10.1 / Table 6-3:
-/// - Both frame or both field: left = same position in left pair
-/// - Current frame, left field: y remaps to select top/bottom field of left pair
-/// - Current field, left frame: y remaps within left pair's top/bottom MB
+/// MV and reference index of the 4x4 block covering luma location
+/// `(xn, yn)` (relative to macroblock `mb_idx`, outside it) in an MBAFF
+/// frame, or `None` if unavailable. Neighbour addressing follows spec
+/// Table 6-4 (`mbaff_neighbor_loc`); a neighbour coded the other way is
+/// scaled per spec 8.4.1.3.1: for a field macroblock next to a frame
+/// macroblock the vertical MV is halved and the reference index doubled,
+/// and the reverse for a frame macroblock next to a field macroblock.
+#[allow(clippy::too_many_arguments)]
 #[inline]
-fn mbaff_left_neighbor(
+fn mbaff_mv_at(
+    mv_store: &[[i16; 2]],
+    ref_idx_store: &[i8],
     mb_idx: usize,
     mb_width: usize,
-    py_off: usize,
+    xn: i32,
+    yn: i32,
+    mb_slice_id: &[u16],
+    cur_slice_id: u16,
     mb_field_decoding: &[bool],
-) -> Option<(usize, usize)> {
-    let pair_addr = mb_idx / 2;
-    let pair_col = pair_addr % mb_width;
-    if pair_col == 0 {
+) -> Option<([i16; 2], i8)> {
+    let (mb_n, xw, yw) =
+        crate::neighbor::mbaff_neighbor_loc(mb_idx, mb_width, mb_field_decoding, xn, yn, 16, 16)?;
+    if mb_slice_id[mb_n] != cur_slice_id {
         return None;
     }
-    let left_pair = pair_addr - 1;
-    let is_top = mb_idx.is_multiple_of(2);
-    let cur_is_field = mb_field_decoding[pair_addr];
-    let left_is_field = mb_field_decoding[left_pair];
-
-    match (cur_is_field, left_is_field) {
-        (false, false) => {
-            // Both frame-coded: left top→left top, left bottom→left bottom
-            let left_mb = left_pair * 2 + (if is_top { 0 } else { 1 });
-            Some((left_mb, py_off))
+    let blk = OFFSET_TO_BLOCK[yw / 4][xw / 4];
+    let mut mv = mv_store[mb_n * 16 + blk];
+    let mut ref_idx = ref_idx_store[mb_n * 16 + blk];
+    let cur_field = mb_field_decoding[mb_idx / 2];
+    let n_field = mb_field_decoding[mb_n / 2];
+    if cur_field && !n_field {
+        mv[1] /= 2;
+        if ref_idx >= 0 {
+            ref_idx = ref_idx.saturating_mul(2);
         }
-        (true, true) => {
-            // Both field-coded: same mapping
-            let left_mb = left_pair * 2 + (if is_top { 0 } else { 1 });
-            Some((left_mb, py_off))
-        }
-        (false, true) => {
-            // Current frame, left field
-            // Map frame y (0-15) + position in pair to field MB
-            let y_in_pair = py_off + if is_top { 0 } else { 16 };
-            let left_mb = left_pair * 2 + (y_in_pair % 2); // even→top field, odd→bottom field
-            let remap_py = y_in_pair / 2;
-            // Clamp to 0-15 (field MB has 16 rows)
-            Some((left_mb, remap_py.min(15)))
-        }
-        (true, false) => {
-            // Current field, left frame
-            // Map field y to frame y
-            let y_in_pair = py_off * 2 + if is_top { 0 } else { 1 };
-            let left_mb = left_pair * 2 + (if y_in_pair < 16 { 0 } else { 1 });
-            let remap_py = y_in_pair % 16;
-            Some((left_mb, remap_py))
+    } else if !cur_field && n_field {
+        mv[1] = mv[1].saturating_mul(2);
+        if ref_idx >= 0 {
+            ref_idx >>= 1;
         }
     }
-}
-
-/// Compute the above neighbor MB address and remapped y-offset for MBAFF.
-/// Returns `None` if no above neighbor exists.
-/// Returns `Some((above_mb, remapped_py))`.
-///
-/// Per spec 6.4.10.1 / Table 6-4:
-/// - Bottom of pair: above = top of same pair (unless field-to-frame remap needed)
-/// - Top of pair: above = bottom MB of above pair (with possible mode remap)
-#[inline]
-fn mbaff_above_neighbor(
-    mb_idx: usize,
-    mb_width: usize,
-    mb_field_decoding: &[bool],
-) -> Option<(usize, usize)> {
-    let pair_addr = mb_idx / 2;
-    let is_top = mb_idx.is_multiple_of(2);
-
-    if !is_top {
-        // Bottom MB: above is top MB of same pair
-        // py remap: row 3 (bottom of top MB) → py=12 in block coordinates
-        let cur_is_field = mb_field_decoding[pair_addr];
-        if cur_is_field {
-            // Both in same field pair: above of bottom field is top field, row 15
-            Some((mb_idx - 1, 15))
-        } else {
-            // Frame pair: above of bottom MB is top MB, row 15
-            Some((mb_idx - 1, 15))
-        }
-    } else {
-        // Top MB: above is bottom MB of the above pair
-        let pair_row = pair_addr / mb_width;
-        if pair_row == 0 {
-            return None;
-        }
-        let above_pair = pair_addr - mb_width;
-        let cur_is_field = mb_field_decoding[pair_addr];
-        let above_is_field = mb_field_decoding[above_pair];
-
-        match (cur_is_field, above_is_field) {
-            (false, false) => {
-                // Both frame: above = bottom of above pair, row 15
-                Some((above_pair * 2 + 1, 15))
-            }
-            (true, true) => {
-                // Both field: above = top field of above pair (same field parity), row 15
-                Some((above_pair * 2, 15))
-            }
-            (false, true) => {
-                // Current frame, above field: above = bottom field of above pair, row 15
-                Some((above_pair * 2 + 1, 15))
-            }
-            (true, false) => {
-                // Current field, above frame: above = bottom of above pair, row 15
-                Some((above_pair * 2 + 1, 15))
-            }
-        }
-    }
-}
-
-/// Scale MVy when crossing frame/field boundary in MBAFF.
-/// - Current frame, neighbor field: MVy *= 2 (field→frame)
-/// - Current field, neighbor frame: MVy /= 2 (frame→field)
-/// - Same mode: no scaling
-#[inline]
-fn mbaff_scale_mv(
-    mv: [i16; 2],
-    cur_pair: usize,
-    nbr_pair: usize,
-    mb_field_decoding: &[bool],
-) -> [i16; 2] {
-    let cur_field = mb_field_decoding[cur_pair];
-    let nbr_field = mb_field_decoding[nbr_pair];
-    if cur_field == nbr_field {
-        mv
-    } else if !cur_field && nbr_field {
-        // Current frame, neighbor field: scale up
-        [mv[0], mv[1].saturating_mul(2)]
-    } else {
-        // Current field, neighbor frame: scale down
-        [mv[0], mv[1] / 2]
-    }
+    Some((mv, ref_idx))
 }
 
 /// Get MV/ref of the left neighbor for a partition.
@@ -983,19 +1065,17 @@ pub(crate) fn get_mv_neighbor_left_mbaff(
             ref_idx_store_l0[left_mb * 16 + blk],
         ))
     } else {
-        // MBAFF: use pair-based left neighbor
-        let (left_mb, remap_py) = mbaff_left_neighbor(mb_idx, mb_width, py_off, mb_field_decoding)?;
-        if mb_slice_id[left_mb] != cur_slice_id {
-            return None;
-        }
-        let blk = OFFSET_TO_BLOCK[remap_py / 4][3];
-        let mv = mbaff_scale_mv(
-            mv_store_l0[left_mb * 16 + blk],
-            mb_idx / 2,
-            left_mb / 2,
+        mbaff_mv_at(
+            mv_store_l0,
+            ref_idx_store_l0,
+            mb_idx,
+            mb_width,
+            -1,
+            py_off as i32,
+            mb_slice_id,
+            cur_slice_id,
             mb_field_decoding,
-        );
-        Some((mv, ref_idx_store_l0[left_mb * 16 + blk]))
+        )
     }
 }
 
@@ -1038,19 +1118,17 @@ pub(crate) fn get_mv_neighbor_above_mbaff(
             ref_idx_store_l0[above_mb * 16 + blk],
         ))
     } else {
-        // MBAFF: use pair-based above neighbor
-        let (above_mb, remap_py) = mbaff_above_neighbor(mb_idx, mb_width, mb_field_decoding)?;
-        if mb_slice_id[above_mb] != cur_slice_id {
-            return None;
-        }
-        let blk = OFFSET_TO_BLOCK[remap_py / 4][px_off / 4];
-        let mv = mbaff_scale_mv(
-            mv_store_l0[above_mb * 16 + blk],
-            mb_idx / 2,
-            above_mb / 2,
+        mbaff_mv_at(
+            mv_store_l0,
+            ref_idx_store_l0,
+            mb_idx,
+            mb_width,
+            px_off as i32,
+            -1,
+            mb_slice_id,
+            cur_slice_id,
             mb_field_decoding,
-        );
-        Some((mv, ref_idx_store_l0[above_mb * 16 + blk]))
+        )
     }
 }
 
@@ -1127,56 +1205,19 @@ pub(crate) fn get_mv_neighbor_above_right_mbaff(
             None
         }
     } else if mbaff {
-        // MBAFF: use pair-based above neighbor
-        let (above_mb, remap_py) = mbaff_above_neighbor(mb_idx, mb_width, mb_field_decoding)?;
-        if right_col < 16 {
-            if mb_slice_id[above_mb] != cur_slice_id {
-                return None;
-            }
-            let blk = OFFSET_TO_BLOCK[remap_py / 4][right_col / 4];
-            let mv = mbaff_scale_mv(
-                mv_store_l0[above_mb * 16 + blk],
-                mb_idx / 2,
-                above_mb / 2,
-                mb_field_decoding,
-            );
-            Some((mv, ref_idx_store_l0[above_mb * 16 + blk]))
-        } else {
-            // Above-right MB in MBAFF: pair to the right of the above pair.
-            // For bottom MBs, the "above" is the top of the same pair.
-            // The pair to the right of the above is in the same pair row,
-            // which hasn't been decoded yet → unavailable.
-            if !mb_idx.is_multiple_of(2) {
-                return None;
-            }
-            let pair_addr = mb_idx / 2;
-            let pair_col = pair_addr % mb_width;
-            if pair_col + 1 >= mb_width {
-                return None;
-            }
-            let above_pair = match mbaff_above_neighbor(mb_idx, mb_width, mb_field_decoding) {
-                Some((above_mb, _)) => above_mb / 2,
-                None => return None,
-            };
-            let above_right_pair = above_pair + 1;
-            // Top MB: above is bottom of previous pair row → already decoded.
-            // Use the same top/bottom position as the above MB.
-            let above_mb_pos = mbaff_above_neighbor(mb_idx, mb_width, mb_field_decoding)
-                .map(|(m, _)| m % 2)
-                .unwrap_or(1);
-            let ar_mb = above_right_pair * 2 + above_mb_pos;
-            if mb_slice_id.get(ar_mb).copied() != Some(cur_slice_id) {
-                return None;
-            }
-            let blk = OFFSET_TO_BLOCK[remap_py / 4][0];
-            let mv = mbaff_scale_mv(
-                mv_store_l0[ar_mb * 16 + blk],
-                mb_idx / 2,
-                ar_mb / 2,
-                mb_field_decoding,
-            );
-            Some((mv, ref_idx_store_l0[ar_mb * 16 + blk]))
-        }
+        // Above-right is the location just right of the partition, one row up
+        // (in the above MB, or the above-right pair for the right column).
+        mbaff_mv_at(
+            mv_store_l0,
+            ref_idx_store_l0,
+            mb_idx,
+            mb_width,
+            right_col as i32,
+            -1,
+            mb_slice_id,
+            cur_slice_id,
+            mb_field_decoding,
+        )
     } else {
         None
     }
@@ -1205,97 +1246,48 @@ pub(crate) fn get_mv_neighbor_above_left_mbaff(
         ));
     }
 
-    // Cross-MB cases: need MBAFF-aware neighbor addressing
-    if py_off == 0 && px_off == 0 {
-        // Above-left MB: need both above and left neighbor
-        // For MBAFF: above-left of top of pair = bottom-right block of above-left pair
-        let (above_mb, above_py) = if !mbaff {
-            let mb_row = mb_idx / mb_width;
-            if mb_row == 0 {
-                return None;
-            }
-            (mb_idx - mb_width, 15usize)
-        } else {
-            mbaff_above_neighbor(mb_idx, mb_width, mb_field_decoding)?
-        };
-        // Now get the left of above
-        let (al_mb, al_py) = if !mbaff {
-            let mb_col = mb_idx % mb_width;
-            if mb_col == 0 {
-                return None;
-            }
-            (above_mb - 1, above_py)
-        } else {
-            mbaff_left_neighbor(above_mb, mb_width, above_py, mb_field_decoding)?
-        };
-        if mb_slice_id.get(al_mb).copied() != Some(cur_slice_id) {
-            return None;
-        }
-        let blk = OFFSET_TO_BLOCK[al_py / 4][3];
-        let mv = if mbaff {
-            mbaff_scale_mv(
-                mv_store_l0[al_mb * 16 + blk],
-                mb_idx / 2,
-                al_mb / 2,
-                mb_field_decoding,
-            )
-        } else {
-            mv_store_l0[al_mb * 16 + blk]
-        };
-        Some((mv, ref_idx_store_l0[al_mb * 16 + blk]))
-    } else if py_off == 0 && px_off > 0 {
-        // Above MB, column to the left of px_off
-        let (above_mb, above_py) = if !mbaff {
-            let mb_row = mb_idx / mb_width;
-            if mb_row == 0 {
-                return None;
-            }
-            (mb_idx - mb_width, 15usize)
-        } else {
-            mbaff_above_neighbor(mb_idx, mb_width, mb_field_decoding)?
-        };
-        if mb_slice_id[above_mb] != cur_slice_id {
-            return None;
-        }
-        let blk = OFFSET_TO_BLOCK[above_py / 4][(px_off - 4) / 4];
-        let mv = if mbaff {
-            mbaff_scale_mv(
-                mv_store_l0[above_mb * 16 + blk],
-                mb_idx / 2,
-                above_mb / 2,
-                mb_field_decoding,
-            )
-        } else {
-            mv_store_l0[above_mb * 16 + blk]
-        };
-        Some((mv, ref_idx_store_l0[above_mb * 16 + blk]))
-    } else if py_off > 0 && px_off == 0 {
-        // Left MB, row above py_off
-        let (left_mb, left_py) = if !mbaff {
-            let mb_col = mb_idx % mb_width;
-            if mb_col == 0 {
-                return None;
-            }
-            (mb_idx - 1, py_off - 4)
-        } else {
-            mbaff_left_neighbor(mb_idx, mb_width, py_off - 4, mb_field_decoding)?
-        };
-        if mb_slice_id[left_mb] != cur_slice_id {
-            return None;
-        }
-        let blk = OFFSET_TO_BLOCK[left_py / 4][3];
-        let mv = if mbaff {
-            mbaff_scale_mv(
-                mv_store_l0[left_mb * 16 + blk],
-                mb_idx / 2,
-                left_mb / 2,
-                mb_field_decoding,
-            )
-        } else {
-            mv_store_l0[left_mb * 16 + blk]
-        };
-        Some((mv, ref_idx_store_l0[left_mb * 16 + blk]))
-    } else {
-        None
+    if mbaff {
+        return mbaff_mv_at(
+            mv_store_l0,
+            ref_idx_store_l0,
+            mb_idx,
+            mb_width,
+            px_off as i32 - 1,
+            py_off as i32 - 1,
+            mb_slice_id,
+            cur_slice_id,
+            mb_field_decoding,
+        );
     }
+
+    // Cross-MB cases (not MBAFF)
+    let (mb_col, mb_row) = (mb_idx % mb_width, mb_idx / mb_width);
+    let (n_mb, n_blk) = if py_off == 0 && px_off == 0 {
+        // Bottom-right block of the above-left MB
+        if mb_row == 0 || mb_col == 0 {
+            return None;
+        }
+        (mb_idx - mb_width - 1, OFFSET_TO_BLOCK[3][3])
+    } else if py_off == 0 {
+        // Above MB, column to the left of px_off
+        if mb_row == 0 {
+            return None;
+        }
+        (mb_idx - mb_width, OFFSET_TO_BLOCK[3][(px_off - 4) / 4])
+    } else if px_off == 0 {
+        // Left MB, row above py_off
+        if mb_col == 0 {
+            return None;
+        }
+        (mb_idx - 1, OFFSET_TO_BLOCK[(py_off - 4) / 4][3])
+    } else {
+        return None;
+    };
+    if mb_slice_id[n_mb] != cur_slice_id {
+        return None;
+    }
+    Some((
+        mv_store_l0[n_mb * 16 + n_blk],
+        ref_idx_store_l0[n_mb * 16 + n_blk],
+    ))
 }

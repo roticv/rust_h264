@@ -261,6 +261,7 @@ impl ThreadedDecoder {
             height: first.coded_height,
             frame_num: last.header.frame_num,
             pic_order_cnt: last.current_poc,
+            field_poc: last.field_poc,
             mb_width: first.mb_width,
             is_intra: last.header.slice_type == SliceType::I,
             structure: if last.header.field_pic_flag {
@@ -548,6 +549,7 @@ mod tests {
             height: 48,
             frame_num: 0,
             pic_order_cnt: 0,
+            field_poc: [0, 0],
             mb_width: 2,
             is_intra: false,
             structure: PictureStructure::Frame,

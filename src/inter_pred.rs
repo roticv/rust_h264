@@ -24,13 +24,13 @@ fn ref_luma(pic: &LumaView<'_>, x: i32, y: i32) -> i32 {
 
 /// Fetch a chroma sample with boundary clipping.
 #[inline]
-fn ref_chroma(plane: &[u8], width: usize, height: usize, x: i32, y: i32) -> i32 {
+fn ref_chroma(plane: &[u8], stride: usize, width: usize, height: usize, x: i32, y: i32) -> i32 {
     if width == 0 || height == 0 {
         return 0;
     }
     let cx = x.clamp(0, width as i32 - 1) as usize;
     let cy = y.clamp(0, height as i32 - 1) as usize;
-    let idx = cy * width + cx;
+    let idx = cy * stride + cx;
     if idx >= plane.len() {
         return 0;
     }
@@ -468,7 +468,10 @@ pub(crate) fn chroma_mc(
     // plane, plus margin so the published-length checks in
     // `chroma_mc_slice` make the same decisions as on a complete plane.
     if ref_width > 0 && block_w > 0 && block_h > 0 {
-        let avail_rows = pic.chroma_len().saturating_sub(offset) / ref_width;
+        let pic_width = (pic.width / 2) as usize;
+        let avail_rows = (pic.chroma_len().saturating_sub(offset)
+            + ref_width.saturating_sub(pic_width))
+            / ref_width;
         let eff_h = ref_height.min(avail_rows).max(1) as i32;
         let y_int = y + (dy >> 3);
         let last_row = (y_int + block_h as i32 + 2).clamp(0, eff_h - 1) as usize;
@@ -476,16 +479,43 @@ pub(crate) fn chroma_mc(
     }
     let data = pic.chroma(plane);
     let data = data.get(offset..).unwrap_or(&[]);
-    chroma_mc_slice(
-        data, ref_width, ref_height, x, y, dx, dy, block_w, block_h, output,
+    // `ref_width` is the row stride, doubled for an MBAFF field MB; samples
+    // are clamped at the picture's real chroma width.
+    let pic_width = (pic.width / 2) as usize;
+    chroma_mc_strided(
+        data, ref_width, pic_width, ref_height, x, y, dx, dy, block_w, block_h, output,
     );
 }
 
-/// [`chroma_mc`] on a plain slice (complete data).
+/// [`chroma_mc`] on a plain slice (complete data) whose row stride equals
+/// its width.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn chroma_mc_slice(
     ref_plane: &[u8],
     ref_width: usize,
+    ref_height: usize,
+    x: i32,
+    y: i32,
+    dx: i32,
+    dy: i32,
+    block_w: usize,
+    block_h: usize,
+    output: &mut [u8],
+) {
+    chroma_mc_strided(
+        ref_plane, ref_width, ref_width, ref_height, x, y, dx, dy, block_w, block_h, output,
+    );
+}
+
+/// Chroma MC on a plane with row stride `ref_width` whose samples are
+/// clamped at `pic_width` columns (they differ for an MBAFF field MB, which
+/// reads every other line of the frame).
+#[allow(clippy::too_many_arguments)]
+fn chroma_mc_strided(
+    ref_plane: &[u8],
+    ref_width: usize,
+    pic_width: usize,
     ref_height: usize,
     x: i32,
     y: i32,
@@ -503,11 +533,14 @@ pub(crate) fn chroma_mc_slice(
         return;
     }
     // For field-coded MBAFF, the effective height is derived from the available
-    // plane data, which may be smaller than the frame chroma height.
-    let ref_height = match ref_plane.len().checked_div(ref_width) {
-        Some(rows) => ref_height.min(rows),
-        None => ref_height,
-    };
+    // plane data, which may be smaller than the frame chroma height. A row
+    // counts once its `pic_width` samples are there: the bottom field's last
+    // row ends `ref_width - pic_width` short of a full stride.
+    let ref_height =
+        match (ref_plane.len() + ref_width.saturating_sub(pic_width)).checked_div(ref_width) {
+            Some(rows) => ref_height.min(rows),
+            None => ref_height,
+        };
     let frac_x = dx.rem_euclid(8);
     let frac_y = dy.rem_euclid(8);
     let x_int = x + (dx >> 3);
@@ -515,7 +548,7 @@ pub(crate) fn chroma_mc_slice(
 
     // Full-pel fast path: direct copy when no interpolation needed
     if frac_x == 0 && frac_y == 0 {
-        let w = ref_width as i32;
+        let w = pic_width as i32;
         let h = ref_height as i32;
         if x_int >= 0
             && y_int >= 0
@@ -538,6 +571,7 @@ pub(crate) fn chroma_mc_slice(
                     output[row * block_w + col] = ref_chroma(
                         ref_plane,
                         ref_width,
+                        pic_width,
                         ref_height,
                         x_int + col as i32,
                         y_int + row as i32,
@@ -549,7 +583,7 @@ pub(crate) fn chroma_mc_slice(
     }
 
     // In-bounds fast path: needs x_int..x_int+w+1 and y_int..y_int+h+1
-    let w_i32 = ref_width as i32;
+    let w_i32 = pic_width as i32;
     let h_i32 = ref_height as i32;
     let in_bounds = x_int >= 0
         && y_int >= 0
@@ -583,10 +617,10 @@ pub(crate) fn chroma_mc_slice(
         for col in 0..block_w {
             let xf = x_int + col as i32;
             let yf = y_int + row as i32;
-            let a = ref_chroma(ref_plane, ref_width, ref_height, xf, yf);
-            let b = ref_chroma(ref_plane, ref_width, ref_height, xf + 1, yf);
-            let c = ref_chroma(ref_plane, ref_width, ref_height, xf, yf + 1);
-            let d = ref_chroma(ref_plane, ref_width, ref_height, xf + 1, yf + 1);
+            let a = ref_chroma(ref_plane, ref_width, pic_width, ref_height, xf, yf);
+            let b = ref_chroma(ref_plane, ref_width, pic_width, ref_height, xf + 1, yf);
+            let c = ref_chroma(ref_plane, ref_width, pic_width, ref_height, xf, yf + 1);
+            let d = ref_chroma(ref_plane, ref_width, pic_width, ref_height, xf + 1, yf + 1);
 
             let val = (8 - frac_x) * (8 - frac_y) * a
                 + frac_x * (8 - frac_y) * b
@@ -646,6 +680,7 @@ mod tests {
                 height,
                 frame_num: 0,
                 pic_order_cnt: 0,
+                field_poc: [0, 0],
                 mb_width: width / 16,
                 is_intra: false,
                 structure: crate::dpb::PictureStructure::Frame,

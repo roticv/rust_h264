@@ -450,6 +450,16 @@ const SIGNIFICANT_COEFF_FLAG_OFFSET_8X8: [u8; 63] = [
    12,13,11, 6, 9,14,10, 9,11,12,13,11,14,10,12,
 ];
 
+/// Per-position context offset for significant_coeff_flag in 8x8 blocks of
+/// field-coded macroblocks (spec Table 9-43, field column).
+#[rustfmt::skip]
+const SIGNIFICANT_COEFF_FLAG_OFFSET_8X8_FIELD: [u8; 63] = [
+    0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 7, 7, 7, 8, 4, 5,
+    6, 9,10,10, 8,11,12,11, 9, 9,10,10, 8,11,12,11,
+    9, 9,10,10, 8,11,12,11, 9, 9,10,10, 8,13,13, 9,
+    9,10,10, 8,13,13, 9, 9,10,10,14,14,14,14,14,
+];
+
 /// Per-position context offset for last_significant_coeff_flag in 8x8 blocks.
 #[rustfmt::skip]
 const LAST_COEFF_FLAG_OFFSET_8X8: [u8; 63] = [
@@ -501,6 +511,11 @@ impl CabacReader<'_> {
         };
         let abs_base = COEFF_ABS_LEVEL_M1_OFFSET[cat];
         let is_8x8 = cat == 5;
+        let sig_8x8 = if field_coded {
+            &SIGNIFICANT_COEFF_FLAG_OFFSET_8X8_FIELD
+        } else {
+            &SIGNIFICANT_COEFF_FLAG_OFFSET_8X8
+        };
 
         // Phase 1: Decode significance map. Positions are bounded by
         // max_coeff (<= 64), so they live on the stack.
@@ -511,7 +526,7 @@ impl CabacReader<'_> {
         for pos in 0..max_coeff - 1 {
             // For 8x8 blocks, use per-position context offsets
             let sig_ctx = if is_8x8 {
-                sig_base + SIGNIFICANT_COEFF_FLAG_OFFSET_8X8[pos] as usize
+                sig_base + sig_8x8[pos] as usize
             } else {
                 sig_base + pos
             };
