@@ -394,8 +394,6 @@ decoder in every configuration.
 | 1080p P-only complex (100f)   | 77.4 fps | 76.6 fps | **112.0 fps** | 100.3 fps |
 | 720p B-frames complex (300f)  | 166.1 fps | 199.3 fps | **228.0 fps** | 220.3 fps |
 | 720p P-only complex (300f)    | 171.8 fps | 167.9 fps | **250.8 fps** | 231.2 fps |
-| 1080p B-frames (100f)         | —         | 131.6 fps | 132.8 fps | 125.6 fps |
-| 720p P-only (300f)            | —         | 258.8 fps | 269.7 fps | 269.2 fps |
 
 - **Row-level synchronization** (current): about **1.4-1.46x over serial at
   4 threads** on the complex streams, for P-only content as much as for
@@ -410,9 +408,12 @@ decoder in every configuration.
 - 8 threads is slower than 4 here. Pictures waiting on references hold
   their threads, and with more in flight some run on the efficiency cores,
   which slows the reference chain everyone else waits on.
-- The simple streams (mostly skipped macroblocks) gain little: their
-  decode work is small compared with the serial slice-header parsing and
-  output path on the coordinator thread.
+- The three non-"complex" bench streams (`bench_1080p_100f`,
+  `bench_720p_300f_ponly`, `bench_720p_300f_bframes`) turned out to be
+  High 4:4:4, which this decoder does not support; their earlier numbers
+  measured decoding of unsupported content and have been removed. The
+  decoder now rejects such streams, and the benchmark harness and golden
+  digests cover only the four 4:2:0 streams.
 - Single-threaded cost of the row waits (an atomic load per motion
   compensation call on complete pictures) is within noise: best-of-20
   serial throughput is 0.2-0.6% lower than before the change.

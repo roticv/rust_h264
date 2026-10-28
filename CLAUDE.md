@@ -308,7 +308,6 @@ I-frame, P-frame, and B-frame decoding fully functional with both CAVLC and CABA
 
 ### Not Yet Implemented
 
-- Field pictures (`field_pic_flag=1`, pure field coding without MBAFF)
-- High 10/4:2:2/4:4:4 profiles (>8-bit, non-4:2:0 chroma)
+- Anything but 8-bit 4:2:0: monochrome, 4:2:2, 4:4:4, High 10 and higher bit depths, and lossless transform bypass. `check_supported` in `decoder.rs` rejects these with `DecodeError::Unsupported` when a slice activates the SPS, so they never decode into wrong pictures (`testdata/unsupported_*.h264` cover each case)
 - SP/SI slice types (parsed but not decoded)
 - Slice groups / FMO (returns error)

@@ -52,8 +52,11 @@
 //!
 //! # Not supported
 //!
-//! - Interlaced coding (MBAFF, field pictures)
-//! - High 10 / 4:2:2 / 4:4:4 profiles (>8-bit, non-4:2:0 chroma)
+//! Only 8-bit 4:2:0 video is decoded. Streams using monochrome, 4:2:2 or
+//! 4:4:4 chroma, bit depths above 8 (High 10 and up) or lossless transform
+//! bypass are rejected with [`DecodeError::Unsupported`](error::DecodeError::Unsupported)
+//! on every slice, rather than decoded into wrong pictures.
+//!
 //! - SP/SI slice types
 //! - Slice groups / FMO
 

@@ -32,11 +32,8 @@ static GLOBAL: CountingAllocator = CountingAllocator;
 
 #[cfg(not(feature = "profile"))]
 const STREAMS: &[&str] = &[
-    "bench_720p_300f_ponly.h264",
     "bench_720p_300f_ponly_complex.h264",
-    "bench_720p_300f_bframes.h264",
     "bench_720p_300f_bframes_complex.h264",
-    "bench_1080p_100f.h264",
     "bench_1080p_100f_complex.h264",
     "bench_1080p_100f_ponly.h264",
 ];

@@ -301,6 +301,31 @@ impl Decoder {
     }
 }
 
+/// Reject sequences this decoder cannot decode correctly. Only 8-bit 4:2:0
+/// with the normal transform path is implemented; anything else would decode
+/// to wrong pictures instead of failing. Checked when a slice activates its
+/// SPS (not when the SPS is parsed), so streams that merely carry such an
+/// SPS still decode, and [`parse_sps_info`](crate::nal::parse_sps_info)
+/// can still describe it.
+pub(crate) fn check_supported(sps: &Sps) -> Result<(), DecodeError> {
+    match sps.chroma_format_idc {
+        1 => {}
+        0 => return Err(DecodeError::Unsupported("monochrome (4:0:0) video")),
+        2 => return Err(DecodeError::Unsupported("4:2:2 chroma")),
+        3 => return Err(DecodeError::Unsupported("4:4:4 chroma")),
+        _ => return Err(DecodeError::InvalidSyntax("chroma_format_idc out of range")),
+    }
+    if sps.bit_depth_luma_minus8 != 0 || sps.bit_depth_chroma_minus8 != 0 {
+        return Err(DecodeError::Unsupported("bit depth above 8"));
+    }
+    if sps.qpprime_y_zero_transform_bypass_flag {
+        return Err(DecodeError::Unsupported(
+            "lossless (transform bypass) coding",
+        ));
+    }
+    Ok(())
+}
+
 /// Parse an SPS or PPS NAL and store it in the parameter-set tables. An SPS
 /// also updates the DPB's reference frame capacity.
 pub(crate) fn store_parameter_set(
@@ -379,6 +404,7 @@ pub(crate) fn prepare_slice(
     let sps = sps_table
         .get(&pps.seq_parameter_set_id)
         .ok_or(DecodeError::InvalidSyntax("no SPS available"))?;
+    check_supported(sps)?;
 
     let (header, reader) =
         parse_slice_header(&nal.rbsp, sps, pps, nal.nal_unit_type, nal.nal_ref_idc)?;
@@ -2978,6 +3004,49 @@ mod tests {
             let _ = decoder.decode_nal(&nal);
         }
         let _ = decoder.flush();
+    }
+
+    // --- Unsupported formats ---
+
+    /// Every slice of an unsupported stream fails with `Unsupported` (no
+    /// wrong pictures), while its SPS still parses for `parse_sps_info`.
+    #[test]
+    fn test_unsupported_formats_are_rejected() {
+        for (name, what) in [
+            ("unsupported_mono", "monochrome (4:0:0) video"),
+            ("unsupported_422", "4:2:2 chroma"),
+            ("unsupported_444", "4:4:4 chroma"),
+            ("unsupported_420_10bit", "bit depth above 8"),
+            ("unsupported_lossless", "lossless (transform bypass) coding"),
+        ] {
+            let path = format!("{}/testdata/{}.h264", env!("CARGO_MANIFEST_DIR"), name);
+            let data = std::fs::read(&path).unwrap();
+            let nals = parse_annex_b(&data);
+            let sps = nals
+                .iter()
+                .find(|n| n.nal_unit_type == NalUnitType::Sps)
+                .expect("stream has an SPS");
+            assert!(crate::nal::parse_sps_info(sps).is_ok(), "{name}: SPS info");
+
+            let mut decoder = OrderedDecoder::new();
+            let mut slices = 0;
+            for nal in &nals {
+                let is_slice = matches!(
+                    nal.nal_unit_type,
+                    NalUnitType::Slice | NalUnitType::SliceIdr
+                );
+                match decoder.decode_nal(nal) {
+                    Err(DecodeError::Unsupported(msg)) if is_slice => {
+                        assert_eq!(msg, what, "{name}");
+                        slices += 1;
+                    }
+                    Ok(frames) if !is_slice => assert!(frames.is_empty()),
+                    other => panic!("{name}: unexpected {:?}", other.map(|f| f.len())),
+                }
+            }
+            assert!(slices > 0, "{name}: no slices");
+            assert!(decoder.flush().is_empty(), "{name}: produced frames");
+        }
     }
 
     // --- Fuzz regression tests ---

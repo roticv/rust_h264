@@ -5,7 +5,7 @@
 //! intra/MV prediction depend on already-decoded neighbours), so parallelism
 //! comes from decoding several *pictures* at once. [`ThreadedDecoder`] runs
 //! all header-level work in coded order on the calling thread: parameter
-//! sets, slice headers, POC and reference lists via [`prepare_slice`], and
+//! sets, slice headers, POC and reference lists via `prepare_slice`, and
 //! reference marking on a DPB of pictures that may still be decoding. Each
 //! complete picture is handed to a worker thread.
 //!
@@ -577,6 +577,33 @@ mod tests {
         assert!(pic.luma()[..32 * 32].iter().all(|&b| b == 7));
         assert!(pic.luma()[32 * 32..].iter().all(|&b| b == 128));
         assert_eq!(pic.motion().ref_idx_l0.len(), 2 * 3 * 16);
+    }
+
+    /// Unsupported formats are rejected by the threaded decoder too.
+    #[test]
+    fn threaded_rejects_unsupported_formats() {
+        for name in [
+            "unsupported_mono",
+            "unsupported_422",
+            "unsupported_444",
+            "unsupported_420_10bit",
+            "unsupported_lossless",
+        ] {
+            let path = format!("{}/testdata/{}.h264", env!("CARGO_MANIFEST_DIR"), name);
+            let data = std::fs::read(&path).unwrap();
+            let nals = parse_annex_b(&data);
+            let mut dec = ThreadedDecoder::new(2);
+            let mut rejected = 0;
+            for nal in &nals {
+                match dec.decode_nal(nal) {
+                    Err(DecodeError::Unsupported(_)) => rejected += 1,
+                    Ok(frames) => assert!(frames.is_empty(), "{name}"),
+                    Err(e) => panic!("{name}: {e}"),
+                }
+            }
+            assert!(rejected > 0, "{name}");
+            assert!(dec.flush().is_empty(), "{name}");
+        }
     }
 
     /// Malformed inputs from the fuzz corpus must not hang or panic the
