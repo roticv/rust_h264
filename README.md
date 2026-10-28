@@ -5,13 +5,48 @@ While working on rust_media, it was found that there isn't any sufficiently good
 Hence, the idea is to attempt to create an open source h264 decoder.
 Yes, most devices have hardware h264 decoder, but if we want to be truly portable, then software implementation of h264 decoder is needed.
 
-Supports Baseline, Main, and High profiles (8-bit 4:2:0) with CAVLC and CABAC entropy coding, all partition types (16x16 through 4x4), B-frames with spatial/temporal direct mode, weighted prediction, deblocking filter, and MBAFF interlaced content. 174 byte-exact tests against FFmpeg, verified up to 1080p.
+Decodes Baseline, Main and High profile H.264 (8-bit 4:2:0):
+
+- CAVLC and CABAC entropy coding, 4x4 and 8x8 transforms, custom scaling matrices
+- All partition types (16x16 through 4x4), P and B slices, B-pyramid, spatial and temporal direct mode
+- Multiple and long-term reference pictures, reference list modification, memory management operations
+- Explicit and implicit weighted prediction
+- Multiple slices per picture, per-slice deblocking
+- Interlaced content: MBAFF and field pictures
+- NEON (aarch64) and SSE2/SSSE3/AVX2 (x86-64) motion compensation
+- Optional frame-threaded decoding, and a `no_std` + `alloc` build
+
+Output is byte-identical to FFmpeg on the test and benchmark streams, from
+tiny synthetic clips up to 1080p x264 and JM reference-encoder streams.
 
 ## Design
 
 - **Input:** Both Annex B (start code delimited `00 00 00 01` / `00 00 01`) and AVCC (length-prefixed, used inside MP4/MKV containers) bitstreams are supported. The decoder itself accepts `NalUnit` values; the choice of parser determines the input format.
 - **Streaming:** The decoder exposes a streaming API. NAL units are fed incrementally and decoded frames are emitted as they become available.
-- **Performance:** The decoder aims to be fast, with performance relative to ffmpeg's software H.264 decoder as the target benchmark.
+- **Performance:** The decoder aims to be fast, with performance relative to ffmpeg's software H.264 decoder as the target benchmark. Current numbers are in [BENCHMARK.md](BENCHMARK.md).
+
+## Not supported
+
+Streams using any of these are rejected with `DecodeError::Unsupported` on
+every slice, rather than decoded into wrong pictures:
+
+- Monochrome (4:0:0), 4:2:2 or 4:4:4 chroma
+- Bit depths above 8 (High 10 and up)
+- Lossless coding (transform bypass)
+
+Also not implemented: SP/SI slices, and slice groups (FMO) or arbitrary
+slice order (ASO).
+
+## Cargo features
+
+- `std` (default): standard library support. Without it the crate is
+  `no_std` + `alloc`; `ThreadedDecoder` needs `std`.
+- `portable-simd`: motion compensation via `core::simd` instead of the
+  NEON/x86 kernels (nightly only).
+- `dev-internals`: exposes internal modules (SPS/PPS/slice parsing, SHA-256)
+  for the diagnostic and benchmark examples. Not a stable API.
+- `minifb`: windowed player example.
+- `profile`: pprof sampling and phase timers for the benchmark example.
 
 ## Usage
 
@@ -69,8 +104,8 @@ the metadata for the picture currently being built and pairs it with that
 delayed frame when finalization occurs, avoiding the common off-by-one PTS bug.
 Metadata passed for non-slice NALs (SPS/PPS/SEI/etc.) is ignored, and
 continuation slices keep the metadata attached by the first slice of the same
-picture. Existing `decode_nal`/`flush` callers are unchanged; `OrderedDecoder`
-defaults to `OrderedDecoder<()>` and still returns `Vec<Frame>`.
+picture. Without metadata, `OrderedDecoder` is `OrderedDecoder<()>` and
+`decode_nal`/`flush` return plain `Vec<Frame>`.
 
 ### Multithreaded decoding
 
@@ -197,7 +232,7 @@ for frame in decoder.flush() {
 Decode and display an H.264 bitstream in a window:
 
 ```
-cargo run --example play -- input.h264 [--fps 30] [--loop]
+cargo run --release --features minifb --example play -- input.h264 [--fps 30] [--loop]
 ```
 
 - `--fps N` — set playback frame rate (default: 30)
@@ -209,10 +244,31 @@ cargo run --example play -- input.h264 [--fps 30] [--loop]
 Decode an H.264 bitstream to raw YUV420 output:
 
 ```
-cargo run --example dump_frames -- input.h264 [output.yuv]
+cargo run --release --example dump_frames -- input.h264 [output.yuv]
 ```
 
 Frames are written in display order (sorted by POC).
+
+### Compare against FFmpeg
+
+Decode a stream with both this crate and FFmpeg and compare the raw YUV
+byte for byte. Accepts `.h264` files or any container FFmpeg can read (the
+H.264 track is extracted with a bitstream copy); needs `ffmpeg` and
+`ffprobe` on `PATH`:
+
+```
+python3 tools/verify_vs_ffmpeg.py input.mp4 [more inputs...]
+```
+
+### Benchmark
+
+Decode time, allocation count and output digest for each bench stream in
+`testdata/`; set `BENCH_THREADS=N` to use `ThreadedDecoder`:
+
+```
+cargo run --release --features dev-internals --example bench_decode
+BENCH_THREADS=4 cargo run --release --features dev-internals --example bench_decode
+```
 
 ## License
 

@@ -1,6 +1,6 @@
 /// Decode an H.264 bitstream and display frames in a window.
 ///
-/// Usage: cargo run --example play -- <input.h264> [--fps N] [--loop]
+/// Usage: cargo run --release --features minifb --example play -- <input.h264> [--fps N] [--loop]
 ///
 /// Streams decode: feeds NALs incrementally, reorders by POC for correct
 /// display order, then displays each frame at the specified rate.
