@@ -1,6 +1,7 @@
 use rust_h264::decoder::{Decoder, Frame};
 use rust_h264::nal::{parse_annex_b, NalUnit};
 use rust_h264::sha256::sha256_hex;
+use rust_h264::threading::ThreadedDecoder;
 use std::alloc::{GlobalAlloc, Layout, System};
 #[cfg(not(feature = "profile"))]
 use std::process::Command;
@@ -56,17 +57,34 @@ fn decode_once(data: &[u8]) -> DecodeResult {
     decode_nals(&nals, true)
 }
 
+/// Worker count from `BENCH_THREADS` (unset or 0: serial `Decoder`).
+fn bench_threads() -> usize {
+    std::env::var("BENCH_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
 fn decode_nals(nals: &[NalUnit], compute_digest: bool) -> DecodeResult {
     let before_allocs = ALLOCATIONS.load(Ordering::Relaxed);
-    let mut decoder = Decoder::new();
     let mut frames = Vec::new();
-    for nal in nals {
-        if let Some(frame) = decoder.decode_nal(nal).unwrap() {
+    let threads = bench_threads();
+    if threads > 0 {
+        let mut decoder = ThreadedDecoder::new(threads);
+        for nal in nals {
+            frames.extend(decoder.decode_nal(nal).unwrap());
+        }
+        frames.extend(decoder.flush());
+    } else {
+        let mut decoder = Decoder::new();
+        for nal in nals {
+            if let Some(frame) = decoder.decode_nal(nal).unwrap() {
+                frames.push(frame);
+            }
+        }
+        if let Some(frame) = decoder.flush() {
             frames.push(frame);
         }
-    }
-    if let Some(frame) = decoder.flush() {
-        frames.push(frame);
     }
     let allocs = ALLOCATIONS.load(Ordering::Relaxed) - before_allocs;
 
@@ -165,6 +183,10 @@ fn bench_main() {
         eprintln!("[MISSING] 1080p ponly cabac — generate with x264");
     }
 
+    match bench_threads() {
+        0 => println!("decoder: serial Decoder (set BENCH_THREADS=N for ThreadedDecoder)"),
+        n => println!("decoder: ThreadedDecoder with {n} threads"),
+    }
     println!("stream | frames | decode_ms | fps | allocs | sha256(prefix)");
     println!("--- | ---: | ---: | ---: | ---: | ---");
 

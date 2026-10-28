@@ -177,26 +177,8 @@ impl Decoder {
         #[cfg(feature = "profile")]
         let _profile_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::DecodeNal);
         match nal.nal_unit_type {
-            NalUnitType::Sps => {
-                let sps = parse_sps(&nal.rbsp)?;
-                self.dpb.set_max_ref_frames(sps.max_num_ref_frames);
-                self.sps_table
-                    .insert(sps.seq_parameter_set_id, Arc::new(sps));
-                Ok(None)
-            }
-            NalUnitType::Pps => {
-                let pps_id_sps = {
-                    // Peek at seq_parameter_set_id to find the right SPS
-                    let mut peek = BitstreamReader::new(&nal.rbsp);
-                    let _ = peek.read_ue(); // pic_parameter_set_id
-                    peek.read_ue().ok()
-                };
-                let sps_ref = pps_id_sps
-                    .and_then(|id| self.sps_table.get(&id))
-                    .map(|s| &**s);
-                let pps = parse_pps(&nal.rbsp, sps_ref)?;
-                self.pps_table
-                    .insert(pps.pic_parameter_set_id, Arc::new(pps));
+            NalUnitType::Sps | NalUnitType::Pps => {
+                store_parameter_set(&mut self.sps_table, &mut self.pps_table, &mut self.dpb, nal)?;
                 Ok(None)
             }
             NalUnitType::Sei => Ok(None),
@@ -315,6 +297,36 @@ impl Decoder {
         self.pending = Some(ps);
         Ok(())
     }
+}
+
+/// Parse an SPS or PPS NAL and store it in the parameter-set tables. An SPS
+/// also updates the DPB's reference frame capacity.
+pub(crate) fn store_parameter_set(
+    sps_table: &mut BTreeMap<u32, Arc<Sps>>,
+    pps_table: &mut BTreeMap<u32, Arc<Pps>>,
+    dpb: &mut Dpb,
+    nal: &NalUnit,
+) -> Result<(), DecodeError> {
+    match nal.nal_unit_type {
+        NalUnitType::Sps => {
+            let sps = parse_sps(&nal.rbsp)?;
+            dpb.set_max_ref_frames(sps.max_num_ref_frames);
+            sps_table.insert(sps.seq_parameter_set_id, Arc::new(sps));
+        }
+        NalUnitType::Pps => {
+            let pps_id_sps = {
+                // Peek at seq_parameter_set_id to find the right SPS
+                let mut peek = BitstreamReader::new(&nal.rbsp);
+                let _ = peek.read_ue(); // pic_parameter_set_id
+                peek.read_ue().ok()
+            };
+            let sps_ref = pps_id_sps.and_then(|id| sps_table.get(&id)).map(|s| &**s);
+            let pps = parse_pps(&nal.rbsp, sps_ref)?;
+            pps_table.insert(pps.pic_parameter_set_id, Arc::new(pps));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Everything about one slice that can be decided from its header and the

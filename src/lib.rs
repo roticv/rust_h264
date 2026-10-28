@@ -107,6 +107,8 @@ mod residual;
 #[allow(dead_code)]
 mod sei;
 mod simd;
+#[cfg(feature = "std")]
+pub mod threading;
 
 #[cfg(feature = "dev-internals")]
 #[allow(dead_code)]

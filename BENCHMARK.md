@@ -379,3 +379,32 @@ python3 tools/verify_vs_ffmpeg.py clip.mp4 stream.h264
 
 Requires `ffmpeg` and `ffprobe` on PATH. On mismatch it reports the first
 differing byte offset and exits non-zero.
+
+## Frame threading on Apple Silicon (trunk)
+
+`ThreadedDecoder` as implemented on trunk, measured on the bench corpus with
+`BENCH_THREADS=N cargo run --release --features dev-internals --example
+bench_decode -- 1 3` (best of 3, 10-core aarch64, NEON backend). Output
+digests are identical to the serial decoder at every thread count.
+
+| Stream | serial | 2 threads | 4 threads | 8 threads |
+|--------|-------:|----------:|----------:|----------:|
+| 1080p B-frames complex (100f) | 74.1 fps | 84.0 fps | 88.7 fps | 88.8 fps |
+| 720p B-frames complex (300f)  | 166.2 fps | 193.3 fps | 200.2 fps | 199.6 fps |
+| 720p B-frames (300f)          | 270.9 fps | 275.9 fps | 279.2 fps | 278.6 fps |
+| 1080p P-only complex (100f)   | 77.5 fps | 76.8 fps | 76.7 fps | 76.8 fps |
+| 720p P-only complex (300f)    | 171.8 fps | 170.1 fps | 171.1 fps | 170.8 fps |
+
+- About **1.2x** at 4 threads on B-frame content, flat beyond that. P-only
+  streams see no gain (a P chain is fully serialized at picture
+  granularity) and pay about 1% overhead.
+- The ceiling is the reference chain: every P-picture waits for the
+  previous one to be completely decoded and deblocked, so the I/P chain is
+  the critical path and only the B-pictures run alongside it. In these
+  streams the P-pictures carry most of the work. PR #1 reported 1.47x on an
+  x86 desktop with similar streams; the difference is consistent with how
+  much of the decode time sits on that chain on each machine.
+- Row-level reference synchronization (letting a picture start once the
+  rows it references are done, as FFmpeg's frame threading does) is the
+  structural fix and would also help P-only content.
+

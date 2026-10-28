@@ -72,6 +72,30 @@ continuation slices keep the metadata attached by the first slice of the same
 picture. Existing `decode_nal`/`flush` callers are unchanged; `OrderedDecoder`
 defaults to `OrderedDecoder<()>` and still returns `Vec<Frame>`.
 
+### Multithreaded decoding
+
+`ThreadedDecoder` pipelines whole pictures across worker threads and returns
+frames in display order. Its output is byte-identical to `OrderedDecoder`:
+
+```rust
+use rust_h264::threading::ThreadedDecoder;
+
+let mut decoder = ThreadedDecoder::new(4); // up to 4 pictures in flight
+for nal in &nals {
+    for frame in decoder.decode_nal(nal).unwrap() {
+        // display order
+    }
+}
+for frame in decoder.flush() {
+    // remaining frames
+}
+```
+
+Parallelism comes from pictures that do not depend on each other, so the
+gain depends on the stream's reference structure: B-frames decode alongside
+the P-frames they reference, while a chain of P-frames, each referencing the
+previous one, decodes serially. Requires the `std` feature (on by default).
+
 ### Low-level `Decoder` (decode order)
 
 If you need raw decode order — for example, to drive a custom reorder buffer

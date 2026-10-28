@@ -45,6 +45,7 @@ The decoder logic is split across several files for maintainability:
 | `src/slice_context.rs` | ~920 | `SliceContext`/`SliceParams` structs + shared methods (skip, direct, reconstruct) |
 | `src/mv_pred.rs` | ~940 | MV prediction, spatial/temporal direct mode derivation |
 | `src/neighbor.rs` | ~470 | CABAC neighbor context helpers, nC computation, dequant helpers |
+| `src/threading.rs` | ~700 | `ThreadedDecoder`: frame-level pipelining. Coordinator plans slices (`prepare_slice`) in coded order against a shadow DPB of placeholder pictures; workers run `run_slice` + deblock once references commit; commits are coded-ordered; reorder buffer mirrors `OrderedDecoder` |
 | `src/simd/` | ~450 | Motion-compensation kernel backends: `scalar.rs` (reference), `neon.rs` (aarch64 default), `x86.rs` (x86_64 default, SSE2 + runtime SSSE3/AVX2/AVX-512), `portable.rs` (`core::simd`, nightly `portable-simd` feature). `mod.rs` selects one at compile time; all must be bit-exact with scalar |
 
 `SliceContext` bundles ~25 mutable per-MB arrays; `SliceParams` bundles read-only slice-level parameters. The `make_ctx!()` macro in `decoder.rs` constructs a `SliceContext` from local variables at each call site for zero-cost method dispatch.
@@ -55,6 +56,7 @@ The crate exposes a minimal surface area:
 
 - `decoder::Decoder` — low-level streaming decoder; `decode_nal` returns one frame at a time in **decode order**.
 - `decoder::OrderedDecoder` — wraps `Decoder` with a built-in reorder buffer; `decode_nal` returns 0+ frames in **display order** (sorted by `(gop_id, pic_order_cnt)`). Recommended for most users — handles GOP tracking and the IDR-count timing pitfall internally. It is generic as `OrderedDecoder<M = ()>`; `decode_nal_with_meta`/`flush_with_meta` return `(Frame, M)` pairs so callers can carry per-picture metadata such as PTS timestamps through B-frame reordering while existing `decode_nal`/`flush` callers remain unchanged.
+- `threading::ThreadedDecoder` (`std` feature) — same `decode_nal`/`flush` surface as `OrderedDecoder<()>`, decodes pictures on worker threads, output byte-identical to `OrderedDecoder`. Gains only on B-frame content (pictures referencing a P chain); a pure P chain is serialized by its dependencies.
 - `decoder::Frame` — decoded YUV 4:2:0 frame with `y`/`u`/`v` planes, `width`, `height`, `pic_order_cnt`.
 - `nal::parse_annex_b` — parser for start-code delimited bitstreams.
 - `nal::parse_avcc` + `nal::parse_avcc_config` + `nal::AvccConfig` — parser for length-prefixed bitstreams from MP4/MKV containers.
