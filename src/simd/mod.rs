@@ -53,7 +53,7 @@ mod tests {
         ),
         (
             "bench_720p_300f_ponly_complex",
-            "4b5cce0664658bf777832652d6d56b727e9a96d88e14e193c409309771e8f525",
+            "ba921841a20df11940a73bc4203e5daa669a29b9aba721737a4932727240c165",
         ),
         (
             "bench_720p_300f_bframes",

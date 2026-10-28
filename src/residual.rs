@@ -156,8 +156,14 @@ pub fn dequant_luma_dc_i16x16(dc: &mut [i32; 16], qp: i32, scale_dc: u8) {
     }
 }
 
-/// Dequantize chroma DC coefficients after Hadamard.
-/// Per spec 8.5.12.2. Uses scale[0] from the chroma scaling matrix.
+/// Dequantize 4:2:0 chroma DC coefficients after the 2x2 Hadamard
+/// (spec 8.5.11.2, ChromaArrayType 1):
+/// `dcC = ((f * LevelScale4x4(qP % 6, 0, 0)) << (qP / 6)) >> 5`.
+///
+/// Unlike luma DC and 4:2:2 chroma DC there is no rounding term: the shift
+/// floors. With flat scaling matrices `f * LevelScale` is a multiple of 16,
+/// so a rounding term would only change the result for chroma QP below 6.
+/// Uses scale[0] from the chroma scaling matrix.
 pub fn dequant_chroma_dc(dc: &mut [i32; 4], qp: i32, scale_dc: u8) {
     let qp_per = qp / 6;
     let qp_rem = (qp % 6) as usize;
@@ -168,9 +174,9 @@ pub fn dequant_chroma_dc(dc: &mut [i32; 4], qp: i32, scale_dc: u8) {
             *d = d.wrapping_mul(v).wrapping_shl((qp_per - 5) as u32);
         }
     } else {
-        let round = 1 << (4 - qp_per);
+        // Arithmetic shift: floors, matching (x << qp_per) >> 5.
         for d in dc.iter_mut() {
-            *d = (d.wrapping_mul(v).wrapping_add(round)) >> (5 - qp_per);
+            *d = d.wrapping_mul(v) >> (5 - qp_per);
         }
     }
 }
@@ -486,6 +492,20 @@ mod tests {
         for &v in &dc[1..] {
             assert_eq!(v, 0);
         }
+    }
+
+    #[test]
+    fn test_dequant_chroma_dc_floors_without_rounding() {
+        // qP = 1: LevelScale4x4(1, 0, 0) = 11 * 16 = 176 with a flat matrix.
+        // dcC = (f * 176 << 0) >> 5 = floor(f * 5.5): 5 for f = 1, -6 for
+        // f = -1, 11 for f = 2. A rounding term would give 6, -5 and 11.
+        let mut dc = [1, -1, 2, 0];
+        dequant_chroma_dc(&mut dc, 1, 16);
+        assert_eq!(dc, [5, -6, 11, 0]);
+        // At qP >= 30 the formula is exact either way.
+        let mut dc = [1, -1, 0, 0];
+        dequant_chroma_dc(&mut dc, 31, 16);
+        assert_eq!(dc, [(176 << 5) >> 5, (-176 << 5) >> 5, 0, 0]);
     }
 
     #[test]
