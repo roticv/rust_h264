@@ -114,6 +114,7 @@ pub fn filter_frame_params(
         slice_beta_offset_div2,
         chroma_qp_index_offset,
         false,
+        0..mb_info.len(),
     );
 }
 
@@ -138,6 +139,37 @@ pub fn filter_frame_mbaff(
         slice_beta_offset_div2,
         chroma_qp_index_offset,
         mbaff,
+        0..mb_info.len(),
+    );
+}
+
+/// Deblock only macroblocks `mbs` (in decoding order). Filtering is a single
+/// raster-order pass where each MB filters its left and top edges, so
+/// calling this on consecutive ranges gives exactly the result of
+/// [`filter_frame_mbaff`], provided each range's MBs and their left/top
+/// neighbours are final when it runs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn filter_mb_range(
+    frame: &mut Frame,
+    mb_info: &[MbInfo],
+    mb_width: usize,
+    disable_deblocking_filter_idc: u32,
+    slice_alpha_c0_offset_div2: i32,
+    slice_beta_offset_div2: i32,
+    chroma_qp_index_offset: i32,
+    mbaff: bool,
+    mbs: core::ops::Range<usize>,
+) {
+    filter_frame_inner(
+        frame,
+        mb_info,
+        mb_width,
+        disable_deblocking_filter_idc,
+        slice_alpha_c0_offset_div2,
+        slice_beta_offset_div2,
+        chroma_qp_index_offset,
+        mbaff,
+        mbs,
     );
 }
 
@@ -151,6 +183,7 @@ fn filter_frame_inner(
     slice_beta_offset_div2: i32,
     chroma_qp_index_offset: i32,
     mbaff: bool,
+    mbs: core::ops::Range<usize>,
 ) {
     if disable_deblocking_filter_idc == 1 {
         return;
@@ -169,7 +202,7 @@ fn filter_frame_inner(
     // For vertical edges: blocks to the left of edge column
     // For horizontal edges: blocks above edge row
 
-    for mb_idx in 0..mb_info.len() {
+    for mb_idx in mbs.start..mbs.end.min(mb_info.len()) {
         // Compute spatial position and column/row for neighbor checks
         let (mb_x, mb_y, mb_col, mb_row) = if mbaff {
             let pair_addr = mb_idx / 2;

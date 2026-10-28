@@ -1,27 +1,32 @@
-//! Frame-level multithreaded decoding.
+//! Frame-level multithreaded decoding with row-level reference
+//! synchronization.
 //!
 //! The macroblock loop is inherently serial within a picture (CABAC and
 //! intra/MV prediction depend on already-decoded neighbours), so parallelism
-//! comes from pipelining *pictures*. [`ThreadedDecoder`] runs all
-//! header-level work in coded order on the calling thread — slice header
-//! parsing, POC computation and reference list construction via
-//! [`prepare_slice`] — against a *shadow* DPB that holds placeholder pictures
-//! whose pixels have not been decoded yet. Each complete picture is then
-//! handed to a worker thread that runs the macroblock loops and deblocking.
+//! comes from decoding several *pictures* at once. [`ThreadedDecoder`] runs
+//! all header-level work in coded order on the calling thread: parameter
+//! sets, slice headers, POC and reference lists via [`prepare_slice`], and
+//! reference marking on a DPB of pictures that may still be decoding. Each
+//! complete picture is handed to a worker thread.
 //!
-//! A worker starts decoding once every picture its slices reference has been
-//! committed, and pictures commit strictly in coded order. Because the shadow
-//! DPB replays exactly the bookkeeping the serial [`Decoder`] performs
-//! (insert, sliding window, MMCO), with the same metadata in the same order,
-//! the reference lists are identical by construction and the output is
-//! bit-identical to the serial decoder. The reorder buffer reproduces
-//! [`OrderedDecoder`] semantics, so the display-order frame sequence is the
-//! same as well; the tests decode every multi-frame test stream both ways and
-//! compare byte for byte.
+//! A worker deblocks and publishes its picture one macroblock row at a time
+//! (see `RowSync`). Pictures that reference it wait only for the rows they
+//! actually read: motion compensation waits for the reference rows its
+//! interpolation filter touches, and direct-mode prediction waits for the
+//! co-located picture to finish. A P-picture can therefore start while its
+//! reference is still being decoded, so even a pure P chain is pipelined.
 //!
-//! Dependencies are tracked at picture granularity. On B-frame content this
-//! exposes several pictures of parallelism; a pure P chain references its
-//! immediate predecessor and gains little.
+//! The DPB bookkeeping is exactly the serial [`Decoder`]'s, performed in the
+//! same order with the same metadata, and every sample a worker reads is
+//! final when read, so the output is bit-identical to the serial decoder.
+//! The reorder buffer reproduces [`OrderedDecoder`] semantics, so the
+//! display-order frame sequence is the same as well; the tests decode every
+//! test stream both ways and compare byte for byte.
+//!
+//! On streams with macroblock-level decode errors the threaded decoder
+//! conceals rather than drops: a picture whose slices all fail becomes a
+//! mid-grey stand-in, and rows published before a slice failed are kept.
+//! Output can then differ from the serial decoder.
 //!
 //! Field pictures and MBAFF are supported.
 //!
@@ -31,73 +36,31 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::bitstream::BitstreamReader;
 use crate::decoder::{
-    apply_reference_marking, deblock_picture, finish_output, make_decoded_picture, prepare_slice,
-    run_slice, store_parameter_set, Frame, PictureState, SlicePlan,
+    apply_reference_marking, finish_output, prepare_slice, run_slice, store_parameter_set, Frame,
+    PictureState, RowSync, SlicePlan,
 };
-use crate::dpb::{DecodedPicture, Dpb, PictureStructure};
+use crate::dpb::{DecodedPicture, Dpb, PictureMeta, PictureStructure, PictureWriter};
 use crate::error::DecodeError;
 use crate::nal::{NalUnit, NalUnitType};
 use crate::pps::Pps;
 use crate::slice::SliceType;
 use crate::sps::Sps;
 
-/// Receives the real decoded picture when its frame commits. Workers read a
-/// slot only after the commit barrier guarantees it is filled.
-type Slot = Arc<OnceLock<Arc<DecodedPicture>>>;
-
-/// A picture in the shadow DPB: metadata-only placeholder plus the slot its
-/// pixels will arrive in.
-struct Placeholder {
-    pic: Arc<DecodedPicture>,
-    slot: Slot,
-    seq: u64,
-}
+type WorkerResult = Result<PictureState, DecodeError>;
 
 /// Picture currently accumulating slices on the coordinator.
 struct OpenPicture {
     seq: u64,
-    slot: Slot,
     slices: Vec<SlicePlan>,
 }
 
-/// Per-picture bookkeeping from dispatch until commit.
-struct Scheduled {
-    slot: Slot,
-    /// Reorder-buffer GOP tag (see `push_frame`).
-    gop: u32,
-    /// Geometry for the stand-in picture published if decoding fails, so
-    /// dependent pictures can still be decoded instead of stalling.
-    fallback: Arc<DecodedPicture>,
-}
-
-struct CommitBarrier {
-    /// Number of pictures committed so far; pictures `0..committed` are
-    /// decoded and their slots are filled.
-    committed: Mutex<u64>,
-    cv: Condvar,
-}
-
-/// One slice ready for a worker: the plan plus, for every reference list
-/// entry, the slot to take the real picture from (`None` keeps the entry).
-struct WorkSlice {
-    plan: SlicePlan,
-    slots: [Vec<Option<Slot>>; 3],
-}
-
-struct PictureJob {
-    seq: u64,
-    /// Commit count required before decoding may start.
-    needed: u64,
-    slices: Vec<WorkSlice>,
-}
-
-/// H.264 decoder that pipelines pictures across worker threads and emits
+/// H.264 decoder that decodes several pictures concurrently and emits
 /// frames in display order: the threaded counterpart of
 /// [`OrderedDecoder`](crate::decoder::OrderedDecoder), with byte-identical
 /// output.
@@ -122,18 +85,17 @@ pub struct ThreadedDecoder {
     threads: usize,
     sps_table: BTreeMap<u32, Arc<Sps>>,
     pps_table: BTreeMap<u32, Arc<Pps>>,
-    /// Shadow DPB of placeholder pictures.
+    /// DPB of pictures that may still be decoding on workers.
     dpb: Dpb,
     open: Option<OpenPicture>,
-    /// Placeholder identity (Arc pointer) -> slot/seq, for dependency lookup.
-    placeholders: HashMap<usize, Placeholder>,
     next_seq: u64,
+    /// Next picture (in coded order) to hand to the output stage.
     commit_next: u64,
-    barrier: Arc<CommitBarrier>,
-    scheduled: HashMap<u64, Scheduled>,
-    results: BTreeMap<u64, Result<PictureState, DecodeError>>,
-    done_tx: Sender<(u64, Result<PictureState, DecodeError>)>,
-    done_rx: Receiver<(u64, Result<PictureState, DecodeError>)>,
+    /// Reorder-buffer GOP tag per dispatched picture.
+    gops: HashMap<u64, u32>,
+    results: BTreeMap<u64, WorkerResult>,
+    done_tx: Sender<(u64, WorkerResult)>,
+    done_rx: Receiver<(u64, WorkerResult)>,
     inflight: VecDeque<JoinHandle<()>>,
     /// First field of a field pair awaiting its complement (serial
     /// `Decoder::pending_field` equivalent; handled at commit time).
@@ -164,14 +126,9 @@ impl ThreadedDecoder {
             pps_table: BTreeMap::new(),
             dpb: Dpb::new(0),
             open: None,
-            placeholders: HashMap::new(),
             next_seq: 0,
             commit_next: 0,
-            barrier: Arc::new(CommitBarrier {
-                committed: Mutex::new(0),
-                cv: Condvar::new(),
-            }),
-            scheduled: HashMap::new(),
+            gops: HashMap::new(),
             results: BTreeMap::new(),
             done_tx,
             done_rx,
@@ -206,9 +163,7 @@ impl ThreadedDecoder {
     /// display order.
     ///
     /// Errors from slice headers are reported immediately; errors from
-    /// macroblock decoding on a worker are reported on a later call (the
-    /// picture that failed is replaced by a flat stand-in so the stream
-    /// keeps decoding), matching how the serial decoder recovers.
+    /// macroblock decoding on a worker are reported on a later call.
     pub fn decode_nal(&mut self, nal: &NalUnit) -> Result<Vec<Frame>, DecodeError> {
         let mut out = Vec::new();
         match nal.nal_unit_type {
@@ -238,7 +193,6 @@ impl ThreadedDecoder {
                             self.next_seq += 1;
                             self.open = Some(OpenPicture {
                                 seq,
-                                slot: Arc::new(OnceLock::new()),
                                 slices: Vec::new(),
                             });
                         }
@@ -271,13 +225,11 @@ impl ThreadedDecoder {
     pub fn flush(&mut self) -> Vec<Frame> {
         let closed = self.close_open_picture();
         let mut out = Vec::new();
-        self.pump(&mut out);
-        // Join workers in coded order, committing between joins: a worker may
-        // be waiting on the commit barrier, and commits happen in pump().
         while let Some(handle) = self.inflight.pop_front() {
             let _ = handle.join();
             self.pump(&mut out);
         }
+        self.pump(&mut out);
         self.first_error = None;
         // Serial flush: finalize the last picture; if that produced no frame,
         // output a lone pending field as a half-height frame.
@@ -297,22 +249,34 @@ impl ThreadedDecoder {
         let Some(open) = self.open.take() else {
             return false;
         };
-        let Some(last) = open.slices.last() else {
+        let (Some(first), Some(last)) = (open.slices.first(), open.slices.last()) else {
             return false;
         };
 
-        // Reference marking on the shadow DPB with a metadata-only
-        // placeholder, exactly as the serial decoder does when it finalizes
-        // this picture (using the last slice's header, like the serial path).
-        let placeholder = Arc::new(picture_shell(last, Vec::new(), Vec::new()));
-        let fallback = Arc::new(picture_shell(
-            last,
-            vec![128u8; (last.coded_width * last.coded_height) as usize],
-            vec![128u8; (last.coded_width * last.coded_height / 4) as usize],
-        ));
+        // The DPB picture is created now, empty, and filled by the worker.
+        // Geometry comes from the slice that creates the PictureState, the
+        // rest from the last slice, as in the serial decoder's finalize.
+        let meta = PictureMeta {
+            width: first.coded_width,
+            height: first.coded_height,
+            frame_num: last.header.frame_num,
+            pic_order_cnt: last.current_poc,
+            mb_width: first.mb_width,
+            is_intra: last.header.slice_type == SliceType::I,
+            structure: if last.header.field_pic_flag {
+                if last.header.bottom_field_flag {
+                    PictureStructure::BottomField
+                } else {
+                    PictureStructure::TopField
+                }
+            } else {
+                PictureStructure::Frame
+            },
+        };
+        let (pic, writer) = DecodedPicture::new_in_progress(meta);
         apply_reference_marking(
             &mut self.dpb,
-            placeholder.clone(),
+            pic,
             last.nal_unit_type,
             last.nal_ref_idc,
             last.header.frame_num,
@@ -320,57 +284,15 @@ impl ThreadedDecoder {
             &last.header.mmco_ops,
             last.header.long_term_reference_flag,
         );
-        self.placeholders.insert(
-            Arc::as_ptr(&placeholder) as usize,
-            Placeholder {
-                pic: placeholder,
-                slot: open.slot.clone(),
-                seq: open.seq,
-            },
-        );
+        self.gops.insert(open.seq, self.gop_id);
 
-        // Map every reference list entry to its slot and find the newest
-        // picture this one depends on.
-        let mut needed = 0u64;
-        let mut slices = Vec::with_capacity(open.slices.len());
-        for plan in open.slices {
-            let mut map = |list: &[Arc<DecodedPicture>]| -> Vec<Option<Slot>> {
-                list.iter()
-                    .map(|p| {
-                        self.placeholders.get(&(Arc::as_ptr(p) as usize)).map(|ph| {
-                            needed = needed.max(ph.seq + 1);
-                            ph.slot.clone()
-                        })
-                    })
-                    .collect()
-            };
-            let slots = [
-                map(&plan.ref_pic_list),
-                map(&plan.ref_pic_list_l0),
-                map(&plan.ref_pic_list_l1),
-            ];
-            slices.push(WorkSlice { plan, slots });
-        }
-
-        self.scheduled.insert(
-            open.seq,
-            Scheduled {
-                slot: open.slot,
-                gop: self.gop_id,
-                fallback,
-            },
-        );
-
-        let job = PictureJob {
-            seq: open.seq,
-            needed,
-            slices,
-        };
-        let barrier = Arc::clone(&self.barrier);
+        let seq = open.seq;
+        let slices = open.slices;
         let done_tx = self.done_tx.clone();
-        let seq = job.seq;
         let handle = std::thread::spawn(move || {
-            let result = catch_unwind(AssertUnwindSafe(|| run_picture(job, &barrier)))
+            // A panic drops the writer during unwinding, which completes the
+            // picture with stand-in content so no reader waits forever.
+            let result = catch_unwind(AssertUnwindSafe(move || run_picture(slices, writer)))
                 .unwrap_or(Err(DecodeError::InvalidSyntax("decode worker panicked")));
             let _ = done_tx.send((seq, result));
         });
@@ -378,7 +300,7 @@ impl ThreadedDecoder {
         true
     }
 
-    /// Collect finished pictures and commit as many as possible in coded
+    /// Collect finished pictures and hand them to the output stage in coded
     /// order, emitting display-ready frames into `out`.
     fn pump(&mut self, out: &mut Vec<Frame>) {
         while let Ok((seq, res)) = self.done_rx.try_recv() {
@@ -387,40 +309,23 @@ impl ThreadedDecoder {
         self.inflight.retain(|h| !h.is_finished());
 
         while let Some(res) = self.results.remove(&self.commit_next) {
-            let seq = self.commit_next;
-            let sched = self
-                .scheduled
-                .remove(&seq)
-                .expect("scheduled entry for committed picture");
+            let gop = self.gops.remove(&self.commit_next).unwrap_or(self.gop_id);
+            self.commit_next += 1;
             match res {
-                Ok(mut ps) => {
-                    let pic = Arc::new(make_decoded_picture(&mut ps));
-                    let _ = sched.slot.set(pic);
-                    match finish_output(ps, &mut self.pending_field) {
-                        Some(frame) => {
-                            self.last_commit_output = true;
-                            self.push_frame(sched.gop, frame, out);
-                        }
-                        None => self.last_commit_output = false,
+                Ok(ps) => match finish_output(ps, &mut self.pending_field) {
+                    Some(frame) => {
+                        self.last_commit_output = true;
+                        self.push_frame(gop, frame, out);
                     }
-                }
+                    None => self.last_commit_output = false,
+                },
                 Err(e) => {
                     if self.first_error.is_none() {
                         self.first_error = Some(e);
                     }
-                    let _ = sched.slot.set(sched.fallback);
                     self.last_commit_output = false;
                 }
             }
-            {
-                let mut committed = self.barrier.committed.lock().unwrap();
-                *committed = seq + 1;
-                self.barrier.cv.notify_all();
-            }
-            self.commit_next = seq + 1;
-            // Placeholders no longer held by the shadow DPB or any plan can go.
-            self.placeholders
-                .retain(|_, ph| Arc::strong_count(&ph.pic) > 1);
         }
     }
 
@@ -432,8 +337,7 @@ impl ThreadedDecoder {
             Ok((seq, res)) => {
                 self.results.insert(seq, res);
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {}
+            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {}
         }
     }
 
@@ -472,101 +376,62 @@ impl ThreadedDecoder {
 
 impl Drop for ThreadedDecoder {
     fn drop(&mut self) {
-        // Let workers finish so none is left blocked on the barrier.
-        let mut sink = Vec::new();
+        // Workers only wait on each other, never on the coordinator, so they
+        // all finish on their own.
         while let Some(handle) = self.inflight.pop_front() {
-            self.pump(&mut sink);
             let _ = handle.join();
         }
     }
 }
 
-/// A `DecodedPicture` carrying the metadata the DPB needs (frame_num, POC,
-/// structure, geometry) with the given planes; motion data is empty or
-/// zero-sized to match.
-fn picture_shell(plan: &SlicePlan, luma: Vec<u8>, chroma: Vec<u8>) -> DecodedPicture {
-    let n = if luma.is_empty() {
-        0
+/// First macroblock index a slice writes (MB-pair addresses with MBAFF).
+fn first_mb_index(plan: &SlicePlan) -> usize {
+    let first = plan.header.first_mb_in_slice as usize;
+    if plan.header.mbaff_frame_flag {
+        first * 2
     } else {
-        plan.total_mbs * 16
-    };
-    DecodedPicture {
-        y: luma,
-        u: chroma.clone(),
-        v: chroma,
-        width: plan.coded_width,
-        height: plan.coded_height,
-        frame_num: plan.header.frame_num,
-        pic_order_cnt: plan.current_poc,
-        mv_l0: vec![[0i16; 2]; n],
-        ref_idx_l0: vec![-1i8; n],
-        ref_poc_l0: vec![-1i32; n],
-        mv_l1: vec![[0i16; 2]; n],
-        ref_idx_l1: vec![-1i8; n],
-        mb_width: plan.mb_width,
-        is_intra: plan.header.slice_type == SliceType::I,
-        structure: if plan.header.field_pic_flag {
-            if plan.header.bottom_field_flag {
-                PictureStructure::BottomField
-            } else {
-                PictureStructure::TopField
-            }
-        } else {
-            PictureStructure::Frame
-        },
+        first
     }
 }
 
-/// Worker side: wait for this picture's references, swap the placeholder
-/// references for the real pictures, run every slice, then deblock.
-fn run_picture(job: PictureJob, barrier: &CommitBarrier) -> Result<PictureState, DecodeError> {
-    {
-        let mut committed = barrier.committed.lock().unwrap();
-        while *committed < job.needed {
-            committed = barrier.cv.wait(committed).unwrap();
-        }
-    }
-
+/// Worker side: decode every slice of one picture, deblocking and publishing
+/// rows as they become final, then complete the shared picture.
+fn run_picture(slices: Vec<SlicePlan>, writer: PictureWriter) -> WorkerResult {
+    let starts: Vec<usize> = slices.iter().map(first_mb_index).collect();
+    let mut sync = RowSync {
+        writer,
+        next_unit: 0,
+        limit_mb: 0,
+    };
     let mut pending: Option<PictureState> = None;
     let mut first_error: Option<DecodeError> = None;
-    for mut slice in job.slices {
-        materialize(&mut slice);
-        // Mirror the serial decoder's recovery: a failed continuation slice
-        // keeps the already-decoded macroblocks of earlier slices.
+    for (k, plan) in slices.iter().enumerate() {
+        // Rows a later slice may still write must not be deblocked or
+        // published yet.
+        sync.limit_mb = starts[k + 1..].iter().copied().min().unwrap_or(usize::MAX);
+        // Mirror the serial decoder's recovery: a failed slice leaves the
+        // picture as it was before that slice.
         let backup = pending.clone();
-        match run_slice(&slice.plan, pending.take()) {
+        let saved_unit = sync.next_unit;
+        match run_slice(plan, pending.take(), Some(&mut sync)) {
             Ok(ps) => pending = Some(ps),
             Err(e) => {
                 pending = backup;
+                sync.next_unit = saved_unit;
                 if first_error.is_none() {
                     first_error = Some(e);
                 }
             }
         }
     }
+    // With no decoded state, dropping `sync` completes the picture as a
+    // stand-in.
     let mut ps = match pending {
         Some(ps) => ps,
         None => return Err(first_error.unwrap_or(DecodeError::InvalidSyntax("empty picture"))),
     };
-    deblock_picture(&mut ps);
+    sync.finish(&mut ps);
     Ok(ps)
-}
-
-/// Replace placeholder reference pictures with the committed ones. Slots are
-/// guaranteed filled once the barrier has passed; an entry without a slot (or
-/// an unexpectedly empty slot) keeps the placeholder.
-fn materialize(slice: &mut WorkSlice) {
-    let swap = |list: &mut Vec<Arc<DecodedPicture>>, slots: &[Option<Slot>]| {
-        for (entry, slot) in list.iter_mut().zip(slots) {
-            if let Some(pic) = slot.as_ref().and_then(|s| s.get()) {
-                *entry = Arc::clone(pic);
-            }
-        }
-    };
-    let WorkSlice { plan, slots } = slice;
-    swap(&mut plan.ref_pic_list, &slots[0]);
-    swap(&mut plan.ref_pic_list_l0, &slots[1]);
-    swap(&mut plan.ref_pic_list_l1, &slots[2]);
 }
 
 #[cfg(test)]
@@ -670,6 +535,47 @@ mod tests {
             let nals = parse_annex_b(&data);
             assert_same(name, &decode_serial(&nals), &decode_threaded(&nals, 4));
         }
+    }
+
+    /// Readers block until the rows they need are published, see only the
+    /// published prefix, and a dropped writer completes the picture.
+    #[test]
+    fn in_progress_picture_row_publication() {
+        let meta = PictureMeta {
+            width: 32,
+            height: 48,
+            frame_num: 0,
+            pic_order_cnt: 0,
+            mb_width: 2,
+            is_intra: false,
+            structure: PictureStructure::Frame,
+        };
+        let (pic, mut writer) = DecodedPicture::new_in_progress(meta);
+        assert!(pic.luma().is_empty());
+        let y = vec![7u8; 32 * 48];
+        let c = vec![9u8; 16 * 24];
+        let reader = {
+            let pic = Arc::clone(&pic);
+            std::thread::spawn(move || {
+                // Needs luma line 17, i.e. MB row 1.
+                pic.wait_luma(32 * 18);
+                pic.luma().len()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        writer.publish(&y, &c, &c, 1);
+        assert_eq!(pic.luma().len(), 32 * 16);
+        assert_eq!(pic.chroma(0).len(), 16 * 8);
+        writer.publish(&y, &c, &c, 2);
+        assert!(reader.join().unwrap() >= 32 * 32);
+        // The last row is only published by finish/drop.
+        writer.publish(&y, &c, &c, 3);
+        assert_eq!(pic.luma().len(), 32 * 32);
+        drop(writer);
+        assert_eq!(pic.luma().len(), 32 * 48);
+        assert!(pic.luma()[..32 * 32].iter().all(|&b| b == 7));
+        assert!(pic.luma()[32 * 32..].iter().all(|&b| b == 128));
+        assert_eq!(pic.motion().ref_idx_l0.len(), 2 * 3 * 16);
     }
 
     /// Malformed inputs from the fuzz corpus must not hang or panic the

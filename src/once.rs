@@ -53,6 +53,23 @@ mod no_std {
             self.get_ready()
         }
 
+        pub(crate) fn get(&self) -> Option<&T> {
+            if self.state.load(Ordering::Acquire) == READY {
+                Some(self.get_ready())
+            } else {
+                None
+            }
+        }
+
+        pub(crate) fn set(&self, value: T) -> Result<(), T> {
+            let mut value = Some(value);
+            self.get_or_init(|| value.take().expect("value present"));
+            match value {
+                None => Ok(()),
+                Some(v) => Err(v),
+            }
+        }
+
         fn get_ready(&self) -> &T {
             let ptr = self.ptr.load(Ordering::Acquire);
             debug_assert!(!ptr.is_null());

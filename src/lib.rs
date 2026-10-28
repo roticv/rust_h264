@@ -87,6 +87,7 @@ mod mv_pred;
 pub mod nal;
 mod neighbor;
 mod once;
+mod picture_sync;
 #[cfg(feature = "dev-internals")]
 #[allow(dead_code)]
 pub mod pps;

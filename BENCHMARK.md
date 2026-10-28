@@ -382,29 +382,37 @@ differing byte offset and exits non-zero.
 
 ## Frame threading on Apple Silicon (trunk)
 
-`ThreadedDecoder` as implemented on trunk, measured on the bench corpus with
-`BENCH_THREADS=N cargo run --release --features dev-internals --example
-bench_decode -- 1 3` (best of 3, 10-core aarch64, NEON backend). Output
-digests are identical to the serial decoder at every thread count.
+`ThreadedDecoder` on the bench corpus, 10-core aarch64, NEON backend. Best
+of 15 runs per cell (`BENCH_THREADS=N cargo run --release --features
+dev-internals --example bench_decode -- 1 5`, repeated in interleaved
+rounds); serial is best of 20. Output digests are identical to the serial
+decoder in every configuration.
 
-| Stream | serial | 2 threads | 4 threads | 8 threads |
-|--------|-------:|----------:|----------:|----------:|
-| 1080p B-frames complex (100f) | 74.1 fps | 84.0 fps | 88.7 fps | 88.8 fps |
-| 720p B-frames complex (300f)  | 166.2 fps | 193.3 fps | 200.2 fps | 199.6 fps |
-| 720p B-frames (300f)          | 270.9 fps | 275.9 fps | 279.2 fps | 278.6 fps |
-| 1080p P-only complex (100f)   | 77.5 fps | 76.8 fps | 76.7 fps | 76.8 fps |
-| 720p P-only complex (300f)    | 171.8 fps | 170.1 fps | 171.1 fps | 170.8 fps |
+| Stream | serial | picture sync, 4t | row sync, 4t | row sync, 8t |
+|--------|-------:|-----------------:|-------------:|-------------:|
+| 1080p B-frames complex (100f) | 73.9 fps | 87.8 fps | **102.8 fps** | 93.1 fps |
+| 1080p P-only complex (100f)   | 77.4 fps | 76.6 fps | **112.0 fps** | 100.3 fps |
+| 720p B-frames complex (300f)  | 166.1 fps | 199.3 fps | **228.0 fps** | 220.3 fps |
+| 720p P-only complex (300f)    | 171.8 fps | 167.9 fps | **250.8 fps** | 231.2 fps |
+| 1080p B-frames (100f)         | —         | 131.6 fps | 132.8 fps | 125.6 fps |
+| 720p P-only (300f)            | —         | 258.8 fps | 269.7 fps | 269.2 fps |
 
-- About **1.2x** at 4 threads on B-frame content, flat beyond that. P-only
-  streams see no gain (a P chain is fully serialized at picture
-  granularity) and pay about 1% overhead.
-- The ceiling is the reference chain: every P-picture waits for the
-  previous one to be completely decoded and deblocked, so the I/P chain is
-  the critical path and only the B-pictures run alongside it. In these
-  streams the P-pictures carry most of the work. PR #1 reported 1.47x on an
-  x86 desktop with similar streams; the difference is consistent with how
-  much of the decode time sits on that chain on each machine.
-- Row-level reference synchronization (letting a picture start once the
-  rows it references are done, as FFmpeg's frame threading does) is the
-  structural fix and would also help P-only content.
-
+- **Row-level synchronization** (current): about **1.4-1.46x over serial at
+  4 threads** on the complex streams, for P-only content as much as for
+  B-frames. A picture's worker deblocks and publishes each macroblock row
+  as it becomes final; motion compensation in a dependent picture waits
+  only for the reference rows it reads, so consecutive P-pictures overlap
+  instead of running back to back.
+- **Picture-level synchronization** (previous version, kept for
+  comparison): each picture waited for its references to finish
+  completely. That left the I/P chain serial, so P-only streams gained
+  nothing and B-frame streams about 1.2x.
+- 8 threads is slower than 4 here. Pictures waiting on references hold
+  their threads, and with more in flight some run on the efficiency cores,
+  which slows the reference chain everyone else waits on.
+- The simple streams (mostly skipped macroblocks) gain little: their
+  decode work is small compared with the serial slice-header parsing and
+  output path on the coordinator thread.
+- Single-threaded cost of the row waits (an atomic load per motion
+  compensation call on complete pictures) is within noise: best-of-20
+  serial throughput is 0.2-0.6% lower than before the change.

@@ -3,12 +3,20 @@
 //! Generates predicted blocks for P/B slices by interpolating pixels from
 //! reference frames at quarter-pel (luma) or eighth-pel (chroma) precision.
 
-use crate::dpb::DecodedPicture;
+use crate::dpb::{ChromaRef, DecodedPicture};
+
+/// Luma samples available to the clamped (per-pixel) interpolation paths:
+/// the published rows of a reference picture, or a temporary field copy.
+struct LumaView<'a> {
+    y: &'a [u8],
+    width: u32,
+    height: u32,
+}
 
 /// Fetch a luma sample from the reference picture with boundary clipping.
 /// Out-of-bounds coordinates are clamped to the picture edge (spec 8.4.2.2.1).
 #[inline]
-fn ref_luma(pic: &DecodedPicture, x: i32, y: i32) -> i32 {
+fn ref_luma(pic: &LumaView<'_>, x: i32, y: i32) -> i32 {
     let cx = x.clamp(0, pic.width as i32 - 1) as usize;
     let cy = y.clamp(0, pic.height as i32 - 1) as usize;
     pic.y[cy * pic.width as usize + cx] as i32
@@ -55,20 +63,20 @@ pub(crate) fn fir6_i32(s0: i32, s1: i32, s2: i32, s3: i32, s4: i32, s5: i32) -> 
 
 /// 6-tap horizontal half-pel filter at integer position (x, y).
 /// Returns clipped u8 result. Used only for boundary blocks.
-fn half_pel_h(pic: &DecodedPicture, x: i32, y: i32) -> u8 {
+fn half_pel_h(pic: &LumaView<'_>, x: i32, y: i32) -> u8 {
     let s = |dx: i32| ref_luma(pic, x + dx, y);
     clip_u8((s(-2) - 5 * s(-1) + 20 * s(0) + 20 * s(1) - 5 * s(2) + s(3) + 16) >> 5)
 }
 
 /// 6-tap vertical half-pel filter at integer position (x, y).
 /// Used only for boundary blocks.
-fn half_pel_v(pic: &DecodedPicture, x: i32, y: i32) -> u8 {
+fn half_pel_v(pic: &LumaView<'_>, x: i32, y: i32) -> u8 {
     let s = |dy: i32| ref_luma(pic, x, y + dy);
     clip_u8((s(-2) - 5 * s(-1) + 20 * s(0) + 20 * s(1) - 5 * s(2) + s(3) + 16) >> 5)
 }
 
 /// Diagonal half-pel. Used only for boundary blocks.
-fn half_pel_hv(pic: &DecodedPicture, x: i32, y: i32) -> u8 {
+fn half_pel_hv(pic: &LumaView<'_>, x: i32, y: i32) -> u8 {
     let mut h = [0i32; 6];
     for (i, dy) in (-2..=3).enumerate() {
         let s = |dx: i32| ref_luma(pic, x + dx, y + dy);
@@ -79,7 +87,7 @@ fn half_pel_hv(pic: &DecodedPicture, x: i32, y: i32) -> u8 {
 }
 
 /// Per-pixel interpolation fallback for boundary blocks.
-fn luma_interp(pic: &DecodedPicture, x: i32, y: i32, frac_x: i32, frac_y: i32) -> u8 {
+fn luma_interp(pic: &LumaView<'_>, x: i32, y: i32, frac_x: i32, frac_y: i32) -> u8 {
     match (frac_x, frac_y) {
         (0, 0) => ref_luma(pic, x, y) as u8,
         (2, 0) => half_pel_h(pic, x, y),
@@ -164,7 +172,17 @@ pub fn luma_mc_stride(
     let stride = ref_stride;
     let bw = block_w as i32;
     let bh = block_h as i32;
-    let ref_y = &ref_pic.y[ref_y_offset..];
+    // Wait until every reference row this call can read is final (the
+    // filters reach 2 rows above and 3 below, plus one for quarter-pel
+    // offsets; one more row of margin). Complete pictures return at once.
+    let last_row = (y_int + bh + 4).clamp(0, (pic_h - 1).max(0)) as usize;
+    ref_pic.wait_luma(ref_y_offset + (last_row + 1) * ref_stride);
+    let view = LumaView {
+        y: ref_pic.luma(),
+        width: ref_pic.width,
+        height: ref_pic.height,
+    };
+    let ref_y = &view.y[ref_y_offset..];
 
     // Determine margins needed for the filter type
     // Half-pel filters need 2 pixels before and 3 after the block
@@ -214,6 +232,9 @@ pub fn luma_mc_stride(
     } else if ref_y_offset > 0 || stride != ref_pic.width as usize {
         // Field-coded boundary fallback: extract field lines into a temporary
         // DecodedPicture and use the standard interpolation on it.
+        // This copies the whole field, so it needs the whole picture.
+        ref_pic.wait_complete();
+        let full = ref_pic.luma();
         let field_h = pic_h as usize;
         let field_w = pic_w as usize;
         let mut field_buf = vec![0u8; field_w * field_h];
@@ -221,27 +242,15 @@ pub fn luma_mc_stride(
             let src_off = ref_y_offset + r * stride;
             let dst_off = r * field_w;
             for c in 0..field_w {
-                if src_off + c < ref_pic.y.len() {
-                    field_buf[dst_off + c] = ref_pic.y[src_off + c];
+                if src_off + c < full.len() {
+                    field_buf[dst_off + c] = full[src_off + c];
                 }
             }
         }
-        let field_pic = DecodedPicture {
-            y: field_buf,
-            u: vec![],
-            v: vec![],
+        let field_pic = LumaView {
+            y: &field_buf,
             width: field_w as u32,
             height: field_h as u32,
-            pic_order_cnt: 0,
-            frame_num: 0,
-            mv_l0: vec![],
-            ref_idx_l0: vec![],
-            ref_poc_l0: vec![],
-            mv_l1: vec![],
-            ref_idx_l1: vec![],
-            mb_width: 0,
-            is_intra: false,
-            structure: crate::dpb::PictureStructure::Frame,
         };
         for row in 0..block_h {
             for col in 0..block_w {
@@ -259,7 +268,7 @@ pub fn luma_mc_stride(
         for row in 0..block_h {
             for col in 0..block_w {
                 output[row * block_w + col] = luma_interp(
-                    ref_pic,
+                    &view,
                     x_int + col as i32,
                     y_int + row as i32,
                     frac_x,
@@ -441,7 +450,40 @@ fn luma_mc_inner(
 /// `x`, `y`: chroma block top-left in full chroma-pel coordinates.
 /// `dx`, `dy`: motion vector in eighth-pel units (= luma quarter-pel MV).
 #[allow(clippy::too_many_arguments)]
-pub fn chroma_mc(
+pub(crate) fn chroma_mc(
+    ref_plane: ChromaRef<'_>,
+    ref_width: usize,
+    ref_height: usize,
+    x: i32,
+    y: i32,
+    dx: i32,
+    dy: i32,
+    block_w: usize,
+    block_h: usize,
+    output: &mut [u8],
+) {
+    let ChromaRef { pic, plane, offset } = ref_plane;
+    // Wait until every row this call can read is final: rows y_int ..=
+    // y_int + block_h (bilinear reads one row below), clamped to the
+    // plane, plus margin so the published-length checks in
+    // `chroma_mc_slice` make the same decisions as on a complete plane.
+    if ref_width > 0 && block_w > 0 && block_h > 0 {
+        let avail_rows = pic.chroma_len().saturating_sub(offset) / ref_width;
+        let eff_h = ref_height.min(avail_rows).max(1) as i32;
+        let y_int = y + (dy >> 3);
+        let last_row = (y_int + block_h as i32 + 2).clamp(0, eff_h - 1) as usize;
+        pic.wait_chroma(offset + (last_row + 1) * ref_width);
+    }
+    let data = pic.chroma(plane);
+    let data = data.get(offset..).unwrap_or(&[]);
+    chroma_mc_slice(
+        data, ref_width, ref_height, x, y, dx, dy, block_w, block_h, output,
+    );
+}
+
+/// [`chroma_mc`] on a plain slice (complete data).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn chroma_mc_slice(
     ref_plane: &[u8],
     ref_width: usize,
     ref_height: usize,
@@ -598,23 +640,21 @@ mod tests {
 
     fn make_ref_pic(width: u32, height: u32, y_data: Vec<u8>) -> Arc<DecodedPicture> {
         let uv_size = (width / 2 * height / 2) as usize;
-        Arc::new(DecodedPicture {
-            y: y_data,
-            u: vec![128; uv_size],
-            v: vec![128; uv_size],
-            width,
-            height,
-            frame_num: 0,
-            pic_order_cnt: 0,
-            mv_l0: vec![],
-            ref_idx_l0: vec![],
-            ref_poc_l0: vec![],
-            mv_l1: vec![],
-            ref_idx_l1: vec![],
-            mb_width: width / 16,
-            is_intra: false,
-            structure: crate::dpb::PictureStructure::Frame,
-        })
+        Arc::new(DecodedPicture::new_complete(
+            crate::dpb::PictureMeta {
+                width,
+                height,
+                frame_num: 0,
+                pic_order_cnt: 0,
+                mb_width: width / 16,
+                is_intra: false,
+                structure: crate::dpb::PictureStructure::Frame,
+            },
+            y_data,
+            vec![128; uv_size],
+            vec![128; uv_size],
+            crate::dpb::Motion::default(),
+        ))
     }
 
     #[test]
@@ -716,7 +756,7 @@ mod tests {
     fn test_chroma_mc_integer() {
         let plane = vec![200u8; 64]; // 8x8 chroma
         let mut out = vec![0u8; 16]; // 4x4 block
-        chroma_mc(&plane, 8, 8, 0, 0, 0, 0, 4, 4, &mut out);
+        chroma_mc_slice(&plane, 8, 8, 0, 0, 0, 0, 4, 4, &mut out);
         assert!(out.iter().all(|&v| v == 200));
     }
 
@@ -726,7 +766,7 @@ mod tests {
         let plane = vec![0, 255, 0, 255];
         let mut out = [0u8; 1];
         // dx=4 = half-pel (4/8 = 0.5), dy=0
-        chroma_mc(&plane, 4, 1, 0, 0, 4, 0, 1, 1, &mut out);
+        chroma_mc_slice(&plane, 4, 1, 0, 0, 4, 0, 1, 1, &mut out);
         // Bilinear: (8-4)*8*0 + 4*8*255 + 0 + 0 = 8160. (8160+32)>>6 = 128 (approx)
         assert_eq!(out[0], 128);
     }

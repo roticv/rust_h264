@@ -1188,7 +1188,7 @@ impl SliceContext<'_> {
                                     ref_pic,
                                 );
                             inter_pred::chroma_mc(
-                                &ref_pic.u[c_ref_off..],
+                                ref_pic.chroma_ref(0, c_ref_off),
                                 c_ref_stride,
                                 (self.height / 2) as usize,
                                 (cx + ccx) as i32,
@@ -1200,7 +1200,7 @@ impl SliceContext<'_> {
                                 &mut cb_pred,
                             );
                             inter_pred::chroma_mc(
-                                &ref_pic.v[c_ref_off..],
+                                ref_pic.chroma_ref(1, c_ref_off),
                                 c_ref_stride,
                                 (self.height / 2) as usize,
                                 (cx + ccx) as i32,
@@ -1393,7 +1393,7 @@ impl SliceContext<'_> {
                                 ref_pic,
                             );
                         inter_pred::chroma_mc(
-                            &ref_pic.u[c_ref_off..],
+                            ref_pic.chroma_ref(0, c_ref_off),
                             c_ref_stride,
                             (self.height / 2) as usize,
                             (chroma_mb_x + cx_off) as i32,
@@ -1405,7 +1405,7 @@ impl SliceContext<'_> {
                             &mut cb_pred,
                         );
                         inter_pred::chroma_mc(
-                            &ref_pic.v[c_ref_off..],
+                            ref_pic.chroma_ref(1, c_ref_off),
                             c_ref_stride,
                             (self.height / 2) as usize,
                             (chroma_mb_x + cx_off) as i32,
@@ -2892,14 +2892,14 @@ impl SliceContext<'_> {
                                 sub_part.ref_idx_l1,
                             );
                             let cr0 = if plane_idx == 0 {
-                                &ref_l0.u[c_ref_off_l0..]
+                                ref_l0.chroma_ref(0, c_ref_off_l0)
                             } else {
-                                &ref_l0.v[c_ref_off_l0..]
+                                ref_l0.chroma_ref(1, c_ref_off_l0)
                             };
                             let cr1 = if plane_idx == 0 {
-                                &ref_l1.u[c_ref_off_l1..]
+                                ref_l1.chroma_ref(0, c_ref_off_l1)
                             } else {
-                                &ref_l1.v[c_ref_off_l1..]
+                                ref_l1.chroma_ref(1, c_ref_off_l1)
                             };
                             let mut c0 = vec![0u8; chw * chh];
                             let mut c1 = vec![0u8; chw * chh];
@@ -2963,9 +2963,9 @@ impl SliceContext<'_> {
                                     sub_part.ref_idx_l0,
                                 );
                             let plane = if plane_idx == 0 {
-                                &ref_pic.u[c_ref_off..]
+                                ref_pic.chroma_ref(0, c_ref_off)
                             } else {
-                                &ref_pic.v[c_ref_off..]
+                                ref_pic.chroma_ref(1, c_ref_off)
                             };
                             let cy_off = sub_part.y / 2;
                             let cmv_y = sub_part.mv_l0[1] as i32
@@ -3009,9 +3009,9 @@ impl SliceContext<'_> {
                                     sub_part.ref_idx_l1,
                                 );
                             let plane = if plane_idx == 0 {
-                                &ref_pic.u[c_ref_off..]
+                                ref_pic.chroma_ref(0, c_ref_off)
                             } else {
-                                &ref_pic.v[c_ref_off..]
+                                ref_pic.chroma_ref(1, c_ref_off)
                             };
                             let cy_off = sub_part.y / 2;
                             let cmv_y = sub_part.mv_l1[1] as i32

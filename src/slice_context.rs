@@ -430,7 +430,7 @@ impl SliceContext<'_> {
             let mut cb_pred = [0u8; 64];
             let mut cr_pred = [0u8; 64];
             inter_pred::chroma_mc(
-                &ref_pic.u[c_ref_off..],
+                ref_pic.chroma_ref(0, c_ref_off),
                 cw,
                 (self.height / 2) as usize,
                 cx as i32,
@@ -442,7 +442,7 @@ impl SliceContext<'_> {
                 &mut cb_pred,
             );
             inter_pred::chroma_mc(
-                &ref_pic.v[c_ref_off..],
+                ref_pic.chroma_ref(1, c_ref_off),
                 cw,
                 (self.height / 2) as usize,
                 cx as i32,
@@ -797,14 +797,14 @@ impl SliceContext<'_> {
                     let (_, _, _, mc_cy_l1, c_ref_stride_l1, c_ref_off_l1) =
                         self.mc_params(mb_idx, mb_y, ref1.width as usize, r1);
                     let cr0 = if plane_idx == 0 {
-                        &ref0.u[c_ref_off_l0..]
+                        ref0.chroma_ref(0, c_ref_off_l0)
                     } else {
-                        &ref0.v[c_ref_off_l0..]
+                        ref0.chroma_ref(1, c_ref_off_l0)
                     };
                     let cr1 = if plane_idx == 0 {
-                        &ref1.u[c_ref_off_l1..]
+                        ref1.chroma_ref(0, c_ref_off_l1)
                     } else {
-                        &ref1.v[c_ref_off_l1..]
+                        ref1.chroma_ref(1, c_ref_off_l1)
                     };
                     let cmv_y0 = mv0[1] as i32 + self.chroma_field_mv_offset(ref0);
                     let cmv_y1 = mv1[1] as i32 + self.chroma_field_mv_offset(ref1);
@@ -846,9 +846,9 @@ impl SliceContext<'_> {
                     let (_, _, _, mc_cy, c_ref_stride, c_ref_off) =
                         self.mc_params(mb_idx, mb_y, ref0.width as usize, r0);
                     let cr = if plane_idx == 0 {
-                        &ref0.u[c_ref_off..]
+                        ref0.chroma_ref(0, c_ref_off)
                     } else {
-                        &ref0.v[c_ref_off..]
+                        ref0.chroma_ref(1, c_ref_off)
                     };
                     let cmv_y = mv0[1] as i32 + self.chroma_field_mv_offset(ref0);
                     inter_pred::chroma_mc(
@@ -872,9 +872,9 @@ impl SliceContext<'_> {
                     let (_, _, _, mc_cy, c_ref_stride, c_ref_off) =
                         self.mc_params(mb_idx, mb_y, ref1.width as usize, r1);
                     let cr = if plane_idx == 0 {
-                        &ref1.u[c_ref_off..]
+                        ref1.chroma_ref(0, c_ref_off)
                     } else {
-                        &ref1.v[c_ref_off..]
+                        ref1.chroma_ref(1, c_ref_off)
                     };
                     let cmv_y = mv1[1] as i32 + self.chroma_field_mv_offset(ref1);
                     inter_pred::chroma_mc(
@@ -1086,14 +1086,14 @@ impl SliceContext<'_> {
                     let (_mc_y_l1, _rs_l1, _ref_y_off_l1, mc_cy_l1, c_ref_stride_l1, c_ref_off_l1) =
                         self.mc_params(mb_idx, mb_y, rl1.width as usize, r1);
                     let cr0 = if plane_idx == 0 {
-                        &rl0.u[c_ref_off_l0..]
+                        rl0.chroma_ref(0, c_ref_off_l0)
                     } else {
-                        &rl0.v[c_ref_off_l0..]
+                        rl0.chroma_ref(1, c_ref_off_l0)
                     };
                     let cr1 = if plane_idx == 0 {
-                        &rl1.u[c_ref_off_l1..]
+                        rl1.chroma_ref(0, c_ref_off_l1)
                     } else {
-                        &rl1.v[c_ref_off_l1..]
+                        rl1.chroma_ref(1, c_ref_off_l1)
                     };
                     let cmv_y0 = mv0[1] as i32 + self.chroma_field_mv_offset(rl0);
                     let cmv_y1 = mv1[1] as i32 + self.chroma_field_mv_offset(rl1);
@@ -1137,9 +1137,9 @@ impl SliceContext<'_> {
                     let (_mc_y, _rs, _ref_y_off, mc_cy, c_ref_stride, c_ref_off) =
                         self.mc_params(mb_idx, mb_y, ref_pic.width as usize, r0);
                     let cr = if plane_idx == 0 {
-                        &ref_pic.u[c_ref_off..]
+                        ref_pic.chroma_ref(0, c_ref_off)
                     } else {
-                        &ref_pic.v[c_ref_off..]
+                        ref_pic.chroma_ref(1, c_ref_off)
                     };
                     let cmv_y = mv0[1] as i32 + self.chroma_field_mv_offset(ref_pic);
                     inter_pred::chroma_mc(
@@ -1164,9 +1164,9 @@ impl SliceContext<'_> {
                     let (_mc_y, _rs, _ref_y_off, mc_cy, c_ref_stride, c_ref_off) =
                         self.mc_params(mb_idx, mb_y, ref_pic.width as usize, r1);
                     let cr = if plane_idx == 0 {
-                        &ref_pic.u[c_ref_off..]
+                        ref_pic.chroma_ref(0, c_ref_off)
                     } else {
-                        &ref_pic.v[c_ref_off..]
+                        ref_pic.chroma_ref(1, c_ref_off)
                     };
                     let cmv_y = mv1[1] as i32 + self.chroma_field_mv_offset(ref_pic);
                     inter_pred::chroma_mc(
@@ -1605,7 +1605,17 @@ impl SliceContext<'_> {
 
     ///
     /// Called once after the MB loop completes, covering MBs `first_mb..last_mb`.
-    pub(crate) fn finalize_mb_info(&mut self, first_mb: usize, last_mb: usize, sp: &SliceParams) {
+    /// Fill the deblocking info of MBs `first_mb..last_mb` (the per-MB part
+    /// of finalizing a slice; [`fill_ref_poc_table`](Self::fill_ref_poc_table)
+    /// is the rest). Each MB depends only on its
+    /// own decoded data and the slice's reference lists, so this can run
+    /// incrementally as MB rows complete.
+    pub(crate) fn finalize_mb_info_range(
+        &mut self,
+        first_mb: usize,
+        last_mb: usize,
+        sp: &SliceParams,
+    ) {
         let list_count = if sp.is_b_slice {
             2u8
         } else if sp.is_p_slice {
@@ -1652,8 +1662,16 @@ impl SliceContext<'_> {
                 };
             }
         }
+    }
 
-        // Build per-block ref POC table for temporal direct mode (spec 8.4.1.2.3).
+    /// Build the per-block reference POC table for temporal direct mode
+    /// (spec 8.4.1.2.3) from this slice's L0 list.
+    pub(crate) fn fill_ref_poc_table(&mut self, sp: &SliceParams) {
+        let l0_list = if sp.is_p_slice {
+            sp.ref_pic_list
+        } else {
+            sp.ref_pic_list_l0
+        };
         for i in 0..self.ref_poc_store_l0.len() {
             let ri = self.ref_idx_store_l0[i];
             if ri >= 0 && (ri as usize) < l0_list.len() {

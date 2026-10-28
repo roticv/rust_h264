@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use crate::bitstream::BitstreamReader;
 use crate::deblock::{self, MbInfo, MbType};
 use crate::decode_cabac::CabacMbResult;
-use crate::dpb::{DecodedPicture, Dpb, ReferenceStatus};
+use crate::dpb::{DecodedPicture, Dpb, Motion, PictureMeta, PictureWriter, ReferenceStatus};
 use crate::error::DecodeError;
 use crate::mv_pred::WeightContext;
 use crate::nal::{NalUnit, NalUnitType};
@@ -293,7 +293,7 @@ impl Decoder {
     fn decode_slice(&mut self, nal: &NalUnit) -> Result<(), DecodeError> {
         let plan = prepare_slice(&self.sps_table, &self.pps_table, &mut self.dpb, nal)?;
         let pending = self.pending.take();
-        let ps = run_slice(&plan, pending)?;
+        let ps = run_slice(&plan, pending, None)?;
         self.pending = Some(ps);
         Ok(())
     }
@@ -573,6 +573,7 @@ pub(crate) fn prepare_slice(
 pub(crate) fn run_slice(
     plan: &SlicePlan,
     mut pending: Option<PictureState>,
+    mut sync: Option<&mut RowSync>,
 ) -> Result<PictureState, DecodeError> {
     // Covers everything before the MB loop: PictureState allocation and
     // entropy decoder init.
@@ -836,7 +837,32 @@ pub(crate) fn run_slice(
     drop(setup_timer);
     #[cfg(feature = "profile")]
     let loop_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::MbLoop);
+    // MBs of this slice from `fin_from` on still need their deblocking info
+    // filled in (finalize_mb_info_range).
+    let mut fin_from = mb_idx;
+    let unit_len = deblock_unit_len(mb_width as usize, mbaff);
     while mb_idx < total_mbs {
+        // Frame threading: deblock and publish rows as they become final.
+        if let Some(sync) = sync.as_mut() {
+            let ready = sync.ready_mb(mb_idx, unit_len);
+            if ready >= (sync.next_unit + 2) * unit_len {
+                if ready > fin_from {
+                    make_ctx!().finalize_mb_info_range(fin_from, ready, &params);
+                    fin_from = ready;
+                }
+                sync.advance(
+                    ready,
+                    &mut frame,
+                    &mb_info,
+                    mb_width as usize,
+                    mbaff,
+                    ps_deblock_idc,
+                    ps_alpha,
+                    ps_beta,
+                    ps_chroma_qp_offset,
+                );
+            }
+        }
         // CAVLC end-of-slice: check before reading any new syntax elements.
         // Skip this check when counting down a skip run (no reads needed).
         if !use_cabac && mb_skip_run <= 0 && !reader.more_rbsp_data() {
@@ -971,19 +997,32 @@ pub(crate) fn run_slice(
         }
     }
 
-    // Post-loop: fill deblock info and ref POC table
-    let first_mb = if mbaff {
-        (header.first_mb_in_slice as usize) * 2
-    } else {
-        header.first_mb_in_slice as usize
-    };
+    // Post-loop: fill deblock info (for the MBs not already done by the
+    // row hook) and the ref POC table.
+    let end_mb = mb_idx.min(total_mbs);
     #[cfg(feature = "profile")]
     drop(loop_timer);
     {
         #[cfg(feature = "profile")]
         let _profile_timer =
             crate::profile::PhaseTimer::start(crate::profile::Phase::FinalizeMbInfo);
-        make_ctx!().finalize_mb_info(first_mb, mb_idx.min(total_mbs), &params);
+        let mut ctx = make_ctx!();
+        ctx.finalize_mb_info_range(fin_from, end_mb, &params);
+        ctx.fill_ref_poc_table(&params);
+    }
+    if let Some(sync) = sync.as_mut() {
+        let ready = sync.ready_mb(end_mb, unit_len);
+        sync.advance(
+            ready,
+            &mut frame,
+            &mb_info,
+            mb_width as usize,
+            mbaff,
+            ps_deblock_idc,
+            ps_alpha,
+            ps_beta,
+            ps_chroma_qp_offset,
+        );
     }
 
     // Store state back into pending PictureState.
@@ -1050,22 +1089,13 @@ pub(crate) fn deblock_picture(ps: &mut PictureState) {
     );
 }
 
-/// Build the DPB picture for a decoded (and deblocked) picture: the coded
-/// planes are copied, the motion data is moved out of `ps`.
-pub(crate) fn make_decoded_picture(ps: &mut PictureState) -> DecodedPicture {
-    DecodedPicture {
-        y: ps.frame.y.clone(),
-        u: ps.frame.u.clone(),
-        v: ps.frame.v.clone(),
+/// Metadata of the DPB picture for a picture being decoded into `ps`.
+pub(crate) fn picture_meta(ps: &PictureState) -> PictureMeta {
+    PictureMeta {
         width: ps.mb_width * 16,
         height: (ps.frame.height.div_ceil(16)) * 16,
         frame_num: ps.frame_num,
         pic_order_cnt: ps.poc,
-        mv_l0: core::mem::take(&mut ps.mv_store_l0),
-        ref_idx_l0: core::mem::take(&mut ps.ref_idx_store_l0),
-        ref_poc_l0: core::mem::take(&mut ps.ref_poc_store_l0),
-        mv_l1: core::mem::take(&mut ps.mv_store_l1),
-        ref_idx_l1: core::mem::take(&mut ps.ref_idx_store_l1),
         mb_width: ps.mb_width,
         is_intra: ps.is_intra_slice,
         structure: if ps.field_pic_flag {
@@ -1077,6 +1107,140 @@ pub(crate) fn make_decoded_picture(ps: &mut PictureState) -> DecodedPicture {
         } else {
             crate::dpb::PictureStructure::Frame
         },
+    }
+}
+
+/// Move the motion data out of a fully decoded picture.
+pub(crate) fn take_motion(ps: &mut PictureState) -> Motion {
+    Motion {
+        mv_l0: core::mem::take(&mut ps.mv_store_l0),
+        ref_idx_l0: core::mem::take(&mut ps.ref_idx_store_l0),
+        ref_poc_l0: core::mem::take(&mut ps.ref_poc_store_l0),
+        mv_l1: core::mem::take(&mut ps.mv_store_l1),
+        ref_idx_l1: core::mem::take(&mut ps.ref_idx_store_l1),
+    }
+}
+
+/// Build the DPB picture for a decoded (and deblocked) picture: the coded
+/// planes are copied, the motion data is moved out of `ps`.
+pub(crate) fn make_decoded_picture(ps: &mut PictureState) -> DecodedPicture {
+    let meta = picture_meta(ps);
+    let (y, u, v) = (ps.frame.y.clone(), ps.frame.u.clone(), ps.frame.v.clone());
+    DecodedPicture::new_complete(meta, y, u, v, take_motion(ps))
+}
+
+/// Number of macroblocks in one deblocking unit: an MB row, or an MB-pair
+/// row with MBAFF (pairs are decoded and deblocked together).
+#[inline]
+pub(crate) fn deblock_unit_len(mb_width: usize, mbaff: bool) -> usize {
+    if mbaff {
+        2 * mb_width
+    } else {
+        mb_width
+    }
+}
+
+/// Incremental deblocking and row publication for a picture decoded by a
+/// frame-threading worker, so that pictures referencing it can start before
+/// it is finished (see `threading`).
+///
+/// Intra prediction reads *unfiltered* neighbouring samples from the unit
+/// above, so unit `u` is deblocked only once unit `u + 1` is decoded too (and
+/// no later slice of the picture can write to either). Deblocking a unit
+/// also modifies up to three lines at the bottom of the unit above, so after
+/// deblocking units `0..n` the rows of units `0..n-1` are final and get
+/// published.
+pub(crate) struct RowSync {
+    pub(crate) writer: PictureWriter,
+    /// Next deblocking unit of the private frame.
+    pub(crate) next_unit: usize,
+    /// MB index from which a later slice of this picture may still write.
+    pub(crate) limit_mb: usize,
+}
+
+impl RowSync {
+    /// MB index up to which whole units are ready to deblock once MBs
+    /// `..done_mb` are decoded.
+    #[inline]
+    fn ready_mb(&self, done_mb: usize, unit_len: usize) -> usize {
+        if unit_len == 0 {
+            return 0;
+        }
+        done_mb.min(self.limit_mb) / unit_len * unit_len
+    }
+
+    /// Deblock every unit that ends at or before `ready_mb`, then publish
+    /// the rows that are final.
+    #[allow(clippy::too_many_arguments)]
+    fn advance(
+        &mut self,
+        ready_mb: usize,
+        frame: &mut Frame,
+        mb_info: &[MbInfo],
+        mb_width: usize,
+        mbaff: bool,
+        deblock_idc: u32,
+        alpha: i32,
+        beta: i32,
+        chroma_qp_offset: i32,
+    ) {
+        let unit_len = deblock_unit_len(mb_width, mbaff);
+        if unit_len == 0 {
+            return;
+        }
+        // Units below `target` have their successor decoded as well.
+        let target = (ready_mb / unit_len).saturating_sub(1);
+        if target <= self.next_unit {
+            return;
+        }
+        #[cfg(feature = "profile")]
+        let _profile_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::Deblock);
+        while self.next_unit < target {
+            let start = self.next_unit * unit_len;
+            deblock::filter_mb_range(
+                frame,
+                mb_info,
+                mb_width,
+                deblock_idc,
+                alpha,
+                beta,
+                chroma_qp_offset,
+                mbaff,
+                start..start + unit_len,
+            );
+            self.next_unit += 1;
+        }
+        let rows_per_unit = if mbaff { 2 } else { 1 };
+        let final_rows = (self.next_unit - 1) * rows_per_unit;
+        self.writer
+            .publish(&frame.y, &frame.u, &frame.v, final_rows as u32);
+    }
+
+    /// Deblock the rest of a fully decoded picture and complete the shared
+    /// picture.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(crate) fn finish(mut self, ps: &mut PictureState) {
+        let unit_len = deblock_unit_len(ps.mb_width as usize, ps.mbaff_frame_flag);
+        let start = self.next_unit * unit_len;
+        {
+            #[cfg(feature = "profile")]
+            let _profile_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::Deblock);
+            deblock::filter_mb_range(
+                &mut ps.frame,
+                &ps.mb_info,
+                ps.mb_width as usize,
+                ps.disable_deblocking_filter_idc,
+                ps.slice_alpha_c0_offset_div2,
+                ps.slice_beta_offset_div2,
+                ps.chroma_qp_index_offset,
+                ps.mbaff_frame_flag,
+                start..ps.mb_info.len(),
+            );
+        }
+        self.next_unit = ps.mb_info.len().div_ceil(unit_len.max(1));
+        let motion = take_motion(ps);
+        self.writer
+            .finish(&ps.frame.y, &ps.frame.u, &ps.frame.v, motion);
     }
 }
 

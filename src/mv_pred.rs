@@ -518,6 +518,8 @@ pub(crate) fn apply_spatial_direct_col_zero(
     // When direct_8x8_inference_flag is set, use the representative 4x4 block
     // per 8x8 group (same mapping as temporal direct).
     if let Some(col) = col_pic {
+        // Co-located motion data is only final once the whole picture is.
+        let col_motion = col.motion();
         let effective_blk = if direct_8x8_inference_flag {
             const INFERENCE_MAP: [usize; 4] = [0, 5, 10, 15];
             INFERENCE_MAP[col_blk / 4]
@@ -525,24 +527,24 @@ pub(crate) fn apply_spatial_direct_col_zero(
             col_blk
         };
         let col_pos = mb_idx * 16 + effective_blk;
-        if col_pos < col.ref_idx_l0.len() && !col.is_intra {
-            let col_ref_l0 = col.ref_idx_l0[col_pos];
+        if col_pos < col_motion.ref_idx_l0.len() && !col.is_intra {
+            let col_ref_l0 = col_motion.ref_idx_l0[col_pos];
             // Determine which co-located MV to use for the zero check:
             // If co-located has L0 prediction (ref_idx_l0 >= 0): use L0 MV/ref
             // If co-located is L1-only (ref_idx_l0 < 0): use L1 MV/ref per spec
             let col_zero = if col_ref_l0 == 0 {
-                let col_mv = if col_pos < col.mv_l0.len() {
-                    col.mv_l0[col_pos]
+                let col_mv = if col_pos < col_motion.mv_l0.len() {
+                    col_motion.mv_l0[col_pos]
                 } else {
                     [0, 0]
                 };
                 col_mv[0].abs() <= 1 && col_mv[1].abs() <= 1
             } else if col_ref_l0 < 0
-                && col_pos < col.ref_idx_l1.len()
-                && col.ref_idx_l1[col_pos] == 0
+                && col_pos < col_motion.ref_idx_l1.len()
+                && col_motion.ref_idx_l1[col_pos] == 0
             {
-                let col_mv_l1 = if col_pos < col.mv_l1.len() {
-                    col.mv_l1[col_pos]
+                let col_mv_l1 = if col_pos < col_motion.mv_l1.len() {
+                    col_motion.mv_l1[col_pos]
                 } else {
                     [0, 0]
                 };
@@ -593,21 +595,22 @@ pub(crate) fn derive_temporal_direct_blk(
         blk
     };
     let col_base = mb_idx * 16;
+    let col_motion = col_pic.motion();
     if col_pic.is_intra
-        || col_base + col_blk >= col_pic.ref_idx_l0.len()
-        || col_pic.ref_idx_l0[col_base + col_blk] < 0
+        || col_base + col_blk >= col_motion.ref_idx_l0.len()
+        || col_motion.ref_idx_l0[col_base + col_blk] < 0
     {
         // Intra co-located: zero MVs, ref_idx=0
         return ([0, 0], [0, 0], 0, 0, true, true);
     }
 
     // Get co-located MV and ref_idx
-    let col_mv = col_pic.mv_l0[col_base + col_blk];
-    let _col_ref_idx = col_pic.ref_idx_l0[col_base + col_blk];
+    let col_mv = col_motion.mv_l0[col_base + col_blk];
+    let _col_ref_idx = col_motion.ref_idx_l0[col_base + col_blk];
 
     // Map co-located ref_idx to current L0 ref_idx by matching POC (spec 8.4.1.2.3).
     // Look up the POC that the co-located picture referenced at col_ref_idx.
-    let col_ref_poc_val = col_pic.ref_poc_l0[col_base + col_blk];
+    let col_ref_poc_val = col_motion.ref_poc_l0[col_base + col_blk];
 
     // Find the entry in our current L0 list with the matching POC.
     let ref0 = ref_pic_list_l0

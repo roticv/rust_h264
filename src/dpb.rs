@@ -8,6 +8,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::nal::NalUnitType;
+use crate::once::OnceLock;
+use crate::picture_sync::{RowProgress, SharedPlane};
 use crate::slice::SliceHeader;
 use crate::sps::Sps;
 
@@ -30,16 +32,10 @@ pub enum PictureStructure {
     BottomField,
 }
 
-/// Immutable decoded picture data shared via Arc.
-#[derive(Debug)]
-pub struct DecodedPicture {
-    pub y: Vec<u8>,
-    pub u: Vec<u8>,
-    pub v: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-    pub frame_num: u32,
-    pub pic_order_cnt: i32,
+/// Motion data of a decoded picture, read as the co-located picture by
+/// direct-mode prediction.
+#[derive(Debug, Default)]
+pub struct Motion {
     /// Per-4x4-block L0 motion vectors (for temporal direct mode co-located access).
     pub mv_l0: Vec<[i16; 2]>,
     /// Per-4x4-block L0 reference indices.
@@ -50,12 +46,322 @@ pub struct DecodedPicture {
     pub mv_l1: Vec<[i16; 2]>,
     /// Per-4x4-block L1 reference indices (for spatial direct co-located L1 check).
     pub ref_idx_l1: Vec<i8>,
-    /// Width in macroblocks (for indexing into mv_l0/ref_idx_l0).
+}
+
+impl Motion {
+    /// Motion data for a picture whose content is unknown (all blocks intra).
+    fn unavailable(total_mbs: usize) -> Self {
+        let n = total_mbs * 16;
+        Self {
+            mv_l0: vec![[0; 2]; n],
+            ref_idx_l0: vec![-1; n],
+            ref_poc_l0: vec![-1; n],
+            mv_l1: vec![[0; 2]; n],
+            ref_idx_l1: vec![-1; n],
+        }
+    }
+}
+
+/// Picture metadata fixed when a picture is created.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PictureMeta {
+    /// Coded (MB-aligned) width of the planes.
+    pub(crate) width: u32,
+    /// Coded (MB-aligned) height of the planes.
+    pub(crate) height: u32,
+    pub(crate) frame_num: u32,
+    pub(crate) pic_order_cnt: i32,
+    pub(crate) mb_width: u32,
+    pub(crate) is_intra: bool,
+    pub(crate) structure: PictureStructure,
+}
+
+/// A decoded picture in the DPB, shared via Arc.
+///
+/// Usually complete when created. The frame-threaded decoder also inserts
+/// pictures that are still being decoded: their planes become readable one
+/// macroblock row at a time (see `picture_sync`). Readers therefore go
+/// through accessors that expose only published rows, and wait for the rows
+/// they need first.
+pub struct DecodedPicture {
+    pub width: u32,
+    pub height: u32,
+    pub frame_num: u32,
+    pub pic_order_cnt: i32,
+    /// Width in macroblocks (for indexing into the motion data).
     pub mb_width: u32,
     /// Whether this picture is intra-only (all MBs are intra).
     pub is_intra: bool,
     /// Whether this decoded picture is a frame, top field, or bottom field.
     pub structure: PictureStructure,
+    /// Y, Cb, Cr planes in coded layout (stride = width, width / 2).
+    planes: [SharedPlane; 3],
+    /// Final macroblock rows of the planes.
+    progress: RowProgress,
+    /// Set before the last row is published.
+    motion: OnceLock<Motion>,
+}
+
+impl core::fmt::Debug for DecodedPicture {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DecodedPicture")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("frame_num", &self.frame_num)
+            .field("pic_order_cnt", &self.pic_order_cnt)
+            .field("structure", &self.structure)
+            .field("rows", &(self.progress.rows(), self.progress.total()))
+            .finish()
+    }
+}
+
+impl DecodedPicture {
+    fn with_planes(meta: PictureMeta, planes: [SharedPlane; 3], progress: RowProgress) -> Self {
+        Self {
+            width: meta.width,
+            height: meta.height,
+            frame_num: meta.frame_num,
+            pic_order_cnt: meta.pic_order_cnt,
+            mb_width: meta.mb_width,
+            is_intra: meta.is_intra,
+            structure: meta.structure,
+            planes,
+            progress,
+            motion: OnceLock::new(),
+        }
+    }
+
+    /// Macroblock rows covered by a luma plane of `len` bytes.
+    fn mb_rows(width: u32, len: usize) -> u32 {
+        let row_bytes = width as usize * 16;
+        if row_bytes == 0 {
+            0
+        } else {
+            len.div_ceil(row_bytes) as u32
+        }
+    }
+
+    /// A fully decoded picture.
+    pub(crate) fn new_complete(
+        meta: PictureMeta,
+        y: Vec<u8>,
+        u: Vec<u8>,
+        v: Vec<u8>,
+        motion: Motion,
+    ) -> Self {
+        let rows = Self::mb_rows(meta.width, y.len());
+        let pic = Self::with_planes(
+            meta,
+            [
+                SharedPlane::from_vec(y),
+                SharedPlane::from_vec(u),
+                SharedPlane::from_vec(v),
+            ],
+            RowProgress::complete(rows),
+        );
+        let _ = pic.motion.set(motion);
+        pic
+    }
+
+    /// A picture that will be filled in by the returned writer. Its planes
+    /// are coded size; readers block until the rows they need are published.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(crate) fn new_in_progress(meta: PictureMeta) -> (Arc<Self>, PictureWriter) {
+        let luma_len = meta.width as usize * meta.height as usize;
+        let chroma_len = luma_len / 4;
+        let rows = Self::mb_rows(meta.width, luma_len);
+        let pic = Arc::new(Self::with_planes(
+            meta,
+            [
+                SharedPlane::from_vec(vec![0; luma_len]),
+                SharedPlane::from_vec(vec![0; chroma_len]),
+                SharedPlane::from_vec(vec![0; chroma_len]),
+            ],
+            RowProgress::start(rows),
+        ));
+        let writer = PictureWriter {
+            pic: Arc::clone(&pic),
+            rows: 0,
+            done: false,
+        };
+        (pic, writer)
+    }
+
+    /// Bytes of plane `p` (0 = Y, 1 = Cb, 2 = Cr) covered by `rows` MB rows.
+    #[inline]
+    fn plane_bytes(&self, p: usize, rows: u32) -> usize {
+        let len = self.planes[p].len();
+        if rows >= self.progress.total() {
+            return len;
+        }
+        let (w, h) = if p == 0 {
+            (self.width as usize, 16)
+        } else {
+            (self.width as usize / 2, 8)
+        };
+        (rows as usize * h * w).min(len)
+    }
+
+    /// Published part of plane `p` (the whole plane once complete).
+    #[inline]
+    fn plane(&self, p: usize) -> &[u8] {
+        let len = self.plane_bytes(p, self.progress.rows());
+        // SAFETY: `len` covers only published rows, which are never written
+        // again (see `picture_sync`).
+        unsafe { self.planes[p].prefix(len) }
+    }
+
+    /// Published part of the luma plane.
+    #[inline]
+    pub(crate) fn luma(&self) -> &[u8] {
+        self.plane(0)
+    }
+
+    /// Published part of a chroma plane (0 = Cb, 1 = Cr).
+    #[inline]
+    pub(crate) fn chroma(&self, plane: usize) -> &[u8] {
+        self.plane(1 + plane.min(1))
+    }
+
+    /// Full length of the luma plane, published or not.
+    #[inline]
+    pub(crate) fn luma_len(&self) -> usize {
+        self.planes[0].len()
+    }
+
+    /// Full length of a chroma plane, published or not.
+    #[inline]
+    pub(crate) fn chroma_len(&self) -> usize {
+        self.planes[1].len()
+    }
+
+    /// Block until luma bytes `0..end` are final.
+    #[inline]
+    pub(crate) fn wait_luma(&self, end: usize) {
+        self.wait_plane_bytes(self.width as usize, 16, end);
+    }
+
+    /// Block until chroma bytes `0..end` (of both chroma planes) are final.
+    #[inline]
+    pub(crate) fn wait_chroma(&self, end: usize) {
+        self.wait_plane_bytes(self.width as usize / 2, 8, end);
+    }
+
+    #[inline]
+    fn wait_plane_bytes(&self, stride: usize, lines_per_row: usize, end: usize) {
+        if stride == 0 || end == 0 {
+            return;
+        }
+        let lines = end.div_ceil(stride);
+        let rows = lines.div_ceil(lines_per_row);
+        self.progress.wait(rows.min(u32::MAX as usize) as u32);
+    }
+
+    /// Block until the whole picture is decoded.
+    #[inline]
+    pub(crate) fn wait_complete(&self) {
+        self.progress.wait(self.progress.total());
+    }
+
+    /// Motion data; blocks until the picture is completely decoded.
+    pub(crate) fn motion(&self) -> &Motion {
+        self.wait_complete();
+        self.motion
+            .get()
+            .expect("motion data is set before the picture completes")
+    }
+
+    /// Reference to chroma plane `plane` (0 = Cb, 1 = Cr) starting at byte
+    /// `offset`, for [`chroma_mc`](crate::inter_pred::chroma_mc).
+    #[inline]
+    pub(crate) fn chroma_ref(&self, plane: usize, offset: usize) -> ChromaRef<'_> {
+        ChromaRef {
+            pic: self,
+            plane,
+            offset,
+        }
+    }
+}
+
+/// A chroma plane of a reference picture from a byte offset (field-aware
+/// motion compensation starts at the field's first line). Motion
+/// compensation waits for the rows it reads before touching the data.
+#[derive(Clone, Copy)]
+pub(crate) struct ChromaRef<'a> {
+    pub(crate) pic: &'a DecodedPicture,
+    pub(crate) plane: usize,
+    pub(crate) offset: usize,
+}
+
+/// The unique writer of an in-progress [`DecodedPicture`]. Copies final rows
+/// from the decoder's private planes into the shared picture and publishes
+/// them. Dropping it unfinished (error or panic) completes the picture with
+/// mid-grey content so readers never wait forever.
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
+pub(crate) struct PictureWriter {
+    pic: Arc<DecodedPicture>,
+    rows: u32,
+    done: bool,
+}
+
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
+impl PictureWriter {
+    /// Copy MB rows `self.rows..upto` from the private coded planes and
+    /// publish them. Never publishes the last row; use [`finish`](Self::finish).
+    pub(crate) fn publish(&mut self, y: &[u8], u: &[u8], v: &[u8], upto: u32) {
+        let upto = upto.min(self.pic.progress.total().saturating_sub(1));
+        if upto <= self.rows {
+            return;
+        }
+        self.copy_rows(y, u, v, upto);
+        self.pic.progress.publish(upto);
+    }
+
+    /// Copy every remaining row, attach the motion data and mark the picture
+    /// complete.
+    pub(crate) fn finish(mut self, y: &[u8], u: &[u8], v: &[u8], motion: Motion) {
+        let total = self.pic.progress.total();
+        self.copy_rows(y, u, v, total);
+        let _ = self.pic.motion.set(motion);
+        self.pic.progress.publish(total);
+        self.done = true;
+    }
+
+    fn copy_rows(&mut self, y: &[u8], u: &[u8], v: &[u8], upto: u32) {
+        for (p, src) in [y, u, v].into_iter().enumerate() {
+            let from = self.pic.plane_bytes(p, self.rows);
+            let to = self.pic.plane_bytes(p, upto).min(src.len()).max(from);
+            // SAFETY: this is the unique writer; `from..to` lies at or beyond
+            // the published length and within the plane.
+            unsafe { self.pic.planes[p].write(from, &src[from..to]) };
+        }
+        self.rows = upto;
+    }
+
+    /// Complete the picture with mid-grey for every unpublished byte and
+    /// empty motion, so pictures referencing it can still be decoded.
+    fn abandon(&mut self) {
+        let total = self.pic.progress.total();
+        for p in 0..3 {
+            let from = self.pic.plane_bytes(p, self.rows);
+            let len = self.pic.planes[p].len() - from;
+            // SAFETY: unique writer; the range is unpublished and in bounds.
+            unsafe { self.pic.planes[p].fill(from, len, 128) };
+        }
+        let total_mbs = self.pic.mb_width as usize * total as usize;
+        let _ = self.pic.motion.set(Motion::unavailable(total_mbs));
+        self.rows = total;
+        self.pic.progress.publish(total);
+        self.done = true;
+    }
+}
+
+impl Drop for PictureWriter {
+    fn drop(&mut self) {
+        if !self.done {
+            self.abandon();
+        }
+    }
 }
 
 /// A DPB entry wrapping an Arc<DecodedPicture> with mutable status.
@@ -716,23 +1022,21 @@ mod tests {
     use super::*;
 
     fn make_pic(frame_num: u32, poc: i32) -> Arc<DecodedPicture> {
-        Arc::new(DecodedPicture {
-            y: vec![],
-            u: vec![],
-            v: vec![],
-            width: 16,
-            height: 16,
-            frame_num,
-            pic_order_cnt: poc,
-            mv_l0: vec![],
-            ref_idx_l0: vec![],
-            ref_poc_l0: vec![],
-            mv_l1: vec![],
-            ref_idx_l1: vec![],
-            mb_width: 1,
-            is_intra: false,
-            structure: crate::dpb::PictureStructure::Frame,
-        })
+        Arc::new(DecodedPicture::new_complete(
+            PictureMeta {
+                width: 16,
+                height: 16,
+                frame_num,
+                pic_order_cnt: poc,
+                mb_width: 1,
+                is_intra: false,
+                structure: crate::dpb::PictureStructure::Frame,
+            },
+            vec![],
+            vec![],
+            vec![],
+            Motion::default(),
+        ))
     }
 
     #[test]

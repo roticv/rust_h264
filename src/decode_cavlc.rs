@@ -1167,14 +1167,14 @@ impl SliceContext<'_> {
                             c_ref_off_l1,
                         ) = sub_mc_l1[sp_i];
                         let cr_l0 = if scale_idx == 4 {
-                            &ref_l0.u[c_ref_off_l0..]
+                            ref_l0.chroma_ref(0, c_ref_off_l0)
                         } else {
-                            &ref_l0.v[c_ref_off_l0..]
+                            ref_l0.chroma_ref(1, c_ref_off_l0)
                         };
                         let cr_l1 = if scale_idx == 4 {
-                            &ref_l1.u[c_ref_off_l1..]
+                            ref_l1.chroma_ref(0, c_ref_off_l1)
                         } else {
-                            &ref_l1.v[c_ref_off_l1..]
+                            ref_l1.chroma_ref(1, c_ref_off_l1)
                         };
                         let mut c_l0 = vec![0u8; cw * ch];
                         let mut c_l1 = vec![0u8; cw * ch];
@@ -1232,9 +1232,9 @@ impl SliceContext<'_> {
                             .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
                         let (_mc_y, _rs, _ref_y_off, mc_cy, c_ref_stride, c_ref_off) = sub_mc[sp_i];
                         let cr = if scale_idx == 4 {
-                            &ref_pic.u[c_ref_off..]
+                            ref_pic.chroma_ref(0, c_ref_off)
                         } else {
-                            &ref_pic.v[c_ref_off..]
+                            ref_pic.chroma_ref(1, c_ref_off)
                         };
                         let cmv_y_off = crate::slice_context::chroma_field_mv_offset_impl(
                             self.field_pic_flag,
@@ -1755,9 +1755,9 @@ impl SliceContext<'_> {
                         let (_mc_y, _rs, _ref_y_off, mc_cy, c_ref_stride, c_ref_off) =
                             p_sub_mc[sp_i];
                         let chroma_ref = if scale_idx == 4 {
-                            &part_ref_pic.u[c_ref_off..]
+                            part_ref_pic.chroma_ref(0, c_ref_off)
                         } else {
-                            &part_ref_pic.v[c_ref_off..]
+                            part_ref_pic.chroma_ref(1, c_ref_off)
                         };
                         let mut part_pred = [0u8; 64];
                         let cmv_y_off = crate::slice_context::chroma_field_mv_offset_impl(

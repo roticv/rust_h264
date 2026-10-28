@@ -91,10 +91,11 @@ for frame in decoder.flush() {
 }
 ```
 
-Parallelism comes from pictures that do not depend on each other, so the
-gain depends on the stream's reference structure: B-frames decode alongside
-the P-frames they reference, while a chain of P-frames, each referencing the
-previous one, decodes serially. Requires the `std` feature (on by default).
+Each worker publishes its picture row by row, and a picture that references
+it waits only for the rows its motion vectors actually reach. A P-frame can
+therefore start while the frame it references is still being decoded, so
+both B-frame and P-only streams scale. Requires the `std` feature (on by
+default).
 
 ### Low-level `Decoder` (decode order)
 
