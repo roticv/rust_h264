@@ -28,6 +28,8 @@ pub(crate) struct SliceParams<'a> {
     pub scaling_list_8x8: &'a [[u8; 64]; 2],
     pub constrained_intra_pred_flag: bool,
     pub chroma_qp_index_offset: i32,
+    /// Chroma QP offset of Cr (spec 7.4.2.2)
+    pub second_chroma_qp_index_offset: i32,
     pub ref_pic_list: &'a [Arc<DecodedPicture>],
     pub ref_pic_list_l0: &'a [Arc<DecodedPicture>],
     pub ref_pic_list_l1: &'a [Arc<DecodedPicture>],
@@ -1158,12 +1160,38 @@ impl SliceContext<'_> {
         let cstride = self.lc_stride;
         let cbase = self.lc_offset;
         let chroma_h = (self.height / 2) as usize;
+        // Chroma blocks: one 4x4 per 8x8 whose four 4x4 luma blocks share
+        // motion, else a 2x2 per luma block (direct without
+        // direct_8x8_inference can give each 4x4 its own motion).
+        // (luma block, chroma row, chroma col, size)
+        let mut cparts = [(0usize, 0usize, 0usize, 0usize); 16];
+        let mut n_cparts = 0;
+        for b8 in 0..4 {
+            let base = mb_idx * 16 + b8 * 4;
+            let same = (1..4).all(|k| {
+                self.mv_store_l0[base + k] == self.mv_store_l0[base]
+                    && self.mv_store_l1[base + k] == self.mv_store_l1[base]
+                    && self.ref_idx_store_l0[base + k] == self.ref_idx_store_l0[base]
+                    && self.ref_idx_store_l1[base + k] == self.ref_idx_store_l1[base]
+            });
+            if same {
+                cparts[n_cparts] = (b8 * 4, (b8 / 2) * 4, (b8 % 2) * 4, 4);
+                n_cparts += 1;
+            } else {
+                for (blk, &(row, col)) in BLOCK_INDEX_TO_OFFSET
+                    .iter()
+                    .enumerate()
+                    .skip(b8 * 4)
+                    .take(4)
+                {
+                    cparts[n_cparts] = (blk, row / 2, col / 2, 2);
+                    n_cparts += 1;
+                }
+            }
+        }
         for plane_idx in 0..2 {
             let mut chroma_pred = [0u8; 64];
-            for cblk in 0..4 {
-                let cblk_row = (cblk / 2) * 4;
-                let cblk_col = (cblk % 2) * 4;
-                let luma_blk = cblk * 4;
+            for &(luma_blk, cblk_row, cblk_col, csize) in &cparts[..n_cparts] {
                 let mv0 = self.mv_store_l0[mb_idx * 16 + luma_blk];
                 let mv1 = self.mv_store_l1[mb_idx * 16 + luma_blk];
                 let r0 = self.ref_idx_store_l0[mb_idx * 16 + luma_blk];
@@ -1173,7 +1201,9 @@ impl SliceContext<'_> {
                 let mut cblk_pred = [0u8; 16];
                 if bp0 && bp1 {
                     let mut c0 = [0u8; 16];
+                    let c0 = &mut c0[..csize * csize];
                     let mut c1 = [0u8; 16];
+                    let c1 = &mut c1[..csize * csize];
                     let Some(rl0) = ref_pic_safe(ref_pic_list_l0, self.frame_ref_idx(mb_idx, r0))
                     else {
                         return;
@@ -1206,9 +1236,9 @@ impl SliceContext<'_> {
                         (mc_cy_l0 + cblk_row) as i32,
                         mv0[0] as i32,
                         cmv_y0,
-                        4,
-                        4,
-                        &mut c0,
+                        csize,
+                        csize,
+                        c0,
                     );
                     inter_pred::chroma_mc(
                         cr1,
@@ -1218,14 +1248,14 @@ impl SliceContext<'_> {
                         (mc_cy_l1 + cblk_row) as i32,
                         mv1[0] as i32,
                         cmv_y1,
-                        4,
-                        4,
-                        &mut c1,
+                        csize,
+                        csize,
+                        c1,
                     );
                     wctx.apply_bi(
-                        &c0,
-                        &c1,
-                        &mut cblk_pred,
+                        c0,
+                        c1,
+                        &mut cblk_pred[..csize * csize],
                         r0 as usize,
                         r1 as usize,
                         true,
@@ -1253,12 +1283,18 @@ impl SliceContext<'_> {
                         (mc_cy + cblk_row) as i32,
                         mv0[0] as i32,
                         cmv_y,
-                        4,
-                        4,
-                        &mut cblk_pred,
+                        csize,
+                        csize,
+                        &mut cblk_pred[..csize * csize],
                     );
                     if use_weight == 1 {
-                        wctx.apply_uni(&mut cblk_pred, 0, r0 as usize, true, plane_idx);
+                        wctx.apply_uni(
+                            &mut cblk_pred[..csize * csize],
+                            0,
+                            r0 as usize,
+                            true,
+                            plane_idx,
+                        );
                     }
                 } else if bp1 {
                     let Some(ref_pic) =
@@ -1282,17 +1318,23 @@ impl SliceContext<'_> {
                         (mc_cy + cblk_row) as i32,
                         mv1[0] as i32,
                         cmv_y,
-                        4,
-                        4,
-                        &mut cblk_pred,
+                        csize,
+                        csize,
+                        &mut cblk_pred[..csize * csize],
                     );
                     if use_weight == 1 {
-                        wctx.apply_uni(&mut cblk_pred, 1, r1 as usize, true, plane_idx);
+                        wctx.apply_uni(
+                            &mut cblk_pred[..csize * csize],
+                            1,
+                            r1 as usize,
+                            true,
+                            plane_idx,
+                        );
                     }
                 }
-                for r in 0..4 {
-                    for c in 0..4 {
-                        chroma_pred[(cblk_row + r) * 8 + cblk_col + c] = cblk_pred[r * 4 + c];
+                for r in 0..csize {
+                    for c in 0..csize {
+                        chroma_pred[(cblk_row + r) * 8 + cblk_col + c] = cblk_pred[r * csize + c];
                     }
                 }
             }

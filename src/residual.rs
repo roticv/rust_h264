@@ -287,9 +287,22 @@ const LEVEL_SCALE_8X8: [[i32; 6]; 6] = [
 /// From H.264 spec Table 8-14.
 const DEQUANT_8X8_POS_CAT: [usize; 16] = [0, 3, 4, 3, 3, 1, 5, 1, 4, 5, 2, 5, 3, 1, 5, 1];
 
+/// Zigzag scan index of each raster position of an 8x8 block: scaling
+/// matrices are coded in (frame) zigzag order, also for field MBs (spec
+/// 8.5.6).
+const RASTER_TO_ZIGZAG_8X8: [u8; 64] = {
+    let mut t = [0u8; 64];
+    let mut k = 0;
+    while k < 64 {
+        t[ZIGZAG_8X8_CABAC[k]] = k as u8;
+        k += 1;
+    }
+    t
+};
+
 /// Dequantize an 8x8 residual block in raster order.
 /// `block[r*8+c]` contains coefficients in raster positions.
-/// `scale` is the 8x8 scaling matrix (64 values in raster order).
+/// `scale` is the 8x8 scaling matrix in zigzag scan order.
 pub fn dequant_8x8(block: &mut [i32; 64], qp: i32, scale: &[u8; 64]) {
     let qp_per = qp / 6;
     let qp_rem = (qp % 6) as usize;
@@ -299,7 +312,7 @@ pub fn dequant_8x8(block: &mut [i32; 64], qp: i32, scale: &[u8; 64]) {
             let r = idx / 8;
             let c = idx % 8;
             let cat = DEQUANT_8X8_POS_CAT[(r % 4) * 4 + (c % 4)];
-            let v = LEVEL_SCALE_8X8[qp_rem][cat] * scale[r * 8 + c] as i32;
+            let v = LEVEL_SCALE_8X8[qp_rem][cat] * scale[RASTER_TO_ZIGZAG_8X8[idx] as usize] as i32;
             if qp_per >= 6 {
                 *coeff = coeff.wrapping_mul(v).wrapping_shl((qp_per - 6) as u32);
             } else {

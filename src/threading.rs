@@ -42,8 +42,8 @@ use std::time::Duration;
 
 use crate::bitstream::BitstreamReader;
 use crate::decoder::{
-    apply_reference_marking, finish_output, prepare_slice, run_slice, store_parameter_set, Frame,
-    PictureState, RowSync, SlicePlan,
+    apply_reference_marking, decoded_numbering, finish_output, has_mmco5, prepare_slice, run_slice,
+    store_parameter_set, Frame, PictureState, RowSync, SlicePlan,
 };
 use crate::dpb::{DecodedPicture, Dpb, PictureMeta, PictureStructure, PictureWriter};
 use crate::error::DecodeError;
@@ -256,12 +256,18 @@ impl ThreadedDecoder {
         // The DPB picture is created now, empty, and filled by the worker.
         // Geometry comes from the slice that creates the PictureState, the
         // rest from the last slice, as in the serial decoder's finalize.
+        let (frame_num, pic_order_cnt, field_poc) = decoded_numbering(
+            &last.header.mmco_ops,
+            last.header.frame_num,
+            last.current_poc,
+            last.field_poc,
+        );
         let meta = PictureMeta {
             width: first.coded_width,
             height: first.coded_height,
-            frame_num: last.header.frame_num,
-            pic_order_cnt: last.current_poc,
-            field_poc: last.field_poc,
+            frame_num,
+            pic_order_cnt,
+            field_poc,
             mb_width: first.mb_width,
             is_intra: last.header.slice_type == SliceType::I,
             structure: if last.header.field_pic_flag {
@@ -286,6 +292,11 @@ impl ThreadedDecoder {
             &last.header.mmco_ops,
             last.header.long_term_reference_flag,
         );
+        // A picture with MMCO 5 starts a new output period, as in
+        // OrderedDecoder: it and later pictures are output after all earlier
+        if has_mmco5(&last.header.mmco_ops) {
+            self.gop_id += 1;
+        }
         self.gops.insert(open.seq, self.gop_id);
 
         let seq = open.seq;

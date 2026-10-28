@@ -72,27 +72,30 @@ pub fn parse_pps(rbsp: &[u8], sps: Option<&Sps>) -> Result<Pps, &'static str> {
         pic_scaling_matrix_present_flag = r.read_bit()? != 0;
         if pic_scaling_matrix_present_flag {
             let count = 6 + if transform_8x8_mode_flag { 2 } else { 0 };
-            for i in 0..count {
-                let present = r.read_bit()? != 0;
-                if present {
+            // Fall-back rule A (defaults) without SPS matrices, rule B (the
+            // SPS lists) with them, for lists 0, 3, 6 and 7
+            let sps_lists = sps
+                .filter(|s| s.seq_scaling_matrix_present_flag)
+                .map(|s| (s.scaling_list_4x4, s.scaling_list_8x8));
+            let fallback = |i: usize| match sps_lists {
+                Some((l4, l8)) => {
+                    let mut list = [0u8; 64];
                     if i < 6 {
-                        scaling_list_4x4[i] = crate::sps::parse_scaling_list::<16>(&mut r, 16)?;
+                        list[..16].copy_from_slice(&l4[i]);
                     } else {
-                        scaling_list_8x8[i - 6] = crate::sps::parse_scaling_list::<64>(&mut r, 64)?;
+                        list = l8[i - 6];
                     }
-                } else if i < 6 {
-                    // Fallback: use SPS list, or default from Table 7-2
-                    let sps_has_list = sps.is_some_and(|s| s.seq_scaling_matrix_present_flag);
-                    if !sps_has_list {
-                        scaling_list_4x4[i] = match i {
-                            0 => crate::sps::DEFAULT_SCALING_4X4_INTRA,
-                            3 => crate::sps::DEFAULT_SCALING_4X4_INTER,
-                            _ => scaling_list_4x4[i - 1],
-                        };
-                    }
-                    // If SPS has lists, scaling_list_4x4[i] already has the SPS value
+                    list
                 }
-            }
+                None => crate::sps::default_scaling_list(i),
+            };
+            crate::sps::parse_scaling_matrices(
+                &mut r,
+                count,
+                fallback,
+                &mut scaling_list_4x4,
+                &mut scaling_list_8x8,
+            )?;
         }
         second_chroma_qp_index_offset = r.read_se()?;
     }

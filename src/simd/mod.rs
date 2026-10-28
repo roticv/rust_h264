@@ -42,26 +42,26 @@ mod tests {
     use alloc::string::String;
     use alloc::vec::Vec;
 
-    use crate::decoder::Decoder;
+    use crate::decoder::OrderedDecoder;
     use crate::nal::parse_annex_b;
     use crate::sha256::sha256_hex;
 
     const GOLDEN_STREAMS: &[(&str, &str)] = &[
         (
             "bench_720p_300f_ponly",
-            "40b5d71eb6c765f362c0949049a7ad9cafe767ddfd380052f43a8078a61eed9a",
+            "2344dcb88dc01d07fd2afa1ed0f7e3413afe04dab40094cd6a70e047e5d8cb8b",
         ),
         (
             "bench_720p_300f_ponly_complex",
-            "ba921841a20df11940a73bc4203e5daa669a29b9aba721737a4932727240c165",
+            "2e7f958b99c09d9c972ad87e505cdb8fb06fa470c4b07a4e7cb0fe59784c49e0",
         ),
         (
             "bench_720p_300f_bframes",
-            "d5abf889fe64e840c2c5689c4851bf0c1a3d9e4d71b26a0ff7a72462ca838aae",
+            "5ff37fa29831240d996febaf69549b59bdf045d691a1b5bd9226f8c25bbb16c7",
         ),
         (
             "bench_720p_300f_bframes_complex",
-            "3259ba108ef4b105abba2accbb1cf41565a2908b3042b5276ea389c9a008ae3f",
+            "3c5dbbee6379c7b53bc49eb6b67b816cc325b44935ad6c1a4f3b9e905632630f",
         ),
         (
             "bench_1080p_100f",
@@ -73,7 +73,7 @@ mod tests {
         ),
         (
             "bench_1080p_100f_ponly",
-            "20b52c0de018ea316525119b703489828f471035a226f49ac9f3050c45ad1de3",
+            "e17bb157f49784e4e596451b2b84d96714c4c4cbd3e9ac44ed7cb19a385ce7d2",
         ),
     ];
 
@@ -82,17 +82,14 @@ mod tests {
         let h264_data = std::fs::read(&h264_path)
             .unwrap_or_else(|e| panic!("failed to read {}: {}", h264_path, e));
         let nals = parse_annex_b(&h264_data);
-        let mut decoder = Decoder::new();
+        // Display order, as ffmpeg outputs it (POC order within each IDR
+        // period; a POC sort across IDRs is ambiguous)
+        let mut decoder = OrderedDecoder::new();
         let mut frames = Vec::new();
         for nal in &nals {
-            if let Some(frame) = decoder.decode_nal(nal).unwrap() {
-                frames.push(frame);
-            }
+            frames.extend(decoder.decode_nal(nal).unwrap());
         }
-        if let Some(frame) = decoder.flush() {
-            frames.push(frame);
-        }
-        frames.sort_by_key(|frame| frame.pic_order_cnt);
+        frames.extend(decoder.flush());
 
         let mut output = Vec::new();
         for frame in &frames {

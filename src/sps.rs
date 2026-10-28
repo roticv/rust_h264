@@ -20,6 +20,91 @@ pub const DEFAULT_SCALING_4X4_INTER: [u8; 16] = [
     27, 30, 30, 34,
 ];
 
+/// H.264 Table 7-4: Default 8x8 scaling list for Intra (in scan order).
+#[rustfmt::skip]
+pub const DEFAULT_SCALING_8X8_INTRA: [u8; 64] = [
+     6, 10, 10, 13, 11, 13, 16, 16,
+    16, 16, 18, 18, 18, 18, 18, 23,
+    23, 23, 23, 23, 23, 25, 25, 25,
+    25, 25, 25, 25, 27, 27, 27, 27,
+    27, 27, 27, 27, 29, 29, 29, 29,
+    29, 29, 29, 31, 31, 31, 31, 31,
+    31, 33, 33, 33, 33, 33, 36, 36,
+    36, 36, 38, 38, 38, 40, 40, 42,
+];
+
+/// H.264 Table 7-4: Default 8x8 scaling list for Inter (in scan order).
+#[rustfmt::skip]
+pub const DEFAULT_SCALING_8X8_INTER: [u8; 64] = [
+     9, 13, 13, 15, 13, 15, 17, 17,
+    17, 17, 19, 19, 19, 19, 19, 21,
+    21, 21, 21, 21, 21, 22, 22, 22,
+    22, 22, 22, 22, 24, 24, 24, 24,
+    24, 24, 24, 24, 25, 25, 25, 25,
+    25, 25, 25, 27, 27, 27, 27, 27,
+    27, 28, 28, 28, 28, 28, 30, 30,
+    30, 30, 32, 32, 32, 33, 33, 35,
+];
+
+/// Default scaling list `i` of the SPS/PPS list order (0-5: 4x4 Intra Y,
+/// Cb, Cr, Inter Y, Cb, Cr; 6, 7: 8x8 Intra Y, Inter Y), as a 64-entry
+/// array whose first 16 entries hold a 4x4 list.
+pub(crate) fn default_scaling_list(i: usize) -> [u8; 64] {
+    let mut list = [0u8; 64];
+    match i {
+        0..=2 => list[..16].copy_from_slice(&DEFAULT_SCALING_4X4_INTRA),
+        3..=5 => list[..16].copy_from_slice(&DEFAULT_SCALING_4X4_INTER),
+        6 => list = DEFAULT_SCALING_8X8_INTRA,
+        _ => list = DEFAULT_SCALING_8X8_INTER,
+    }
+    list
+}
+
+/// Scaling lists 0-7 (4x4 then 8x8) of a parameter set (spec 7.3.2.1.1.1,
+/// 7.4.2.1.1, Table 7-2). An absent list falls back to `fallback_first(i)`
+/// for lists 0, 3, 6 and 7 (the default list in an SPS, or the SPS list in
+/// a PPS when the SPS carries matrices) and to the previous list of the same
+/// kind otherwise. A list coded as "use default" takes the default list.
+pub(crate) fn parse_scaling_matrices(
+    r: &mut BitstreamReader,
+    count: usize,
+    fallback_first: impl Fn(usize) -> [u8; 64],
+    lists_4x4: &mut [[u8; 16]; 6],
+    lists_8x8: &mut [[u8; 64]; 2],
+) -> Result<(), &'static str> {
+    for i in 0..count {
+        let present = r.read_bit()? != 0;
+        let list: [u8; 64] = if present {
+            let size = if i < 6 { 16 } else { 64 };
+            let (list, use_default) = parse_scaling_list::<64>(r, size)?;
+            if use_default {
+                default_scaling_list(i)
+            } else {
+                list
+            }
+        } else if matches!(i, 0 | 3 | 6 | 7) {
+            fallback_first(i)
+        } else if i < 6 {
+            let mut prev = [0u8; 64];
+            prev[..16].copy_from_slice(&lists_4x4[i - 1]);
+            prev
+        } else {
+            // 8x8 chroma lists of 4:4:4 (i >= 8): not used
+            lists_8x8[(i - 6) % 2]
+        };
+        if i < 6 {
+            lists_4x4[i].copy_from_slice(&list[..16]);
+        } else if i < 8 {
+            lists_8x8[i - 6] = list;
+        }
+    }
+    // 8x8 lists not coded at all (count 6) still follow the fall-back rule
+    for i in count.max(6)..8 {
+        lists_8x8[i - 6] = fallback_first(i);
+    }
+    Ok(())
+}
+
 /// Flat scaling list (no custom scaling) — all 16s.
 pub const FLAT_SCALING_4X4: [u8; 16] = [16; 16];
 
@@ -44,10 +129,10 @@ pub struct Sps {
     pub qpprime_y_zero_transform_bypass_flag: bool,
     pub seq_scaling_matrix_present_flag: bool,
     /// 4x4 scaling matrices [0..5]: Intra Y, Intra Cb, Intra Cr, Inter Y, Inter Cb, Inter Cr.
-    /// Default is all 16s (flat scaling). Stored in raster scan order within each 4x4 block.
+    /// Default is all 16s (flat scaling). Stored in zigzag scan order, as coded.
     pub scaling_list_4x4: [[u8; 16]; 6],
     /// 8x8 scaling matrices [0..1]: Intra Y, Inter Y (for 4:2:0).
-    /// Default is all 16s. Stored in raster scan order within each 8x8 block.
+    /// Default is all 16s. Stored in zigzag scan order, as coded.
     pub scaling_list_8x8: [[u8; 64]; 2],
 
     pub log2_max_frame_num_minus4: u32,
@@ -242,27 +327,14 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, &'static str> {
         seq_scaling_matrix_present_flag = r.read_bit()? != 0;
         if seq_scaling_matrix_present_flag {
             let count = if chroma_format_idc != 3 { 8 } else { 12 };
-            for i in 0..count {
-                let present = r.read_bit()? != 0;
-                if present {
-                    if i < 6 {
-                        scaling_list_4x4[i] = parse_scaling_list::<16>(&mut r, 16)?;
-                    } else if i < 8 {
-                        scaling_list_8x8[i - 6] = parse_scaling_list::<64>(&mut r, 64)?;
-                    } else {
-                        let _: [u8; 64] = parse_scaling_list::<64>(&mut r, 64)?;
-                    }
-                } else if i < 6 {
-                    // Fallback per H.264 Table 7-2:
-                    // i=0: Default_4x4_Intra, i=3: Default_4x4_Inter
-                    // i=1,2: copy from previous, i=4,5: copy from previous
-                    scaling_list_4x4[i] = match i {
-                        0 => DEFAULT_SCALING_4X4_INTRA,
-                        3 => DEFAULT_SCALING_4X4_INTER,
-                        _ => scaling_list_4x4[i - 1],
-                    };
-                }
-            }
+            // Fall-back rule A: absent lists take the defaults
+            parse_scaling_matrices(
+                &mut r,
+                count,
+                default_scaling_list,
+                &mut scaling_list_4x4,
+                &mut scaling_list_8x8,
+            )?;
         }
     }
 
@@ -426,18 +498,21 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, &'static str> {
 }
 
 /// Parse a scaling list from the bitstream (H.264 spec 7.3.2.1.1).
-/// Returns a flat array of `size` scale values in scan order.
+/// Returns `size` scale values in scan order, and whether the list asks for
+/// the default list instead (useDefaultScalingMatrixFlag).
 pub fn parse_scaling_list<const N: usize>(
     r: &mut BitstreamReader,
     size: usize,
-) -> Result<[u8; N], &'static str> {
+) -> Result<([u8; N], bool), &'static str> {
     let mut scaling_list = [0u8; N];
     let mut last_scale: i32 = 8;
     let mut next_scale: i32 = 8;
-    for entry in scaling_list.iter_mut().take(size) {
+    let mut use_default = false;
+    for (j, entry) in scaling_list.iter_mut().take(size).enumerate() {
         if next_scale != 0 {
             let delta = r.read_se()?;
             next_scale = (last_scale.wrapping_add(delta).wrapping_add(256)).rem_euclid(256);
+            use_default = j == 0 && next_scale == 0;
         }
         let val = if next_scale == 0 {
             last_scale
@@ -447,7 +522,7 @@ pub fn parse_scaling_list<const N: usize>(
         *entry = val as u8;
         last_scale = val;
     }
-    Ok(scaling_list)
+    Ok((scaling_list, use_default))
 }
 
 /// Best-effort parse of the VUI fields after timing_info (spec E.1.1):

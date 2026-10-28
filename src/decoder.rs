@@ -148,6 +148,9 @@ pub struct Decoder {
     pending: Option<PictureState>,
     /// First field of a field-picture pair awaiting its complement for output.
     pending_field: Option<Frame>,
+    /// The last frame returned came from a picture with MMCO 5, which starts
+    /// a new output period (see [`OrderedDecoder`]).
+    period_start: bool,
 }
 
 impl Default for Decoder {
@@ -165,6 +168,7 @@ impl Decoder {
             dpb: Dpb::new(0),
             pending: None,
             pending_field: None,
+            period_start: false,
         }
     }
 
@@ -296,7 +300,16 @@ impl Decoder {
                 ps.long_term_reference_flag,
             );
         }
-        finish_output(ps, &mut self.pending_field)
+        let mmco5 = has_mmco5(&ps.mmco_ops);
+        let frame = finish_output(ps, &mut self.pending_field);
+        self.period_start = mmco5 && frame.is_some();
+        frame
+    }
+
+    /// Whether the frame just returned starts a new output period (its
+    /// picture had MMCO 5), clearing the flag.
+    pub(crate) fn take_period_start(&mut self) -> bool {
+        core::mem::take(&mut self.period_start)
     }
 
     fn decode_slice(&mut self, nal: &NalUnit) -> Result<(), DecodeError> {
@@ -451,6 +464,11 @@ pub(crate) fn prepare_slice(
     } else {
         header.frame_num
     };
+    // Skipped frame_num values become "non-existing" reference frames
+    // (spec 8.2.5.2); later slices of the picture find no gap left
+    if nal.nal_unit_type != NalUnitType::SliceIdr {
+        dpb.fill_frame_num_gap(header.frame_num, max_frame_num);
+    }
     let mut ref_pic_list = if is_p_slice {
         let mut refs = dpb.short_term_ref_list(
             header.frame_num,
@@ -492,9 +510,16 @@ pub(crate) fn prepare_slice(
         vec![]
     };
 
+    // The initial lists keep only their first num_ref_idx_lX_active entries
+    // (spec 8.2.4.2); modification works on lists of that length.
+    ref_pic_list.truncate(header.num_ref_idx_l0_active as usize);
+    _ref_pic_list_l0.truncate(header.num_ref_idx_l0_active as usize);
+    _ref_pic_list_l1.truncate(header.num_ref_idx_l1_active as usize);
+
     // Apply ref_pic_list_modification (spec 8.2.4.3)
     // A command may name any short-term reference, not only one in the list.
     let short_term = dpb.short_term_refs();
+    let long_term = dpb.long_term_refs();
     if is_p_slice && !header.ref_list_mod_l0.is_empty() {
         Dpb::apply_ref_list_modification(
             &mut ref_pic_list,
@@ -504,6 +529,7 @@ pub(crate) fn prepare_slice(
             is_field_pic,
             header.bottom_field_flag,
             &short_term,
+            &long_term,
         );
     }
     if is_b_slice && !header.ref_list_mod_l0.is_empty() {
@@ -515,6 +541,7 @@ pub(crate) fn prepare_slice(
             is_field_pic,
             header.bottom_field_flag,
             &short_term,
+            &long_term,
         );
     }
     if is_b_slice && !header.ref_list_mod_l1.is_empty() {
@@ -526,6 +553,7 @@ pub(crate) fn prepare_slice(
             is_field_pic,
             header.bottom_field_flag,
             &short_term,
+            &long_term,
         );
     }
 
@@ -938,6 +966,7 @@ pub(crate) fn run_slice(
         scaling_list_8x8: &pps.scaling_list_8x8,
         constrained_intra_pred_flag: pps.constrained_intra_pred_flag,
         chroma_qp_index_offset: pps.chroma_qp_index_offset,
+        second_chroma_qp_index_offset: pps.second_chroma_qp_index_offset,
         ref_pic_list,
         ref_pic_list_l0: _ref_pic_list_l0,
         ref_pic_list_l1: _ref_pic_list_l1,
@@ -1253,14 +1282,16 @@ pub(crate) fn deblock_picture(ps: &mut PictureState) {
 
 /// Metadata of the DPB picture for a picture being decoded into `ps`.
 pub(crate) fn picture_meta(ps: &PictureState) -> PictureMeta {
+    let (frame_num, pic_order_cnt, field_poc) =
+        decoded_numbering(&ps.mmco_ops, ps.frame_num, ps.poc, ps.field_poc);
     PictureMeta {
         width: ps.mb_width * 16,
         // Coded height of this picture's planes, not the display height rounded
         // up: cropping may remove a macroblock or more.
         height: ps.mb_height * 16,
-        frame_num: ps.frame_num,
-        pic_order_cnt: ps.poc,
-        field_poc: ps.field_poc,
+        frame_num,
+        pic_order_cnt,
+        field_poc,
         mb_width: ps.mb_width,
         is_intra: ps.is_intra_slice,
         structure: if ps.field_pic_flag {
@@ -1496,9 +1527,15 @@ pub(crate) fn apply_reference_marking(
     }
 
     dpb.insert(pic, reference);
+    if nal_ref_idc > 0 {
+        // A picture with MMCO 5 continues as frame_num 0
+        dpb.set_prev_ref_frame_num(if has_mmco5(mmco_ops) { 0 } else { frame_num });
+    }
 
     for &(op, param) in mmco_ops {
         if op == 6 {
+            // A picture with MMCO 5 continues as frame_num 0
+            let frame_num = if has_mmco5(mmco_ops) { 0 } else { frame_num };
             dpb.mark_current_as_long_term(param, frame_num);
         }
     }
@@ -1508,10 +1545,35 @@ pub(crate) fn apply_reference_marking(
 /// planes to the display size and, for field pictures, interleave the two
 /// fields of a frame (`pending_field` holds the first field until its
 /// complement arrives). Returns `None` when nothing is ready for output.
+/// Whether `mmco_ops` holds memory_management_control_operation 5.
+pub(crate) fn has_mmco5(mmco_ops: &[(u32, u32)]) -> bool {
+    mmco_ops.iter().any(|&(op, _)| op == 5)
+}
+
+/// frame_num, POC and field POCs a picture keeps after decoding: a picture
+/// with MMCO 5 continues as frame_num 0 with its POCs moved so that the
+/// smaller one is 0 (spec 8.2.1, 8.2.5.4.5).
+pub(crate) fn decoded_numbering(
+    mmco_ops: &[(u32, u32)],
+    frame_num: u32,
+    poc: i32,
+    field_poc: [i32; 2],
+) -> (u32, i32, [i32; 2]) {
+    if has_mmco5(mmco_ops) {
+        (0, 0, field_poc.map(|p| p.wrapping_sub(poc)))
+    } else {
+        (frame_num, poc, field_poc)
+    }
+}
+
 pub(crate) fn finish_output(
     mut ps: PictureState,
     pending_field: &mut Option<Frame>,
 ) -> Option<Frame> {
+    if has_mmco5(&ps.mmco_ops) {
+        // Output follows the reset POC: first of a new output period
+        ps.frame.pic_order_cnt = 0;
+    }
     #[cfg(feature = "profile")]
     let _output_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::Output);
 
@@ -1840,6 +1902,12 @@ impl<M> OrderedDecoder<M> {
         if let Some(frame) = self.inner.decode_nal(nal)? {
             finalized_previous = true;
             let frame_meta = self.building_meta.take();
+            // A picture with MMCO 5 starts a new output period: everything
+            // decoded before it is output first (spec C.4.4)
+            if self.inner.take_period_start() {
+                self.gop_id += 1;
+                self.drain_completed_gops(&mut output);
+            }
             self.buffer.push((self.gop_id, frame, frame_meta));
         }
 
@@ -1869,6 +1937,9 @@ impl<M> OrderedDecoder<M> {
         // First, get any final pending frame from the inner decoder.
         if let Some(frame) = self.inner.flush() {
             let frame_meta = self.building_meta.take();
+            if self.inner.take_period_start() {
+                self.gop_id += 1;
+            }
             self.buffer.push((self.gop_id, frame, frame_meta));
         }
         // Drain everything in (gop, poc) order.

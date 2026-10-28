@@ -26,6 +26,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     pairs.
 - CAVLC macroblocks with the 8x8 transform deblocked the inner edges of their
   8x8 blocks.
+- Fixes found with the JVT conformance suites (run through Fluster):
+  - POC types 1 and 2 ignored FrameNumOffset, so POC fell back when frame_num
+    wrapped; type 1 also mishandled non-reference pictures, and IDR pictures
+    of types 0 and 1 took POC 0 instead of their coded values.
+  - Pictures with MMCO 5 kept their POC and frame_num instead of restarting
+    at 0, and did not start a new output period, so `OrderedDecoder` and
+    `ThreadedDecoder` mixed their output with earlier pictures.
+  - Gaps in frame_num (`gaps_in_frame_num_value_allowed_flag`) did not insert
+    "non-existing" frames, leaving the wrong references in the DPB.
+  - Initial reference lists were not cut to `num_ref_idx_lX_active` before
+    modification, and modification of long-term references
+    (`modification_of_pic_nums_idc` 2) matched the wrong picture.
+  - 8x8 scaling matrices were applied in raster instead of zigzag order;
+    absent lists did not follow the fall-back rules (default 8x8 lists, PPS
+    lists copying the previous PPS list), and "use default" lists were not
+    recognised.
+  - Cr was dequantized with `chroma_qp_index_offset` instead of
+    `second_chroma_qp_index_offset`.
+  - After an I_PCM macroblock the next macroblock's QP was predicted from 0,
+    and CABAC CBP contexts treated I_PCM as having no coded blocks.
+  - Direct and skipped B macroblocks without `direct_8x8_inference_flag`
+    predicted chroma with one motion vector per 8x8 block.
 - Temporal direct mode used no motion when the co-located block predicted from
   list 1 only, and identified the co-located references of a multi-slice
   picture through the last slice's reference list.

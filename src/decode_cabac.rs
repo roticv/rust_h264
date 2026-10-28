@@ -588,7 +588,7 @@ impl SliceContext<'_> {
                             &pred_v,
                             false,
                             cbp_chroma,
-                            _qp_c,
+                            chroma_qp(qp_y, sp.second_chroma_qp_index_offset),
                             &sp.scaling_list_4x4[2],
                             mb_x,
                             mb_idx,
@@ -898,7 +898,7 @@ impl SliceContext<'_> {
                             &pred_v,
                             false,
                             cbp_chroma,
-                            qp_c,
+                            chroma_qp(qp_y, sp.second_chroma_qp_index_offset),
                             &sp.scaling_list_4x4[2],
                             mb_x,
                             mb_idx,
@@ -954,10 +954,11 @@ impl SliceContext<'_> {
                         self.nc_cr[mb_idx * 4 + blk] = 16;
                     }
                     cr.reinit(pcm_pos + off);
-                    self.prev_mb_qp = 0;
+                    // mb_qp_delta is absent: QP_Y (and the next MB's prediction) is
+                    // unchanged; deblocking uses QP 0 for I_PCM (mb_info.qp_y)
                     self.last_qp_delta_nonzero = false;
                     self.is_i16x16[mb_idx] = true; // I_PCM treated as I16x16 for CABAC context
-                    self.mb_cbp[mb_idx] = 0;
+                    self.mb_cbp[mb_idx] = 0x7EF; // all blocks coded, chroma 2 (CABAC contexts)
                     self.mb_info[mb_idx] = MbInfo {
                         mb_type: MbType::Ipcm,
                         qp_y: 0,
@@ -1613,8 +1614,14 @@ impl SliceContext<'_> {
                         (&mut chroma_dc_cr, &mut self.frame.v, 5usize),
                     ] {
                         let chroma_scale = &sp.scaling_list_4x4[scale_idx];
+                        // Cr (lists 2 and 5) takes the second chroma QP offset
+                        let plane_qp_c = if matches!(scale_idx, 2 | 5) {
+                            chroma_qp(qp_y, sp.second_chroma_qp_index_offset)
+                        } else {
+                            qp_c
+                        };
                         inverse_hadamard_2x2(plane_dc);
-                        dequant_chroma_dc(plane_dc, qp_c, chroma_scale[0]);
+                        dequant_chroma_dc(plane_dc, plane_qp_c, chroma_scale[0]);
                         let mut chroma_residual = [0i32; 64];
                         for blk in 0..4 {
                             let blk_row = (blk / 2) * 4;
@@ -1663,7 +1670,11 @@ impl SliceContext<'_> {
                                         let (r, c) = zigzag_4x4[pos + 1];
                                         block_raster[r * 4 + c] = val;
                                     }
-                                    dequant_4x4_ac_raster(&mut block_raster, qp_c, chroma_scale);
+                                    dequant_4x4_ac_raster(
+                                        &mut block_raster,
+                                        plane_qp_c,
+                                        chroma_scale,
+                                    );
                                 }
                             }
                             inverse_dct_4x4(&mut block_raster);
@@ -3210,8 +3221,14 @@ impl SliceContext<'_> {
                         (&mut chroma_dc_cr, &mut self.frame.v, 5usize),
                     ] {
                         let chroma_scale = &sp.scaling_list_4x4[scale_idx];
+                        // Cr (lists 2 and 5) takes the second chroma QP offset
+                        let plane_qp_c = if matches!(scale_idx, 2 | 5) {
+                            chroma_qp(qp_y, sp.second_chroma_qp_index_offset)
+                        } else {
+                            qp_c
+                        };
                         inverse_hadamard_2x2(plane_dc);
-                        dequant_chroma_dc(plane_dc, qp_c, chroma_scale[0]);
+                        dequant_chroma_dc(plane_dc, plane_qp_c, chroma_scale[0]);
                         let mut chroma_residual = [0i32; 64];
                         for blk in 0..4 {
                             let blk_row = (blk / 2) * 4;
@@ -3260,7 +3277,11 @@ impl SliceContext<'_> {
                                         let (r, c) = zigzag_4x4[pos + 1];
                                         block_raster[r * 4 + c] = val;
                                     }
-                                    dequant_4x4_ac_raster(&mut block_raster, qp_c, chroma_scale);
+                                    dequant_4x4_ac_raster(
+                                        &mut block_raster,
+                                        plane_qp_c,
+                                        chroma_scale,
+                                    );
                                 }
                             }
                             inverse_dct_4x4(&mut block_raster);
@@ -3355,10 +3376,11 @@ impl SliceContext<'_> {
                 self.nc_cr[mb_idx * 4 + blk] = 16;
             }
             cr.reinit(pcm_pos + off);
-            self.prev_mb_qp = 0;
+            // mb_qp_delta is absent: QP_Y (and the next MB's prediction) is
+            // unchanged; deblocking uses QP 0 for I_PCM (mb_info.qp_y)
             self.last_qp_delta_nonzero = false;
             self.is_i16x16[mb_idx] = true; // I_PCM treated as I16x16 for CABAC context
-            self.mb_cbp[mb_idx] = 0;
+            self.mb_cbp[mb_idx] = 0x7EF; // all blocks coded, chroma 2 (CABAC contexts)
             self.mb_info[mb_idx] = MbInfo {
                 mb_type: MbType::Ipcm,
                 qp_y: 0,
@@ -3711,7 +3733,7 @@ impl SliceContext<'_> {
                     &pred_v,
                     false,
                     cbp_chroma,
-                    _qp_c,
+                    chroma_qp(qp_y, sp.second_chroma_qp_index_offset),
                     &sp.scaling_list_4x4[2],
                     mb_x,
                     mb_idx,
@@ -4000,7 +4022,7 @@ impl SliceContext<'_> {
                     &pred_v,
                     false,
                     cbp_chroma,
-                    qp_c,
+                    chroma_qp(qp_y, sp.second_chroma_qp_index_offset),
                     &sp.scaling_list_4x4[2],
                     mb_x,
                     mb_idx,
@@ -4058,10 +4080,11 @@ impl SliceContext<'_> {
                 self.nc_cr[mb_idx * 4 + blk] = 16;
             }
             cr.reinit(pcm_pos + off);
-            self.prev_mb_qp = 0;
+            // mb_qp_delta is absent: QP_Y (and the next MB's prediction) is
+            // unchanged; deblocking uses QP 0 for I_PCM (mb_info.qp_y)
             self.last_qp_delta_nonzero = false;
             self.is_i16x16[mb_idx] = true; // I_PCM treated as I16x16 for CABAC context
-            self.mb_cbp[mb_idx] = 0;
+            self.mb_cbp[mb_idx] = 0x7EF; // all blocks coded, chroma 2 (CABAC contexts)
             self.mb_info[mb_idx] = MbInfo {
                 mb_type: MbType::Ipcm,
                 qp_y: 0,
