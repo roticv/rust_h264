@@ -1098,7 +1098,7 @@ impl SliceContext<'_> {
                                     mb_field_decoding: self.mb_field_decoding,
                                 },
                             );
-                            let mv = [mvp_x + mvd_x, mvp_y + mvd_y];
+                            let mv = [mvp_x.wrapping_add(mvd_x), mvp_y.wrapping_add(mvd_y)];
                             for r in (0..sph).step_by(4) {
                                 for c in (0..spw).step_by(4) {
                                     let lr = (py + r) / 4;
@@ -1328,7 +1328,7 @@ impl SliceContext<'_> {
                                 mb_field_decoding: self.mb_field_decoding,
                             },
                         );
-                        let mv = [mvp_x + mvd_x, mvp_y + mvd_y];
+                        let mv = [mvp_x.wrapping_add(mvd_x), mvp_y.wrapping_add(mvd_y)];
                         // Store MV, ref, and MVD
                         for r in (0..part_h).step_by(4) {
                             for c in (0..part_w).step_by(4) {
@@ -1943,7 +1943,7 @@ impl SliceContext<'_> {
                                 mb_field_decoding: self.mb_field_decoding,
                             },
                         );
-                        mv_l0 = [mvp_x + mvd_x, mvp_y + mvd_y];
+                        mv_l0 = [mvp_x.wrapping_add(mvd_x), mvp_y.wrapping_add(mvd_y)];
                         for blk in 0..16 {
                             self.mv_store_l0[mb_idx * 16 + blk] = mv_l0;
                             self.ref_idx_store_l0[mb_idx * 16 + blk] = ref_l0;
@@ -1993,7 +1993,7 @@ impl SliceContext<'_> {
                                 mb_field_decoding: self.mb_field_decoding,
                             },
                         );
-                        mv_l1 = [mvp_x + mvd_x, mvp_y + mvd_y];
+                        mv_l1 = [mvp_x.wrapping_add(mvd_x), mvp_y.wrapping_add(mvd_y)];
                         for blk in 0..16 {
                             self.mv_store_l1[mb_idx * 16 + blk] = mv_l1;
                             self.ref_idx_store_l1[mb_idx * 16 + blk] = ref_l1;
@@ -2169,7 +2169,7 @@ impl SliceContext<'_> {
                                     mb_field_decoding: self.mb_field_decoding,
                                 },
                             );
-                            mv_l0_parts[p] = [mvp_x + mvd_x, mvp_y + mvd_y];
+                            mv_l0_parts[p] = [mvp_x.wrapping_add(mvd_x), mvp_y.wrapping_add(mvd_y)];
                             // Store MV and MVD immediately for partition 1 prediction
                             for r in (0..part_h).step_by(4) {
                                 for c in (0..part_w).step_by(4) {
@@ -2252,7 +2252,7 @@ impl SliceContext<'_> {
                                     mb_field_decoding: self.mb_field_decoding,
                                 },
                             );
-                            mv_l1_parts[p] = [mvp_x + mvd_x, mvp_y + mvd_y];
+                            mv_l1_parts[p] = [mvp_x.wrapping_add(mvd_x), mvp_y.wrapping_add(mvd_y)];
                             for r in (0..part_h).step_by(4) {
                                 for c in (0..part_w).step_by(4) {
                                     let lr = (py_off + r) / 4;
@@ -2553,7 +2553,7 @@ impl SliceContext<'_> {
                                     mb_field_decoding: self.mb_field_decoding,
                                 },
                             );
-                            let mv = [mvp_x + mvd_x, mvp_y + mvd_y];
+                            let mv = [mvp_x.wrapping_add(mvd_x), mvp_y.wrapping_add(mvd_y)];
                             for r in (0..layout.sub_h).step_by(4) {
                                 for c in (0..layout.sub_w).step_by(4) {
                                     let lr = (py + r) / 4;
@@ -2634,7 +2634,7 @@ impl SliceContext<'_> {
                                     mb_field_decoding: self.mb_field_decoding,
                                 },
                             );
-                            let mv = [mvp_x + mvd_x, mvp_y + mvd_y];
+                            let mv = [mvp_x.wrapping_add(mvd_x), mvp_y.wrapping_add(mvd_y)];
                             for r in (0..layout.sub_h).step_by(4) {
                                 for c in (0..layout.sub_w).step_by(4) {
                                     let lr = (py + r) / 4;

@@ -117,7 +117,7 @@ impl SliceContext<'_> {
                             mb_field_decoding: self.mb_field_decoding,
                         },
                     );
-                    let mv = [mvp_x + mvd_x, mvp_y + mvd_y];
+                    let mv = [mvp_x.wrapping_add(mvd_x), mvp_y.wrapping_add(mvd_y)];
 
                     // Store MV/ref for all 4x4 blocks
                     for blk in 0..16 {
@@ -233,7 +233,10 @@ impl SliceContext<'_> {
                             mb_field_decoding: self.mb_field_decoding,
                         },
                     );
-                    let mv_l0 = [mvp_l0_x + mvd_l0_x, mvp_l0_y + mvd_l0_y];
+                    let mv_l0 = [
+                        mvp_l0_x.wrapping_add(mvd_l0_x),
+                        mvp_l0_y.wrapping_add(mvd_l0_y),
+                    ];
 
                     let mvd_l1_x = reader.read_se()? as i16;
                     let mvd_l1_y = reader.read_se()? as i16;
@@ -253,7 +256,10 @@ impl SliceContext<'_> {
                             mb_field_decoding: self.mb_field_decoding,
                         },
                     );
-                    let mv_l1 = [mvp_l1_x + mvd_l1_x, mvp_l1_y + mvd_l1_y];
+                    let mv_l1 = [
+                        mvp_l1_x.wrapping_add(mvd_l1_x),
+                        mvp_l1_y.wrapping_add(mvd_l1_y),
+                    ];
 
                     // Store both L0 and L1 MVs
                     for blk in 0..16 {
@@ -368,7 +374,7 @@ impl SliceContext<'_> {
                                     mb_field_decoding: self.mb_field_decoding,
                                 },
                             );
-                            mv_l0_parts[p] = [mvp_x + mvd_x, mvp_y + mvd_y];
+                            mv_l0_parts[p] = [mvp_x.wrapping_add(mvd_x), mvp_y.wrapping_add(mvd_y)];
                             // Store MV immediately for partition 1 to read partition 0
                             for r in (0..part_h).step_by(4) {
                                 for c in (0..part_w).step_by(4) {
@@ -410,7 +416,7 @@ impl SliceContext<'_> {
                                     mb_field_decoding: self.mb_field_decoding,
                                 },
                             );
-                            mv_l1_parts[p] = [mvp_x + mvd_x, mvp_y + mvd_y];
+                            mv_l1_parts[p] = [mvp_x.wrapping_add(mvd_x), mvp_y.wrapping_add(mvd_y)];
                             for r in (0..part_h).step_by(4) {
                                 for c in (0..part_w).step_by(4) {
                                     let lr = (py_off + r) / 4;
@@ -626,7 +632,7 @@ impl SliceContext<'_> {
                                         mb_field_decoding: self.mb_field_decoding,
                                     },
                                 );
-                                let mv = [mvp_x + mvd_x, mvp_y + mvd_y];
+                                let mv = [mvp_x.wrapping_add(mvd_x), mvp_y.wrapping_add(mvd_y)];
                                 sub_mvs[idx].mv_l0 = mv;
                                 // Store immediately for subsequent sub-partition prediction
                                 for r in (0..layout.sub_h).step_by(4) {
@@ -672,7 +678,7 @@ impl SliceContext<'_> {
                                         mb_field_decoding: self.mb_field_decoding,
                                     },
                                 );
-                                let mv = [mvp_x + mvd_x, mvp_y + mvd_y];
+                                let mv = [mvp_x.wrapping_add(mvd_x), mvp_y.wrapping_add(mvd_y)];
                                 sub_mvs[idx].mv_l1 = mv;
                                 for r in (0..layout.sub_h).step_by(4) {
                                     for c in (0..layout.sub_w).step_by(4) {
@@ -1373,7 +1379,7 @@ impl SliceContext<'_> {
                                 mb_field_decoding: self.mb_field_decoding,
                             },
                         );
-                        let mv = [mvp_x + mvd_x, mvp_y + mvd_y];
+                        let mv = [mvp_x.wrapping_add(mvd_x), mvp_y.wrapping_add(mvd_y)];
                         // Store MV for all 4x4 blocks in this sub-partition
                         for r in (0..sph).step_by(4) {
                             for c in (0..spw).step_by(4) {
@@ -1433,7 +1439,7 @@ impl SliceContext<'_> {
                             mb_field_decoding: self.mb_field_decoding,
                         },
                     );
-                    let mv = [mvp_x + mvd_x, mvp_y + mvd_y];
+                    let mv = [mvp_x.wrapping_add(mvd_x), mvp_y.wrapping_add(mvd_y)];
                     let (py_off, px_off) = match mb_type {
                         1 => (p * 8, 0),
                         2 => (0, p * 8),

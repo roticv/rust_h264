@@ -3250,6 +3250,13 @@ mod tests {
         fuzz_decode_avcc("decode_avcc_poc_type1_mul_overflow.bin");
     }
 
+    /// Motion vector predictor + difference overflowing i16 in CAVLC P_8x8
+    /// (decode_cavlc.rs). Spec 8.4.1 defines the sum modulo 2^16, so it wraps.
+    #[test]
+    fn test_fuzz_regression_cavlc_mv_add_overflow() {
+        fuzz_decode_avcc("decode_avcc_cavlc_mv_add_overflow.bin");
+    }
+
     /// Field-pair combine with mismatched field geometry (decoder.rs:451)
     #[test]
     fn test_fuzz_regression_field_pair_mismatch() {
