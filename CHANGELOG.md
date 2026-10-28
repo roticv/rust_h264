@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `tools/conformance/run.sh` runs the JVT conformance suites (JVT-AVC_V1,
+  JVT-FR-EXT) through Fluster with a new `conformance_decode` example, and
+  fails on any result other than the expected unsupported-format vectors.
+  Every 8-bit 4:2:0 vector passes: 174 of 204.
+
 ### Fixed
 - **MBAFF streams from x264 (`--interlaced`)**, which failed with "invalid
   coded_block_pattern" or decoded with corrupted macroblocks, now decode

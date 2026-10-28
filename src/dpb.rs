@@ -1626,6 +1626,63 @@ mod tests {
         assert_eq!(Dpb::frame_num_for_pic_num(-16, 16), 0);
     }
 
+    fn long_term_set(dpb: &Dpb, is_field_pic: bool) -> Vec<(i32, u32)> {
+        let mut v: Vec<(i32, u32)> = dpb
+            .long_term_refs(is_field_pic)
+            .iter()
+            .map(|(p, idx)| (p.pic_order_cnt, *idx))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn test_field_mmco3_gives_both_fields_one_long_term_index() {
+        // MR6_BT_B: an I field marks both fields of the previous frame
+        // long-term with the same LongTermFrameIdx, one command per field
+        let mut dpb = Dpb::new(5);
+        dpb.insert(make_field(4, 8, false), ReferenceStatus::ShortTerm);
+        dpb.insert(make_field(4, 9, true), ReferenceStatus::ShortTerm);
+        dpb.assign_long_term(4, Some(PictureStructure::TopField), 0);
+        dpb.assign_long_term(4, Some(PictureStructure::BottomField), 0);
+        assert_eq!(long_term_set(&dpb, true), [(8, 0), (9, 0)]);
+        assert!(dpb.short_term_refs(true).is_empty());
+    }
+
+    #[test]
+    fn test_frame_mmco_names_both_fields_of_a_pair() {
+        // MR7_BT_B: a frame picture marks a frame decoded as two fields
+        let mut dpb = Dpb::new(5);
+        dpb.insert(make_field(3, 6, false), ReferenceStatus::ShortTerm);
+        dpb.insert(make_field(3, 7, true), ReferenceStatus::ShortTerm);
+        dpb.insert(make_pic(4, 8), ReferenceStatus::ShortTerm);
+        dpb.assign_long_term(3, None, 1);
+        assert_eq!(long_term_set(&dpb, true), [(6, 1), (7, 1)]);
+        dpb.mark_long_term_unused(1, None);
+        assert!(dpb.long_term_refs(true).is_empty());
+        dpb.mark_short_term_unused(4, None);
+        assert!(dpb.short_term_refs(true).is_empty());
+    }
+
+    #[test]
+    fn test_sliding_window_counts_long_term_frames_by_index() {
+        // A long-term frame keeps its frame_num, which a short-term frame
+        // reuses once frame_num wraps; they are still two frames
+        let mut dpb = Dpb::new(3);
+        dpb.insert(make_pic(6, 12), ReferenceStatus::LongTerm(0));
+        dpb.insert(make_pic(5, 42), ReferenceStatus::ShortTerm);
+        dpb.insert(make_pic(6, 44), ReferenceStatus::ShortTerm);
+        dpb.insert(make_pic(7, 46), ReferenceStatus::ShortTerm);
+        let mut left: Vec<u32> = dpb
+            .short_term_refs(false)
+            .iter()
+            .map(|p| p.frame_num)
+            .collect();
+        left.sort_unstable();
+        assert_eq!(left, [6, 7]);
+        assert_eq!(long_term_set(&dpb, false), [(12, 0)]);
+    }
+
     #[test]
     fn test_unused_not_in_ref_list() {
         let mut dpb = Dpb::new(4);

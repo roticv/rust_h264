@@ -20,6 +20,7 @@ This is a Rust project using Cargo:
 - **Golden corpus digests:** `cargo test --release -- --ignored golden_corpus_digests` (decodes the full 720p/1080p bench corpus; ignored by default because it is slow)
 - **Benchmark:** `cargo run --release --features dev-internals --example bench_decode` (timing, allocation count, and digest per bench stream)
 - **Compare against FFmpeg:** `python3 tools/verify_vs_ffmpeg.py testdata/*.h264` (byte-for-byte; every 4:2:0 test and bench stream should match, only the `unsupported_*` streams fail)
+- **Conformance:** `tools/conformance/run.sh` (JVT-AVC_V1 and JVT-FR-EXT through Fluster, cloned into `target/fluster` with ~1 GB of suites downloaded on first run; extra args go to `fluster run`, e.g. `-tv CAPAMA3_Sand_F`). Every 8-bit 4:2:0 vector passes (174/204); the rest are listed in `tools/conformance/expected_failures.txt`, and the script fails on any other failure or on a listed vector passing
 - **Profile:** `cargo run --release --features profile --example bench_decode -- <iterations>` (pprof flamegraph at `target/profile-1080p-complex.svg`, per-phase timers, top self-time functions; the `profile` feature implies `std` and `dev-internals`)
 
 ## Milestones
@@ -78,7 +79,7 @@ attached by the first slice of that picture.
 
 ## Status
 
-Baseline, Main and High profile 8-bit 4:2:0 decoding is complete: I/P/B slices with CAVLC and CABAC, 4x4 and 8x8 transforms with scaling matrices, all partition types, spatial and temporal direct mode, multiple and long-term references with list modification and MMCO, explicit and implicit weighted prediction, multi-slice pictures with per-slice deblocking, and interlaced content (MBAFF and field pictures). Output is byte-identical to FFmpeg on every 4:2:0 test and bench stream (check with `tools/verify_vs_ffmpeg.py`); unit tests pin this with SHA-256 or YUV comparisons against FFmpeg output. Other formats are rejected with `DecodeError::Unsupported`. Motion compensation has NEON and x86 SIMD backends, and `ThreadedDecoder` adds frame threading with row-level reference sync. Current performance numbers live in BENCHMARK.md.
+Baseline, Main and High profile 8-bit 4:2:0 decoding is complete: I/P/B slices with CAVLC and CABAC, 4x4 and 8x8 transforms with scaling matrices, all partition types, spatial and temporal direct mode, multiple and long-term references with list modification and MMCO, explicit and implicit weighted prediction, multi-slice pictures with per-slice deblocking, and interlaced content (MBAFF and field pictures). Output is byte-identical to FFmpeg on every 4:2:0 test and bench stream (check with `tools/verify_vs_ffmpeg.py`); unit tests pin this with SHA-256 or YUV comparisons against FFmpeg output. Every 8-bit 4:2:0 vector of the JVT conformance suites decodes to the reference output (`tools/conformance/run.sh`). Other formats are rejected with `DecodeError::Unsupported`. Motion compensation has NEON and x86 SIMD backends, and `ThreadedDecoder` adds frame threading with row-level reference sync. Current performance numbers live in BENCHMARK.md.
 
 ### Completed
 

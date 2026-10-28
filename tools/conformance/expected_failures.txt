@@ -1,0 +1,43 @@
+# JVT conformance vectors rust_h264 is expected to fail: formats it rejects
+# with DecodeError::Unsupported. Any other failure, or one of these passing,
+# makes run.sh exit non-zero.
+
+# Slice groups (FMO)
+FM1_BT_B
+FM1_FT_E
+FM2_SVA_C
+
+# SP/SI slices
+SP1_BT_A
+sp2_bt_b
+
+# Monochrome (4:0:0)
+HPCAMOLQ_BRCM_B
+HPCVMOLQ_BRCM_B
+
+# High 10
+FREH10-1
+FREH10-2
+
+# 4:2:2
+FREXT1_TANDBERG_A
+FREXT2_TANDBERG_A
+FREXT3_TANDBERG_A
+Hi422FR1_SONY_A
+Hi422FR2_SONY_A
+Hi422FR3_SONY_A
+Hi422FR4_SONY_A
+Hi422FR6_SONY_A
+Hi422FR7_SONY_A
+Hi422FR8_SONY_A
+Hi422FR9_SONY_A
+Hi422FR10_SONY_A
+Hi422FR11_SONY_A
+Hi422FR12_SONY_A
+Hi422FR13_SONY_A
+Hi422FR14_SONY_A
+Hi422FR15_SONY_A
+Hi422FREXT16_SONY_A
+Hi422FREXT17_SONY_A
+Hi422FREXT18_SONY_A
+Hi422FREXT19_SONY_A
