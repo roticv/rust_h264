@@ -19,6 +19,7 @@ This is a Rust project using Cargo:
 - **no_std check:** `cargo test --no-default-features` (the `std` feature is on by default; without it the crate is `#![no_std]` + `alloc`)
 - **Golden corpus digests:** `cargo test --release -- --ignored golden_corpus_digests` (decodes the full 720p/1080p bench corpus; ignored by default because it is slow)
 - **Benchmark:** `cargo run --release --features dev-internals --example bench_decode` (timing, allocation count, and digest per bench stream)
+- **Compare against FFmpeg:** `python3 tools/verify_vs_ffmpeg.py testdata/*.h264` (byte-for-byte; every 4:2:0 test and bench stream should match, only the `unsupported_*` streams fail)
 - **Profile:** `cargo run --release --features profile --example bench_decode -- <iterations>` (pprof flamegraph at `target/profile-1080p-complex.svg`, per-phase timers, top self-time functions; the `profile` feature implies `std` and `dev-internals`)
 
 ## Milestones
@@ -35,19 +36,20 @@ This is a Rust project using Cargo:
 
 ## Code Structure
 
-The decoder logic is split across several files for maintainability:
+The decoder logic is split across several files:
 
-| File | Lines | Content |
-|------|-------|---------|
-| `src/decoder.rs` | ~2,000 | `Decoder` (raw decode order), `OrderedDecoder` (display-order wrapper), `decode_nal`, `decode_slice` MB loop, DPB/frame management |
-| `src/decode_cabac.rs` | ~3,600 | CABAC MB decode: skip detection, mb_type dispatch, residual decode |
-| `src/decode_cavlc.rs` | ~2,070 | CAVLC MB decode: P/B inter, intra, residual decode |
-| `src/slice_context.rs` | ~920 | `SliceContext`/`SliceParams` structs + shared methods (skip, direct, reconstruct) |
-| `src/mv_pred.rs` | ~940 | MV prediction, spatial/temporal direct mode derivation |
-| `src/neighbor.rs` | ~470 | CABAC neighbor context helpers, nC computation, dequant helpers |
-| `src/threading.rs` | ~600 | `ThreadedDecoder`: frame threading with row-level reference sync. Coordinator plans slices (`prepare_slice`) in coded order and inserts each picture into the DPB as an in-progress `DecodedPicture`; workers run `run_slice` with a `RowSync` hook that deblocks (one unit behind decoding, since intra prediction needs unfiltered samples) and publishes final MB rows; output is committed in coded order; reorder buffer mirrors `OrderedDecoder` |
-| `src/picture_sync.rs` | ~170 | `SharedPlane` (single-writer plane, readers see only the published prefix; the only unsafe code for threading) and `RowProgress` (published MB-row count with blocking waits) |
-| `src/simd/` | ~450 | Motion-compensation kernel backends: `scalar.rs` (reference), `neon.rs` (aarch64 default), `x86.rs` (x86_64 default, SSE2 + runtime SSSE3/AVX2/AVX-512), `portable.rs` (`core::simd`, nightly `portable-simd` feature). `mod.rs` selects one at compile time; all must be bit-exact with scalar |
+| File | Content |
+|------|---------|
+| `src/decoder.rs` | `Decoder` (raw decode order), `OrderedDecoder` (display-order wrapper). Slice decoding is split into `prepare_slice` (header, POC, reference lists, weights, geometry; produces a `SlicePlan`) and `run_slice` (PictureState creation/continuation and the MB loop). Finalization helpers: `deblock_picture`, `apply_reference_marking`, `finish_output`. `check_supported` rejects non-8-bit-4:2:0 streams. `RowSync` is the frame-threading hook in the MB loop |
+| `src/decode_cabac.rs` | CABAC MB decode: skip detection, mb_type dispatch, residual decode |
+| `src/decode_cavlc.rs` | CAVLC MB decode: P/B inter, intra, residual decode |
+| `src/slice_context.rs` | `SliceContext`/`SliceParams` structs + shared methods (skip, direct, reconstruct, `finalize_mb_info_range`) |
+| `src/mv_pred.rs` | MV prediction, spatial/temporal direct mode derivation |
+| `src/neighbor.rs` | CABAC neighbor context helpers, nC computation, dequant helpers |
+| `src/dpb.rs` | DPB, reference list construction and modification, reference marking, POC. `DecodedPicture` keeps its planes and motion data private: `luma()`/`chroma()` return published rows, `wait_luma`/`wait_chroma`/`motion()` block until data is final (instant for complete pictures) |
+| `src/threading.rs` | `ThreadedDecoder`: frame threading with row-level reference sync. Coordinator plans slices (`prepare_slice`) in coded order and inserts each picture into the DPB as an in-progress `DecodedPicture`; workers run `run_slice` with a `RowSync` hook that deblocks (one unit behind decoding, since intra prediction needs unfiltered samples) and publishes final MB rows; output is committed in coded order; reorder buffer mirrors `OrderedDecoder` |
+| `src/picture_sync.rs` | `SharedPlane` (single-writer plane, readers see only the published prefix; the only unsafe code for threading) and `RowProgress` (published MB-row count with blocking waits) |
+| `src/simd/` | Motion-compensation kernel backends: `scalar.rs` (reference), `neon.rs` (aarch64 default), `x86.rs` (x86_64 default, SSE2 + runtime SSSE3/AVX2/AVX-512), `portable.rs` (`core::simd`, nightly `portable-simd` feature). `mod.rs` selects one at compile time; all must be bit-exact with scalar |
 
 `SliceContext` bundles ~25 mutable per-MB arrays; `SliceParams` bundles read-only slice-level parameters. The `make_ctx!()` macro in `decoder.rs` constructs a `SliceContext` from local variables at each call site for zero-cost method dispatch.
 
@@ -56,12 +58,13 @@ The decoder logic is split across several files for maintainability:
 The crate exposes a minimal surface area:
 
 - `decoder::Decoder` — low-level streaming decoder; `decode_nal` returns one frame at a time in **decode order**.
-- `decoder::OrderedDecoder` — wraps `Decoder` with a built-in reorder buffer; `decode_nal` returns 0+ frames in **display order** (sorted by `(gop_id, pic_order_cnt)`). Recommended for most users — handles GOP tracking and the IDR-count timing pitfall internally. It is generic as `OrderedDecoder<M = ()>`; `decode_nal_with_meta`/`flush_with_meta` return `(Frame, M)` pairs so callers can carry per-picture metadata such as PTS timestamps through B-frame reordering while existing `decode_nal`/`flush` callers remain unchanged.
+- `decoder::OrderedDecoder` — wraps `Decoder` with a built-in reorder buffer; `decode_nal` returns 0+ frames in **display order** (sorted by `(gop_id, pic_order_cnt)`). Recommended for most users — handles GOP tracking and the IDR-count timing pitfall internally. It is generic as `OrderedDecoder<M = ()>`; `decode_nal_with_meta`/`flush_with_meta` return `(Frame, M)` pairs so callers can carry per-picture metadata such as PTS timestamps through B-frame reordering; `OrderedDecoder<()>` has plain `decode_nal`/`flush`.
 - `threading::ThreadedDecoder` (`std` feature) — same `decode_nal`/`flush` surface as `OrderedDecoder<()>`, decodes pictures on worker threads, output byte-identical to `OrderedDecoder`. Reference reads wait per row: luma/chroma MC (`luma_mc_stride`, `chroma_mc` taking a `ChromaRef`) wait for the rows they read, direct mode waits for the whole co-located picture via `DecodedPicture::motion()`. New reference-plane reads must go through these accessors (`luma()`, `chroma()` return only published rows).
 - `decoder::Frame` — decoded YUV 4:2:0 frame with `y`/`u`/`v` planes, `width`, `height`, `pic_order_cnt`.
 - `nal::parse_annex_b` — parser for start-code delimited bitstreams.
 - `nal::parse_avcc` + `nal::parse_avcc_config` + `nal::AvccConfig` — parser for length-prefixed bitstreams from MP4/MKV containers.
 - `nal::NalUnit`, `nal::NalUnitType` — parsed NAL unit types.
+- `nal::parse_sps_info` + `nal::SpsInfo` — stream metadata (dimensions, profile, chroma format, bit depth, colour description, reorder depth) without decoding; works for unsupported formats too.
 - `error::DecodeError` — `UnexpectedEof`, `InvalidSyntax(&'static str)`, `Unsupported(&'static str)`.
 
 Everything else is `pub(crate)` or behind the `dev-internals` feature flag.
@@ -75,7 +78,7 @@ attached by the first slice of that picture.
 
 ## Status
 
-I-frame, P-frame, and B-frame decoding fully functional with both CAVLC and CABAC. High profile 8x8 transform supported for both CAVLC and CABAC (intra and inter). Multi-reference (ref>1) with ref_pic_list_modification supported. Multi-slice frames fully supported for both CABAC and CAVLC (I, P, and B-frames byte-exact). MBAFF (Macroblock-Adaptive Frame-Field) interlaced content fully supported — both frame-coded and field-coded MB pairs byte-exact including I/P/B slices, CABAC/CAVLC, deblocking, High profile 8x8 DCT, implicit weighted bi-prediction, and field-aware MC/intra prediction with doubled stride. 178 unit tests (including 15 MBAFF-specific byte-exact stream tests), x264 `--preset medium` with and without deblocking (320x240, 60 frames, ref=4, bframes=3), multi-slice streams with up to 4 slices per frame, and 1080p streams (1920x1080, 10 frames, CABAC/CAVLC, with/without deblocking). Also verified byte-exact at 720p (1280x720, 300 frames, bframes=3 ref=4). Explicit weighted prediction for P-slices and B-slices, plus implicit weighted bi-prediction for B-slices. NEON SIMD acceleration on aarch64 for luma half-pel filters (~28% speedup) achieving 67 fps at 1080p.
+Baseline, Main and High profile 8-bit 4:2:0 decoding is complete: I/P/B slices with CAVLC and CABAC, 4x4 and 8x8 transforms with scaling matrices, all partition types, spatial and temporal direct mode, multiple and long-term references with list modification and MMCO, explicit and implicit weighted prediction, multi-slice pictures with per-slice deblocking, and interlaced content (MBAFF and field pictures). Output is byte-identical to FFmpeg on every 4:2:0 test and bench stream (check with `tools/verify_vs_ffmpeg.py`); unit tests pin this with SHA-256 or YUV comparisons against FFmpeg output. Other formats are rejected with `DecodeError::Unsupported`. Motion compensation has NEON and x86 SIMD backends, and `ThreadedDecoder` adds frame threading with row-level reference sync. Current performance numbers live in BENCHMARK.md.
 
 ### Completed
 
@@ -120,16 +123,18 @@ I-frame, P-frame, and B-frame decoding fully functional with both CAVLC and CABA
 - Boundary clipping per spec 8.4.2.2.1
 
 **Decoded Picture Buffer** (`src/dpb.rs`)
-- Reference frame storage with `Rc<DecodedPicture>` sharing
+- Reference picture storage with `Arc<DecodedPicture>` sharing (pictures may still be decoding when inserted by `ThreadedDecoder`)
 - Sliding window marking (spec 8.2.5.3)
 - POC computation for types 0, 1, 2
-- P-slice L0: short-term refs sorted by descending frame_num
+- P-slice L0: short-term refs sorted by descending FrameNumWrap (decoding order, not POC; spec 8.2.4.2.1)
 - B-slice L0: refs sorted by POC (before current descending, after ascending)
 - B-slice L1: refs sorted by POC (after current ascending, before descending)
 - `ref_pic_list_modification` (spec 8.2.4.3) with shift+insert+dedup algorithm,
-  including idc=2 for long-term reference reordering
+  including idc=2 for long-term reference reordering; the named picture is looked up
+  among all short-term references, not just the list being modified
 - Long-term reference support: MMCO ops 1-6 (mark ST/LT unused, assign ST→LT,
-  set max LT index, clear all, assign current as LT), IDR `long_term_reference_flag`
+  set max LT index, clear all, assign current as LT), IDR `long_term_reference_flag`;
+  MMCO PicNums from before a frame_num wrap map back to frame_num modulo MaxFrameNum
 - Long-term refs appended to reference lists after short-term refs (spec 8.2.4.2)
 - Co-located picture MV/ref storage (L0 + L1) for spatial and temporal direct mode
 
@@ -144,7 +149,6 @@ I-frame, P-frame, and B-frame decoding fully functional with both CAVLC and CABA
 - Context state initialization from QP with 1024 contexts (I-slice + 3 P/B variants)
 - Syntax element decoders: mb_type, skip, CBP, pred modes, ref_idx, MVD, sub_mb_type, QP delta
 - Residual coefficient decoder: significance map + coefficient levels with 8-node state machine
-- I4x4 and I16x16 integration: byte-exact output for single-MB, ±1 IDCT tolerance for multi-MB
 - Per-MB neighbor tracking: CBF (luma LEFT[16]/TOP[16] + chroma), CBP (u16 with DC coded flags),
   chroma pred mode, I16x16 flag — all with proper unavailable-intra defaults (0x7CF)
 - P-slice CABAC: P_Skip, P_L0_16x16/16x8/8x16, P_8x8 (all sub-partition types), intra-in-P
@@ -178,7 +182,7 @@ I-frame, P-frame, and B-frame decoding fully functional with both CAVLC and CABA
 - 4x4 inverse integer DCT
 - 8x8 inverse integer DCT (High profile)
 - 4x4 inverse Hadamard (I16x16 luma DC)
-- 2x2 inverse Hadamard (chroma DC)
+- 2x2 inverse Hadamard (chroma DC); 4:2:0 chroma DC dequant floors with no rounding term (spec 8.5.11.2)
 - Dequantization with 4x4 and 8x8 scaling list support (SPS/PPS, fallback to default matrices)
 
 **Deblocking Filter** (`src/deblock.rs`)
@@ -191,7 +195,12 @@ I-frame, P-frame, and B-frame decoding fully functional with both CAVLC and CABA
 - 8x8 transform: internal odd edges (positions 4 and 12 within MB) skipped
   per spec 8.7.2.1 — they fall inside 8x8 transform blocks
 - MBAFF-aware: pair-based MB position, left/above neighbor addressing for MB pairs
-- Applied automatically after slice decode
+- Each MB uses its own slice's settings (`SliceDeblock` by slice ID), including
+  disable_deblocking_filter_idc 2 (no filtering across slice edges); Cr uses
+  second_chroma_qp_index_offset
+- Row stride is the coded width (planes are cropped only on output)
+- Single raster-order pass, so it can run on MB ranges (`filter_mb_range`) for
+  incremental deblocking in `ThreadedDecoder`; applied at picture finalization
 
 **Multi-Slice Frame Support** (`src/decoder.rs`, `src/decode_cabac.rs`, `src/decode_cavlc.rs`)
 - `PictureState` accumulates decoded MBs across multiple slices of the same picture
@@ -234,77 +243,18 @@ I-frame, P-frame, and B-frame decoding fully functional with both CAVLC and CABA
 - `DecodeError` enum with `UnexpectedEof`, `InvalidSyntax`, `Unsupported` variants
 - Prediction functions use graceful fallback instead of panicking
 
-**Test Coverage** (178 tests, all byte-exact against FFmpeg)
-- Intra (CAVLC): single_frame, multi_mb_frame, i4x4_frame, deblock_frame,
-  mixed_i4x4_frame, gradient_48x32, edges (QP=10/35), smooth_80x48,
-  noise_16x16, scaling_test
-- P-slice: p_frame_test, p_skip_heavy, p_multi_frame, p_8x8_test, p_multiref
-- B-slice: b_l0_l1_test, b_bi_test, b_skip_test (spatial direct),
-  b_temporal_test, b_parts_test (16x8/8x16/8x8), b_multi_test, b_hier_test
-  (hierarchical B-frames with ref_pic_list_modification)
-- CABAC: cabac_i4x4_test, cabac_i16x16_test, cabac_mixed_test,
-  cabac_p_test, cabac_p_parts_test (P16x8/8x16/8x8/4x4 sub-partitions),
-  cabac_intra_p_test (I16x16-in-P),
-  cabac_b_test (B_Skip spatial direct),
-  cabac_b_parts_test (B16x16/16x8/8x16/8x8/Direct/Skip with L0/L1/Bi),
-  cabac_intra_b_test (I16x16-in-B), cabac_b_temporal_test (temporal direct),
-  cabac_high_profile (8x8 inter), cabac_deblock_test (deblocking enabled),
-  cabac_i8x8_test (I8x8 intra with chroma),
-  cabac_multiref_test (ref=2 with ref_pic_list_modification)
-- Deblocking: deblock_frame, deblock_b_test (B-frames + deblock),
-  deblock_b_inter_test (B inter + cross-list bS)
-- Weighted prediction: weighted_p_test (CAVLC, 100% weighted P, fading),
-  weighted_b_test (CABAC, implicit weighted B idc=2)
-- High profile: high_profile_test (320x240 CAVLC, 8x8 intra+inter)
-- Real-world: realworld_test (320x240 P-only),
-  realworld_b_test (320x240 with B-frames),
-  preset_medium (320x240, 60 frames, x264 --preset medium, no-deblock),
-  preset_medium_deblock (same with deblocking ON)
-- Multi-slice: ms_cabac_i_test (32x32, 2-slice CABAC I-frame),
-  ms_cabac_i4_test (64x64, 4-slice CABAC I-frame),
-  ms_cavlc_i_test (32x32, 2-slice CAVLC I-frame),
-  ms_cavlc_p_test (64x64, 5-frame 4-slice CAVLC with P-frames),
-  ms_cabac_p_test (64x64, 5-frame 4-slice CABAC with P-frames),
-  ms_cabac_b_test (64x64, 4-frame 4-slice CABAC with B-frames),
-  b_temporal_direct_test (64x64, 4-frame, preset slower temporal direct 8x8 inference),
-  high_p8x8_sub4x4_test (64x64, 6-frame, High profile P_8x8 sub-4x4 + 8x8dct),
-  high_b_slower_test (64x64, 10-frame, High profile preset slower ref=2 B-frames 8x8dct),
-  high_cavlc_b_test (64x64, 10-frame, CAVLC High profile bframes=2 ref=2 8x8dct),
-  ms_deblock_b_cabac_test (64x64, 8-frame, CABAC 4-slice bframes=2 ref=2 deblock),
-  ms_cavlc_b_test (64x64, 8-frame, CAVLC 4-slice bframes=2 ref=2),
-  cavlc_deblock_pb_test (64x64, 8-frame, CAVLC P+B with deblocking),
-  unaligned_100x76_test (100x76, 6-frame, non-16-aligned dimensions),
-  cabac_weighted_p_test (64x64, 8-frame, CABAC 100% weighted P fading),
-  cavlc_i8x8_test (64x64, 3-frame, CAVLC High profile I8x8 intra),
-  high_preset_medium_test (320x240, 30-frame, High profile bframes=3 ref=4 8x8dct no-deblock),
-  high_deblock_medium_test (320x240, 30-frame, High profile bframes=3 ref=4 8x8dct deblock ON),
-  constrained_intra_test (64x64, 8-frame, CABAC constrained_intra_pred_flag=1 bframes=1 ref=2),
-  cabac_b8x8_direct_test (64x64, 8-frame, CABAC B_8x8 with B_Direct_8x8 sub-partitions),
-  jm_ltr_cavlc_test (64x64, 8-frame, JM CAVLC long-term reference),
-  jm_ltr_cabac_test (64x64, 8-frame, JM CABAC long-term reference),
-  jm_weighted_b_explicit_test (64x64, 8-frame, JM CABAC weighted_bipred_idc=1),
-  jm_poc_type1_test (64x64, 6-frame, JM CAVLC pic_order_cnt_type=1),
-  jm_poc_type2_test (64x64, 6-frame, JM CAVLC pic_order_cnt_type=2),
-  jm_ipcm_cavlc_test (32x32, 4-frame, JM CAVLC I_PCM macroblocks QP=0),
-  jm_ipcm_cabac_test (32x32, 4-frame, JM CABAC I_PCM macroblocks QP=0)
-- 1080p (SHA-256 hash comparison): 1080p_test (1920x1080, 10-frame, CABAC bframes=3 ref=2 no-deblock),
-  1080p_deblock_test (same with deblocking ON),
-  1080p_cavlc_test (CAVLC, bframes=3 ref=2 no-deblock)
-- MBAFF: mbaff_cavlc_test (64x64, 6-frame, CAVLC frame-coded pairs),
-  mbaff_p_cavlc_8f_test (64x64, 8-frame, CAVLC P-frames),
-  mbaff_high_cavlc_test (64x64, 6-frame, High profile CAVLC 8x8 transform),
-  mbaff_cabac_i_test (32x32, 1-frame, CABAC I-frame),
-  mbaff_cabac_64_test (64x64, 1-frame, CABAC I-frame),
-  mbaff_cabac_p_test (64x64, 5-frame, CABAC P-frames),
-  mbaff_cabac_b_test (64x64, 8-frame, CABAC bframes=2 ref=2),
-  mbaff_cavlc_b_test (64x64, 8-frame, CAVLC bframes=2 ref=2),
-  mbaff_deblock_cavlc_test (64x64, 8-frame, CAVLC Main profile deblocking),
-  mbaff_deblock_cabac_test (64x64, 8-frame, CABAC Main profile bframes=2 ref=2 deblocking),
-  mbaff_high_deblock_test (64x64, 8-frame, High profile 8x8dct bframes=2 ref=2 deblocking),
-  mbaff_field_i_test (64x64, 3-frame, CAVLC all-field-coded I-only),
-  mbaff_field_p_test (64x64, 4-frame, CAVLC all-field-coded P-frames),
-  mbaff_field_cabac_test (64x64, 4-frame, CABAC all-field-coded Main profile),
-  mbaff_field_high_test (64x64, 4-frame, CAVLC all-field-coded High profile 8x8dct)
+**Test Coverage**
+- Unit tests for each stage (bitstream, CAVLC/CABAC, transforms, intra/inter prediction,
+  deblocking, DPB) plus whole-stream tests that compare decoded output against FFmpeg
+  (YUV or SHA-256) for every stream in `testdata/`: synthetic CAVLC/CABAC clips, x264
+  presets with and without deblocking, High profile, multi-slice, weighted prediction,
+  long-term references and POC types from the JM encoder, MBAFF and field pictures,
+  non-16-aligned sizes, up to 1080p
+- `testdata/unsupported_*.h264`: one tiny stream per rejected format
+- `testdata/fuzz_regressions/`: crash inputs replayed to check they don't panic
+- Frame threading: every test stream decoded serially and at 1, 2 and 4 threads must match
+- Ignored (slow) tests over the bench corpus: golden digests per SIMD backend, and
+  threaded vs serial
 
 ### Not Yet Implemented
 

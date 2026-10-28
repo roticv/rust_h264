@@ -5,6 +5,77 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-10-28
+
+Thanks to petitstrawberry, codepaws and Brandon Hoult, whose forks and pull
+requests contributed several of these changes.
+
+### Added
+- **Field pictures** (`field_pic_flag = 1`, PAFF): top and bottom fields are
+  decoded as separate pictures and interleaved into frames for output.
+- **`threading::ThreadedDecoder`**: frame-threaded decoding with the same
+  `decode_nal`/`flush` surface as `OrderedDecoder` and byte-identical output.
+  Pictures wait only for the reference rows their motion vectors read, so P-only
+  as well as B-frame streams scale (about 1.4-1.8x at 4 threads; see
+  BENCHMARK.md). Requires the `std` feature.
+- **Per-picture metadata through reordering**: `OrderedDecoder<M>` with
+  `decode_nal_with_meta`/`flush_with_meta` returns `(Frame, M)` pairs, so PTS
+  values stay with the right frame through B-frame reordering.
+- **`nal::parse_sps_info` / `nal::SpsInfo`**: dimensions, profile, chroma format,
+  bit depth, colour description and reorder depth from an SPS without decoding.
+- **`no_std` + `alloc` support**: the new default `std` feature can be turned
+  off.
+- **x86-64 SIMD** motion compensation (SSE2, with SSSE3/AVX2/AVX-512 detected at
+  runtime), next to the existing NEON backend; optional `core::simd` backend
+  behind the nightly-only `portable-simd` feature.
+- Cargo features `minifb` (player example), `profile` (pprof and phase timers)
+  and `dev-internals` (internal modules for diagnostics; not a stable API).
+- `tools/verify_vs_ffmpeg.py`: compares decoded output with FFmpeg byte for byte
+  for `.h264` files or any container FFmpeg reads.
+- CI for std and no_std builds, an embedded no_std target, rustfmt and clippy.
+
+### Changed
+- **Unsupported formats are rejected**: monochrome, 4:2:2, 4:4:4, bit depths
+  above 8 and lossless (transform bypass) streams now fail with
+  `DecodeError::Unsupported` on every slice instead of decoding into wrong
+  pictures.
+- `OrderedDecoder` is generic over a metadata type with default `()`; existing
+  `decode_nal`/`flush` callers are unaffected.
+- A new `std` feature is on by default. Builds that already disable default
+  features now get the `no_std` build, without `std::error::Error` for
+  `DecodeError`.
+- Rust 1.79 or newer is required (inline `const` blocks, raw slice pointer
+  `len`).
+
+### Fixed
+- **P-slice reference lists** were ordered by POC; they now follow FrameNumWrap
+  (decoding order), which matters once B-pictures are references (x264
+  B-pyramid, NVENC).
+- **Reference list modification** now finds the named picture among all
+  short-term references, not only the list being modified (x264 `weightp`
+  duplicates references and pushes entries out).
+- **MMCO operations** naming a picture from before frame_num wrapped matched
+  nothing, leaving a stale reference.
+- **Deblocking** used the cropped display width as the row stride, so streams
+  cropped on the right were filtered in the wrong place.
+- **Deblocking** now uses each slice's own settings, implements
+  `disable_deblocking_filter_idc` 2, and uses `second_chroma_qp_index_offset`
+  for Cr.
+- **4:2:0 chroma DC dequantization** added a rounding term the spec does not
+  have; at chroma QP below 6 this was off by one.
+- Field-pair output with mismatched field geometry (found by fuzzing).
+
+  Together these make every 4:2:0 test and benchmark stream byte-identical to
+  FFmpeg, including x264 streams with B-pyramid, `weightp` and sliced threads
+  that previously drifted.
+
+### Performance
+- B-skip and direct macroblocks with direct 8x8 inference derive their motion
+  once per macroblock, with a whole-macroblock motion compensation fast path
+  (+13-18% on B-frame content).
+- CABAC residual decoding no longer allocates (88-97% fewer allocations).
+- Fewer allocations in CAVLC partition decoding and output cropping.
+
 ## [0.4.0] - 2026-04-19
 
 ### Added
