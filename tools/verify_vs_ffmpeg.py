@@ -71,8 +71,9 @@ def rust_decode(path, out):
                        "dump_frames.exe" if os.name == "nt" else "dump_frames")
     r = run([exe, path, out])
     if r.returncode != 0:
-        sys.exit(f"dump_frames failed on {path}:\n{r.stderr}\n{r.stdout}")
-    return r.stderr
+        # A decode error (e.g. an unsupported format) fails this input only.
+        return None, (r.stderr.strip() or r.stdout.strip()).splitlines()[-1:]
+    return r.stderr, None
 
 
 def first_diff(a, b):
@@ -107,7 +108,10 @@ def verify(path):
         ref = os.path.join(td, "ref.yuv")
         ours = os.path.join(td, "ours.yuv")
         ffmpeg_decode(h264, ref)
-        info = rust_decode(h264, ours)
+        info, error = rust_decode(h264, ours)
+        if error is not None:
+            print(f"   FAIL: decoder error: {' '.join(error)}")
+            return False
         if info.strip():
             print(f"   decoder: {info.strip()}")
 

@@ -556,21 +556,30 @@ pub(crate) fn prepare_slice(
         vec![]
     };
 
+    // The coded size comes from the SPS macroblock counts (spec 7.4.2.1.1);
+    // the display size is that minus the cropping, which may remove a
+    // macroblock or more, so it cannot be used to derive the MB counts.
     let width = sps.width();
     let frame_height = sps.height();
-    // Reject absurd dimensions that would cause allocation overflow.
-    // H.264 Level 6.2 max is 8192x4320; allow up to 16384x16384 for headroom.
-    if width == 0 || frame_height == 0 || width > 16384 || frame_height > 16384 {
+    let mb_width = sps.pic_width_in_mbs_minus1.saturating_add(1);
+    let map_units = sps.pic_height_in_map_units_minus1.saturating_add(1);
+    let frame_mb_height = if sps.frame_mbs_only_flag {
+        map_units
+    } else {
+        map_units.saturating_mul(2)
+    };
+    // Reject absurd dimensions that would cause allocation overflow, and
+    // cropping that removes the whole picture (the display size saturates to
+    // 0). H.264 Level 6.2 max is 8192x4320; allow up to 16384x16384.
+    if width == 0 || frame_height == 0 || mb_width > 16384 / 16 || frame_mb_height > 16384 / 16 {
         return Err(DecodeError::InvalidSyntax("SPS dimensions out of range"));
     }
     // For field pictures, each field has half the frame height
-    let height = if is_field_pic {
-        frame_height / 2
+    let (height, mb_height) = if is_field_pic {
+        (frame_height / 2, frame_mb_height / 2)
     } else {
-        frame_height
+        (frame_height, frame_mb_height)
     };
-    let mb_width = width.div_ceil(16);
-    let mb_height = height.div_ceil(16);
     let coded_width = mb_width * 16;
     let coded_height = mb_height * 16;
     let total_mbs = (mb_width * mb_height) as usize;
@@ -2716,6 +2725,20 @@ mod tests {
     }
 
     #[test]
+    fn test_large_crop_right_bottom() {
+        // 128x96 coded, cropped 32 px right and 32 px bottom (two
+        // macroblocks' worth) with h264_metadata: the MB counts must come
+        // from the SPS, not the cropped size. SHA-256 of ffmpeg's decode.
+        decode_and_compare_hash(
+            "large_crop_rb",
+            4,
+            96,
+            64,
+            "bba5410ded9f41488dd4c5cb90bca6bdf1a4be3d7151f32ada5464dcefbf66f7",
+        );
+    }
+
+    #[test]
     fn test_x264_pyramid_weightp_sliced() {
         // 88x128 (cropped from 96 wide), 80 frames of x264 High: ref=5, bframes=3
         // with b-pyramid (reference B-frames), weightp=2 (P-frames list a picture
@@ -3248,6 +3271,13 @@ mod tests {
     #[test]
     fn test_fuzz_regression_poc_type1_mul_overflow() {
         fuzz_decode_avcc("decode_avcc_poc_type1_mul_overflow.bin");
+    }
+
+    /// SPS cropping larger than a macroblock: MB counts were derived from the
+    /// cropped size, so the picture buffer was too small (slice_context.rs).
+    #[test]
+    fn test_fuzz_regression_large_crop_mb_dims() {
+        fuzz_decode_avcc("decode_avcc_large_crop_mb_dims.bin");
     }
 
     /// Motion vector predictor + difference overflowing i16 in CAVLC P_8x8
