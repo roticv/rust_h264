@@ -514,14 +514,9 @@ impl CabacReader<'_> {
         // Chroma DC (cat 3): ctxIdxInc is Min(i / NumC8x8, 2), NumC8x8 = 1
         // for 4:2:0 (4 coefficients) and 2 for 4:2:2 (8); its greater-than-1
         // context stops at 5 + 3 (spec 9.3.3.1.3)
-        let dc_shift = (cat == 3 && max_coeff == 8) as usize;
-        let ctx_inc = |pos: usize| {
-            if cat == 3 {
-                (pos >> dc_shift).min(2)
-            } else {
-                pos
-            }
-        };
+        let dc_shift = (cat == 3 && max_coeff == 8) as u32;
+        let ctx_cap = if cat == 3 { 2 } else { usize::MAX };
+        let ctx_inc = |pos: usize| (pos >> dc_shift).min(ctx_cap);
         let sig_8x8 = if field_coded {
             &SIGNIFICANT_COEFF_FLAG_OFFSET_8X8_FIELD
         } else {

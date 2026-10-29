@@ -178,6 +178,7 @@ impl MbWeights<'_> {
     }
 
     /// Apply weighted uni-prediction in place. No-op if use_weight != 1.
+    #[inline]
     pub(crate) fn apply_uni(
         &self,
         pred: &mut [u8],
@@ -192,6 +193,7 @@ impl MbWeights<'_> {
 
     /// Weighted bi-prediction of this MB (plain average when unweighted).
     #[allow(clippy::too_many_arguments)]
+    #[inline]
     pub(crate) fn apply_bi(
         &self,
         pred_l0: &[u8],

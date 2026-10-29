@@ -1003,7 +1003,6 @@ impl SliceContext<'_> {
             }
 
             // Chroma
-            let chroma = self.decode_chroma_residual_cavlc(reader, mb_idx, cbp_chroma)?;
             for sub_part in sub_parts.iter() {
                 let m0 = if sub_part.pred_l0 {
                     let pic = ref_pic_safe(sp.ref_pic_list_l0, fri(sub_part.ref_idx_l0))
@@ -1029,7 +1028,7 @@ impl SliceContext<'_> {
                     m1,
                 );
             }
-            self.add_chroma_residual(&chroma, cbp_chroma, qp_y, false, mb_x, mb_idx, sp);
+            self.decode_chroma_residual_cavlc(reader, mb_idx, mb_x, cbp_chroma, qp_y, false, sp)?;
 
             self.mb_info[mb_idx] = MbInfo {
                 mb_type: MbType::Inter,
@@ -1373,7 +1372,6 @@ impl SliceContext<'_> {
             }
 
             // Chroma (P-slice inter)
-            let chroma = self.decode_chroma_residual_cavlc(reader, mb_idx, cbp_chroma)?;
             for sub_part in sub_parts.iter().take(sub_part_count) {
                 let pic = sp
                     .ref_pic_list
@@ -1392,7 +1390,7 @@ impl SliceContext<'_> {
                     None,
                 );
             }
-            self.add_chroma_residual(&chroma, cbp_chroma, qp_y, false, mb_x, mb_idx, sp);
+            self.decode_chroma_residual_cavlc(reader, mb_idx, mb_x, cbp_chroma, qp_y, false, sp)?;
 
             self.mb_info[mb_idx] = MbInfo {
                 mb_type: MbType::Inter,
@@ -1761,7 +1759,6 @@ impl SliceContext<'_> {
         // excludes intra neighbors from directional prediction.
 
         // === Reconstruct chroma (shared by I4x4 and I16x16) ===
-        let chroma = self.decode_chroma_residual_cavlc(reader, mb_idx, cbp_chroma)?;
         self.write_chroma_intra_pred(
             mb_x,
             intra_chroma_pred_mode,
@@ -1769,7 +1766,7 @@ impl SliceContext<'_> {
             left_halves,
             above_left_mb_avail,
         );
-        self.add_chroma_residual(&chroma, cbp_chroma, qp_y, true, mb_x, mb_idx, sp);
+        self.decode_chroma_residual_cavlc(reader, mb_idx, mb_x, cbp_chroma, qp_y, true, sp)?;
         Ok(())
     }
 }

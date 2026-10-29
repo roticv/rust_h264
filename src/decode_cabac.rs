@@ -440,9 +440,9 @@ impl SliceContext<'_> {
                         left_halves,
                         above_left_mb_avail,
                     );
-                    let chroma =
-                        self.decode_chroma_residual_cabac(cr, st, mb_idx, cbp_chroma, true);
-                    self.add_chroma_residual(&chroma, cbp_chroma, qp_y, true, mb_x, mb_idx, sp);
+                    self.decode_chroma_residual_cabac(
+                        cr, st, mb_idx, mb_x, cbp_chroma, qp_y, true, sp,
+                    );
                     self.mb_info[mb_idx] = MbInfo {
                         mb_type: MbType::Intra,
                         qp_y,
@@ -597,10 +597,10 @@ impl SliceContext<'_> {
                         left_halves,
                         above_left_mb_avail,
                     );
-                    let chroma =
-                        self.decode_chroma_residual_cabac(cr, st, mb_idx, cbp_chroma, true);
+                    self.decode_chroma_residual_cabac(
+                        cr, st, mb_idx, mb_x, cbp_chroma, qp_y, true, sp,
+                    );
                     self.mb_cbp[mb_idx] |= (cbp_luma as u16) | ((cbp_chroma as u16) << 4);
-                    self.add_chroma_residual(&chroma, cbp_chroma, qp_y, true, mb_x, mb_idx, sp);
 
                     self.mb_info[mb_idx] = MbInfo {
                         mb_type: MbType::Intra,
@@ -1177,8 +1177,9 @@ impl SliceContext<'_> {
                 }
 
                 // Chroma residual
-                let chroma = self.decode_chroma_residual_cabac(cr, st, mb_idx, cbp_chroma, false);
-                self.add_chroma_residual(&chroma, cbp_chroma, qp_y, false, mb_x, mb_idx, sp);
+                self.decode_chroma_residual_cabac(
+                    cr, st, mb_idx, mb_x, cbp_chroma, qp_y, false, sp,
+                );
 
                 self.mb_info[mb_idx] = MbInfo {
                     mb_type: MbType::Inter,
@@ -2497,8 +2498,9 @@ impl SliceContext<'_> {
                 }
 
                 // Chroma residual
-                let chroma = self.decode_chroma_residual_cabac(cr, st, mb_idx, cbp_chroma, false);
-                self.add_chroma_residual(&chroma, cbp_chroma, qp_y, false, mb_x, mb_idx, sp);
+                self.decode_chroma_residual_cabac(
+                    cr, st, mb_idx, mb_x, cbp_chroma, qp_y, false, sp,
+                );
 
                 self.mb_info[mb_idx] = MbInfo {
                     mb_type: MbType::Inter,
@@ -2809,8 +2811,7 @@ impl SliceContext<'_> {
                 left_halves,
                 above_left_mb_avail,
             );
-            let chroma = self.decode_chroma_residual_cabac(cr, st, mb_idx, cbp_chroma, true);
-            self.add_chroma_residual(&chroma, cbp_chroma, qp_y, true, mb_x, mb_idx, sp);
+            self.decode_chroma_residual_cabac(cr, st, mb_idx, mb_x, cbp_chroma, qp_y, true, sp);
 
             self.mb_info[mb_idx] = MbInfo {
                 mb_type: MbType::Intra,
@@ -2964,8 +2965,7 @@ impl SliceContext<'_> {
                 left_halves,
                 above_left_mb_avail_i,
             );
-            let chroma = self.decode_chroma_residual_cabac(cr, st, mb_idx, cbp_chroma, true);
-            self.add_chroma_residual(&chroma, cbp_chroma, qp_y, true, mb_x, mb_idx, sp);
+            self.decode_chroma_residual_cabac(cr, st, mb_idx, mb_x, cbp_chroma, qp_y, true, sp);
 
             self.mb_info[mb_idx] = MbInfo {
                 mb_type: MbType::Intra,
