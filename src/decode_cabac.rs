@@ -333,8 +333,8 @@ impl SliceContext<'_> {
                                     self.nc_luma[mb_idx * 16 + i8x8 * 4 + sub] = tc_per;
                                 }
                                 let mut block_8x8 = [0i32; 64];
-                                for (pos, val) in &coeffs {
-                                    block_8x8[zigzag_8x8_cabac[*pos]] = *val;
+                                for &(pos, val) in coeffs {
+                                    block_8x8[zigzag_8x8_cabac[pos]] = val;
                                 }
                                 dequant_8x8(&mut block_8x8, qp_y, &sp.scaling_list_8x8[0]);
                                 inverse_dct_8x8(&mut block_8x8);
@@ -400,9 +400,9 @@ impl SliceContext<'_> {
                                         self.is_field_coded(mb_idx),
                                     );
                                     self.nc_luma[mb_idx * 16 + blk] = tc;
-                                    for (pos, val) in &coeffs {
-                                        let (r, c) = zigzag_4x4[*pos];
-                                        block_coeffs[r * 4 + c] = *val;
+                                    for &(pos, val) in coeffs {
+                                        let (r, c) = zigzag_4x4[pos];
+                                        block_coeffs[r * 4 + c] = val;
                                     }
                                     dequant_4x4_full(
                                         &mut block_coeffs,
@@ -492,7 +492,7 @@ impl SliceContext<'_> {
                     if cr.decode_coded_block_flag(st, 0, dc_left_nz, dc_top_nz) {
                         let (coeffs, _) =
                             cr.decode_residual_cabac_field(st, 0, 16, self.is_field_coded(mb_idx));
-                        for (p, v) in coeffs {
+                        for &(p, v) in coeffs {
                             luma_dc[p] = v;
                         }
                         self.mb_cbp[mb_idx] |= 0x100;
@@ -534,7 +534,7 @@ impl SliceContext<'_> {
                                     self.is_field_coded(mb_idx),
                                 );
                                 self.nc_luma[mb_idx * 16 + blk] = tc;
-                                for (p, v) in coeffs {
+                                for &(p, v) in coeffs {
                                     luma_ac[blk][p] = v;
                                 }
                             }
@@ -1091,8 +1091,8 @@ impl SliceContext<'_> {
                                 self.nc_luma[mb_idx * 16 + i8x8 * 4 + sub] = tc_per;
                             }
                             let mut block_8x8 = [0i32; 64];
-                            for (pos, val) in &coeffs {
-                                block_8x8[zigzag_8x8_cabac[*pos]] = *val;
+                            for &(pos, val) in coeffs {
+                                block_8x8[zigzag_8x8_cabac[pos]] = val;
                             }
                             dequant_8x8(&mut block_8x8, qp_y, scale_8x8);
                             inverse_dct_8x8(&mut block_8x8);
@@ -1143,9 +1143,9 @@ impl SliceContext<'_> {
                                     );
                                     self.nc_luma[mb_idx * 16 + blk] = tc;
                                     let mut block_coeffs = [0i32; 16];
-                                    for (pos, val) in &coeffs {
-                                        let (r, c) = zigzag_4x4[*pos];
-                                        block_coeffs[r * 4 + c] = *val;
+                                    for &(pos, val) in coeffs {
+                                        let (r, c) = zigzag_4x4[pos];
+                                        block_coeffs[r * 4 + c] = val;
                                     }
                                     dequant_4x4_full(
                                         &mut block_coeffs,
@@ -2415,8 +2415,8 @@ impl SliceContext<'_> {
                                 self.nc_luma[mb_idx * 16 + i8x8 * 4 + sub] = tc_per;
                             }
                             let mut block_8x8 = [0i32; 64];
-                            for (pos, val) in &coeffs {
-                                block_8x8[zigzag_8x8_cabac[*pos]] = *val;
+                            for &(pos, val) in coeffs {
+                                block_8x8[zigzag_8x8_cabac[pos]] = val;
                             }
                             dequant_8x8(&mut block_8x8, qp_y, scale_8x8);
                             inverse_dct_8x8(&mut block_8x8);
@@ -2465,9 +2465,9 @@ impl SliceContext<'_> {
                                     );
                                     self.nc_luma[mb_idx * 16 + blk] = tc;
                                     let mut block_coeffs = [0i32; 16];
-                                    for (pos, val) in &coeffs {
-                                        let (r, c) = zigzag_4x4[*pos];
-                                        block_coeffs[r * 4 + c] = *val;
+                                    for &(pos, val) in coeffs {
+                                        let (r, c) = zigzag_4x4[pos];
+                                        block_coeffs[r * 4 + c] = val;
                                     }
                                     dequant_4x4_full(
                                         &mut block_coeffs,
@@ -2703,8 +2703,8 @@ impl SliceContext<'_> {
                         self.nc_luma[mb_idx * 16 + i8x8 * 4 + sub] = tc_per;
                     }
                     let mut block_8x8 = [0i32; 64];
-                    for (pos, val) in &coeffs {
-                        block_8x8[zigzag_8x8_cabac[*pos]] = *val;
+                    for &(pos, val) in coeffs {
+                        block_8x8[zigzag_8x8_cabac[pos]] = val;
                     }
                     dequant_8x8(&mut block_8x8, qp_y, &sp.scaling_list_8x8[0]);
                     inverse_dct_8x8(&mut block_8x8);
@@ -2772,9 +2772,9 @@ impl SliceContext<'_> {
                                 self.is_field_coded(mb_idx),
                             );
                             self.nc_luma[mb_idx * 16 + blk] = tc;
-                            for (pos, val) in &coeffs {
-                                let (r, c) = zigzag_4x4[*pos];
-                                block_coeffs[r * 4 + c] = *val;
+                            for &(pos, val) in coeffs {
+                                let (r, c) = zigzag_4x4[pos];
+                                block_coeffs[r * 4 + c] = val;
                             }
                             dequant_4x4_full(&mut block_coeffs, qp_y, &sp.scaling_list_4x4[0]);
                         }
@@ -2863,7 +2863,7 @@ impl SliceContext<'_> {
             if cr.decode_coded_block_flag(st, 0, dc_left_nz, dc_top_nz) {
                 let (coeffs, _tc) =
                     cr.decode_residual_cabac_field(st, 0, 16, self.is_field_coded(mb_idx));
-                for (pos, val) in coeffs {
+                for &(pos, val) in coeffs {
                     luma_dc[pos] = val;
                 }
                 self.mb_cbp[mb_idx] |= 0x100; // set luma DC coded flag
@@ -2901,7 +2901,7 @@ impl SliceContext<'_> {
                         let (coeffs, tc) =
                             cr.decode_residual_cabac_field(st, 1, 15, self.is_field_coded(mb_idx));
                         self.nc_luma[mb_idx * 16 + blk] = tc;
-                        for (pos, val) in coeffs {
+                        for &(pos, val) in coeffs {
                             luma_ac_scan[blk][pos] = val;
                         }
                     }

@@ -119,7 +119,7 @@ impl SliceContext<'_> {
             };
             for r in 0..ch {
                 let o = self.lc_offset + (cy + r) * self.lc_stride + cx;
-                dst[o..o + cw].copy_from_slice(&pred[r * cw..(r + 1) * cw]);
+                inter_pred::copy_row(&mut dst[o..o + cw], &pred[r * cw..(r + 1) * cw]);
             }
         }
     }
@@ -295,7 +295,7 @@ impl SliceContext<'_> {
                 .map_or(intra, |m| (self.mb_cbp[m] >> bit) & 1 != 0);
             if cr.decode_coded_block_flag(st, 3, left, top) {
                 let (coeffs, _) = cr.decode_residual_cabac_field(st, 3, blocks, field);
-                for (p, v) in coeffs {
+                for &(p, v) in coeffs {
                     d[p] = v;
                 }
                 self.mb_cbp[mb_idx] |= 1 << bit;
@@ -333,7 +333,7 @@ impl SliceContext<'_> {
                             &mut *self.nc_cr
                         };
                         nc_arr[mb_idx * 8 + blk] = tc;
-                        for (p, v) in coeffs {
+                        for &(p, v) in coeffs {
                             let (r, c) = zigzag[p + 1];
                             block[r * 4 + c] = v;
                         }

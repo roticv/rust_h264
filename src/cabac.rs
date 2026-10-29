@@ -171,6 +171,10 @@ pub struct CabacReader<'a> {
     range: u32,
     data: &'a [u8],
     pos: usize,
+    /// Coefficients of the last residual block decoded, `(scan_pos,
+    /// level)` in scan order: reused so decoding a block neither clears nor
+    /// returns a buffer
+    residual: [(usize, i32); MAX_RESIDUAL_COEFFS],
 }
 
 impl<'a> CabacReader<'a> {
@@ -193,6 +197,7 @@ impl<'a> CabacReader<'a> {
             range: 0x1FE,
             data,
             pos,
+            residual: [(0, 0); MAX_RESIDUAL_COEFFS],
         }
     }
 
@@ -497,7 +502,7 @@ impl CabacReader<'_> {
         cat: usize,
         max_coeff: usize,
         field_coded: bool,
-    ) -> (ResidualCoeffs, u8) {
+    ) -> (&[(usize, i32)], u8) {
         debug_assert!(max_coeff <= MAX_RESIDUAL_COEFFS);
         let sig_base = if field_coded {
             SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET[cat]
@@ -562,10 +567,6 @@ impl CabacReader<'_> {
         // Phase 2: Decode coefficient levels in reverse order (high frequency
         // first), writing each straight into its scan-order slot so no
         // reversal pass is needed.
-        let mut coeffs = ResidualCoeffs {
-            buf: [(0, 0); MAX_RESIDUAL_COEFFS],
-            len: sig_count,
-        };
         let mut node_ctx = 0usize;
 
         for i in (0..sig_count).rev() {
@@ -611,60 +612,15 @@ impl CabacReader<'_> {
 
             // Sign via bypass
             let level = self.get_cabac_bypass_sign(-(abs_level));
-            coeffs.buf[i] = (pos, level);
+            self.residual[i] = (pos, level);
         }
 
-        (coeffs, coeff_count)
+        (&self.residual[..sig_count], coeff_count)
     }
 }
 
 /// Upper bound on coefficients in one residual block (8x8 luma).
 pub const MAX_RESIDUAL_COEFFS: usize = 64;
-
-/// Non-zero coefficients of one residual block as `(scan_pos, level)` in
-/// scan order. Fixed-capacity so decoding a block never touches the heap.
-#[derive(Clone, Copy)]
-pub struct ResidualCoeffs {
-    buf: [(usize, i32); MAX_RESIDUAL_COEFFS],
-    len: usize,
-}
-
-impl ResidualCoeffs {
-    #[inline]
-    pub fn as_slice(&self) -> &[(usize, i32)] {
-        &self.buf[..self.len]
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-impl<'a> IntoIterator for &'a ResidualCoeffs {
-    type Item = &'a (usize, i32);
-    type IntoIter = core::slice::Iter<'a, (usize, i32)>;
-
-    #[inline]
-    fn into_iter(self) -> Self::IntoIter {
-        self.as_slice().iter()
-    }
-}
-
-impl IntoIterator for ResidualCoeffs {
-    type Item = (usize, i32);
-    type IntoIter = core::iter::Take<core::array::IntoIter<(usize, i32), MAX_RESIDUAL_COEFFS>>;
-
-    #[inline]
-    fn into_iter(self) -> Self::IntoIter {
-        self.buf.into_iter().take(self.len)
-    }
-}
 
 // ---- CABAC syntax element decoders (spec 9.3.3) ----
 
@@ -1108,6 +1064,7 @@ mod tests {
                 range: 0x1FE,
                 data: &nal.rbsp,
                 pos: offset + 2,
+                residual: [(0, 0); MAX_RESIDUAL_COEFFS],
             };
 
             let mut low2: u32 = (nal.rbsp[offset] as u32) << 18;
@@ -1119,6 +1076,7 @@ mod tests {
                 range: 0x1FE,
                 data: &nal.rbsp,
                 pos: offset + 3,
+                residual: [(0, 0); MAX_RESIDUAL_COEFFS],
             };
 
             let states = super::init_cabac_states(20, true, 0);

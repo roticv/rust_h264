@@ -37,6 +37,20 @@ fn ref_chroma(plane: &[u8], stride: usize, width: usize, height: usize, x: i32, 
     plane[idx] as i32
 }
 
+/// Copy a short row (a block row of 2 to 16 samples). Block widths are a
+/// few fixed sizes; copying them as fixed-size arrays avoids a `memmove`
+/// call per row.
+#[inline(always)]
+pub(crate) fn copy_row(dst: &mut [u8], src: &[u8]) {
+    match src.len() {
+        16 => dst[..16].copy_from_slice(&src[..16]),
+        8 => dst[..8].copy_from_slice(&src[..8]),
+        4 => dst[..4].copy_from_slice(&src[..4]),
+        2 => dst[..2].copy_from_slice(&src[..2]),
+        n => dst[..n].copy_from_slice(src),
+    }
+}
+
 #[inline]
 pub(crate) fn clip_u8(v: i32) -> u8 {
     v.clamp(0, 255) as u8
@@ -317,7 +331,7 @@ fn luma_mc_inner(
             // Full-pel copy
             for r in 0..h {
                 let src = row(r as isize, 0, w);
-                output[r * w..(r + 1) * w].copy_from_slice(src);
+                copy_row(&mut output[r * w..(r + 1) * w], src);
             }
         }
         (2, 0) => {
@@ -561,8 +575,10 @@ fn chroma_mc_strided(
                 if src_off + block_w > ref_plane.len() {
                     return;
                 }
-                output[row * block_w..(row + 1) * block_w]
-                    .copy_from_slice(&ref_plane[src_off..src_off + block_w]);
+                copy_row(
+                    &mut output[row * block_w..(row + 1) * block_w],
+                    &ref_plane[src_off..src_off + block_w],
+                );
                 src_off += ref_width;
             }
         } else {
