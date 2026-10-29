@@ -548,11 +548,9 @@ impl SliceContext<'_> {
             if use_weight == 1 {
                 wctx.apply_uni(&mut luma_pred, 0, 0, false, 0);
             }
-            for r in 0..16 {
-                for c in 0..16 {
-                    self.frame.y[self.ly_offset + r * self.ly_stride + mb_x + c] =
-                        luma_pred[r * 16 + c];
-                }
+            for (r, row) in luma_pred.as_chunks::<16>().0.iter().enumerate() {
+                let o = self.ly_offset + r * self.ly_stride + mb_x;
+                self.frame.y[o..o + 16].copy_from_slice(row);
             }
             self.predict_chroma_part(
                 mb_idx,
@@ -900,11 +898,9 @@ impl SliceContext<'_> {
             }
             (None, None) => {}
         }
-        for r in 0..16 {
-            for c in 0..16 {
-                self.frame.y[self.ly_offset + r * self.ly_stride + mb_x + c] =
-                    luma_pred[r * 16 + c];
-            }
+        for (r, row) in luma_pred.as_chunks::<16>().0.iter().enumerate() {
+            let o = self.ly_offset + r * self.ly_stride + mb_x;
+            self.frame.y[o..o + 16].copy_from_slice(row);
         }
 
         self.predict_chroma_part(
@@ -948,130 +944,9 @@ impl SliceContext<'_> {
             return;
         }
 
-        // Luma MC: per-4x4-block
-        let mut luma_pred = [0u8; 256];
-        for (blk, &(blk_row, blk_col)) in BLOCK_INDEX_TO_OFFSET.iter().enumerate() {
-            let bx = mb_x + blk_col;
-            let mv0 = self.mv_store_l0[mb_idx * 16 + blk];
-            let mv1 = self.mv_store_l1[mb_idx * 16 + blk];
-            let r0 = self.ref_idx_store_l0[mb_idx * 16 + blk];
-            let r1 = self.ref_idx_store_l1[mb_idx * 16 + blk];
-            let bp0 = r0 >= 0;
-            let bp1 = r1 >= 0;
-            let mut blk_pred = [0u8; 16];
-            if bp0 && bp1 {
-                let mut p0 = [0u8; 16];
-                let mut p1 = [0u8; 16];
-                let Some(ref_l0) = ref_pic_safe(ref_pic_list_l0, self.frame_ref_idx(mb_idx, r0))
-                else {
-                    return;
-                };
-                let Some(ref_l1) = ref_pic_safe(ref_pic_list_l1, self.frame_ref_idx(mb_idx, r1))
-                else {
-                    return;
-                };
-                let (
-                    mc_y_l0,
-                    ref_stride_l0,
-                    ref_y_off_l0,
-                    _mc_cy_l0,
-                    _c_ref_stride_l0,
-                    _c_ref_off_l0,
-                ) = self.mc_params(mb_idx, mb_y, ref_l0.width as usize, r0);
-                inter_pred::luma_mc_stride(
-                    ref_l0,
-                    bx as i32,
-                    mc_y_l0 + blk_row as i32,
-                    mv0[0] as i32,
-                    mv0[1] as i32,
-                    4,
-                    4,
-                    &mut p0,
-                    ref_stride_l0,
-                    ref_y_off_l0,
-                );
-                let (
-                    mc_y_l1,
-                    ref_stride_l1,
-                    ref_y_off_l1,
-                    _mc_cy_l1,
-                    _c_ref_stride_l1,
-                    _c_ref_off_l1,
-                ) = self.mc_params(mb_idx, mb_y, ref_l1.width as usize, r1);
-                inter_pred::luma_mc_stride(
-                    ref_l1,
-                    bx as i32,
-                    mc_y_l1 + blk_row as i32,
-                    mv1[0] as i32,
-                    mv1[1] as i32,
-                    4,
-                    4,
-                    &mut p1,
-                    ref_stride_l1,
-                    ref_y_off_l1,
-                );
-                wctx.apply_bi(&p0, &p1, &mut blk_pred, r0 as usize, r1 as usize, false, 0);
-            } else if bp0 {
-                let Some(ref_pic) = ref_pic_safe(ref_pic_list_l0, self.frame_ref_idx(mb_idx, r0))
-                else {
-                    return;
-                };
-                let (mc_y, ref_stride, ref_y_off, _mc_cy, _c_ref_stride, _c_ref_off) =
-                    self.mc_params(mb_idx, mb_y, ref_pic.width as usize, r0);
-                inter_pred::luma_mc_stride(
-                    ref_pic,
-                    bx as i32,
-                    mc_y + blk_row as i32,
-                    mv0[0] as i32,
-                    mv0[1] as i32,
-                    4,
-                    4,
-                    &mut blk_pred,
-                    ref_stride,
-                    ref_y_off,
-                );
-                if use_weight == 1 {
-                    wctx.apply_uni(&mut blk_pred, 0, r0 as usize, false, 0);
-                }
-            } else if bp1 {
-                let Some(ref_pic) = ref_pic_safe(ref_pic_list_l1, self.frame_ref_idx(mb_idx, r1))
-                else {
-                    return;
-                };
-                let (mc_y, ref_stride, ref_y_off, _mc_cy, _c_ref_stride, _c_ref_off) =
-                    self.mc_params(mb_idx, mb_y, ref_pic.width as usize, r1);
-                inter_pred::luma_mc_stride(
-                    ref_pic,
-                    bx as i32,
-                    mc_y + blk_row as i32,
-                    mv1[0] as i32,
-                    mv1[1] as i32,
-                    4,
-                    4,
-                    &mut blk_pred,
-                    ref_stride,
-                    ref_y_off,
-                );
-                if use_weight == 1 {
-                    wctx.apply_uni(&mut blk_pred, 1, r1 as usize, false, 0);
-                }
-            }
-            for r in 0..4 {
-                for c in 0..4 {
-                    luma_pred[(blk_row + r) * 16 + blk_col + c] = blk_pred[r * 4 + c];
-                }
-            }
-        }
-        for r in 0..16 {
-            for c in 0..16 {
-                self.frame.y[self.ly_offset + r * self.ly_stride + mb_x + c] =
-                    luma_pred[r * 16 + c];
-            }
-        }
-
-        // Chroma: one partition per 8x8 whose four 4x4 luma blocks share
-        // motion, else one per luma 4x4 (direct without
-        // direct_8x8_inference can give each 4x4 its own motion).
+        // Prediction partitions: one per 8x8 whose four 4x4 blocks share
+        // motion (always, with direct_8x8_inference), else one per 4x4
+        // (direct without it can give each 4x4 its own motion).
         // (luma block, luma rectangle)
         let mut cparts = [(0usize, (0usize, 0usize, 0usize, 0usize)); 16];
         let mut n_cparts = 0;
@@ -1098,6 +973,72 @@ impl SliceContext<'_> {
                 }
             }
         }
+        // Luma MC per partition, straight into the frame
+        for &(blk, (px, py, pw, ph)) in &cparts[..n_cparts] {
+            let i = mb_idx * 16 + blk;
+            let (mv0, mv1) = (self.mv_store_l0[i], self.mv_store_l1[i]);
+            let (r0, r1) = (self.ref_idx_store_l0[i], self.ref_idx_store_l1[i]);
+            let n = pw * ph;
+            let mut pred = [0u8; 64];
+            let mc =
+                |ctx: &Self, list: &[Arc<DecodedPicture>], r: i8, mv: [i16; 2], out: &mut [u8]| {
+                    let Some(pic) = ref_pic_safe(list, ctx.frame_ref_idx(mb_idx, r)) else {
+                        return false;
+                    };
+                    let (mc_y, ref_stride, ref_y_off, _, _, _) =
+                        ctx.mc_params(mb_idx, mb_y, pic.width as usize, r);
+                    inter_pred::luma_mc_stride(
+                        pic,
+                        (mb_x + px) as i32,
+                        mc_y + py as i32,
+                        mv[0] as i32,
+                        mv[1] as i32,
+                        pw,
+                        ph,
+                        out,
+                        ref_stride,
+                        ref_y_off,
+                    );
+                    true
+                };
+            if r0 >= 0 && r1 >= 0 {
+                let mut p0 = [0u8; 64];
+                let mut p1 = [0u8; 64];
+                if !mc(self, ref_pic_list_l0, r0, mv0, &mut p0[..n])
+                    || !mc(self, ref_pic_list_l1, r1, mv1, &mut p1[..n])
+                {
+                    return;
+                }
+                wctx.apply_bi(
+                    &p0[..n],
+                    &p1[..n],
+                    &mut pred[..n],
+                    r0 as usize,
+                    r1 as usize,
+                    false,
+                    0,
+                );
+            } else if r0 >= 0 {
+                if !mc(self, ref_pic_list_l0, r0, mv0, &mut pred[..n]) {
+                    return;
+                }
+                if use_weight == 1 {
+                    wctx.apply_uni(&mut pred[..n], 0, r0 as usize, false, 0);
+                }
+            } else if r1 >= 0 {
+                if !mc(self, ref_pic_list_l1, r1, mv1, &mut pred[..n]) {
+                    return;
+                }
+                if use_weight == 1 {
+                    wctx.apply_uni(&mut pred[..n], 1, r1 as usize, false, 0);
+                }
+            }
+            for r in 0..ph {
+                let o = self.ly_offset + (py + r) * self.ly_stride + mb_x + px;
+                inter_pred::copy_row(&mut self.frame.y[o..o + pw], &pred[r * pw..(r + 1) * pw]);
+            }
+        }
+
         for &(luma_blk, rect) in &cparts[..n_cparts] {
             let i = mb_idx * 16 + luma_blk;
             let (r0, r1) = (self.ref_idx_store_l0[i], self.ref_idx_store_l1[i]);
