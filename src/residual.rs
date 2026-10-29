@@ -521,6 +521,19 @@ pub fn map_cbp(code: usize, intra: bool, monochrome: bool) -> Option<u8> {
 
 /// Dequantize a full 4x4 block (including DC at position [0][0]) in raster order.
 /// `scale` is the scaling matrix in scan order; mapped to raster via ZIGZAG_4X4.
+/// Zigzag scan index of each raster position of a 4x4 block (the inverse
+/// of `ZIGZAG_4X4`), for looking up scaling lists.
+pub(crate) const RASTER_TO_ZIGZAG_4X4: [u8; 16] = {
+    let mut t = [0u8; 16];
+    let mut i = 0;
+    while i < 16 {
+        let (r, c) = ZIGZAG_4X4[i];
+        t[r * 4 + c] = i as u8;
+        i += 1;
+    }
+    t
+};
+
 pub fn dequant_4x4_full(block: &mut [i32; 16], qp: i32, scale: &[u8; 16]) {
     let qp_per = qp / 6;
     let qp_rem = (qp % 6) as usize;
@@ -530,12 +543,8 @@ pub fn dequant_4x4_full(block: &mut [i32; 16], qp: i32, scale: &[u8; 16]) {
             let idx = r * 4 + c;
             if block[idx] != 0 {
                 let pc = position_category(r, c);
-                // Find the scan-order index for this raster position to look up the scale
-                let scan_idx = ZIGZAG_4X4
-                    .iter()
-                    .position(|&(zr, zc)| zr == r && zc == c)
-                    .unwrap();
-                let v = LEVEL_SCALE[qp_rem][pc] * scale[scan_idx] as i32;
+                // Scaling lists are in (frame) zigzag order
+                let v = LEVEL_SCALE[qp_rem][pc] * scale[RASTER_TO_ZIGZAG_4X4[idx] as usize] as i32;
                 if qp_per >= 4 {
                     block[idx] = block[idx].wrapping_mul(v).wrapping_shl((qp_per - 4) as u32);
                 } else {

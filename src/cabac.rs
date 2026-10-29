@@ -157,12 +157,20 @@ static MLPS_STATE: [u8; 256] = [
 
 #[inline]
 fn norm_shift(range: u32) -> u32 {
-    NORM_SHIFT[range as usize] as u32
+    // Shifts that bring range (1..=511) back to 256..=511: NORM_SHIFT as
+    // one count-leading-zeros, with no table load or bounds check
+    debug_assert_eq!(
+        range.leading_zeros().saturating_sub(23),
+        NORM_SHIFT[range as usize & 511] as u32
+    );
+    range.leading_zeros().saturating_sub(23)
 }
 
 #[inline]
 fn lps_range_lookup(range: u32, state: u8) -> u32 {
-    LPS_RANGE[2 * (range & 0xC0) as usize + state as usize] as u32
+    // States are 0..=127, so the index is below 512 (the mask lets the
+    // compiler drop the bounds check)
+    LPS_RANGE[2 * (range & 0xC0) as usize + (state & 0x7F) as usize] as u32
 }
 
 /// CABAC binary arithmetic decoder context.
@@ -296,7 +304,7 @@ impl<'a> CabacReader<'a> {
             .wrapping_add(range_lps.wrapping_sub(self.range) & lps_mask);
 
         let s = (s as i32) ^ (lps_mask as i32);
-        *state = MLPS_STATE[(128 + s) as usize];
+        *state = MLPS_STATE[(128 + s) as usize & 0xFF];
         let bit = (s & 1) as u32;
 
         // Renormalization
@@ -448,31 +456,61 @@ const COEFF_ABS_LEVEL_M1_OFFSET: [usize; 6] = [
 
 /// Per-position context offset for significant_coeff_flag in 8x8 blocks (frame mode).
 #[rustfmt::skip]
-const SIGNIFICANT_COEFF_FLAG_OFFSET_8X8: [u8; 63] = [
+const SIGNIFICANT_COEFF_FLAG_OFFSET_8X8: [u8; 64] = [
     0, 1, 2, 3, 4, 5, 5, 4, 4, 3, 3, 4, 4, 4, 5, 5,
     4, 4, 4, 4, 3, 3, 6, 7, 7, 7, 8, 9,10, 9, 8, 7,
     7, 6,11,12,13,11, 6, 7, 8, 9,14,10, 9, 8, 6,11,
-   12,13,11, 6, 9,14,10, 9,11,12,13,11,14,10,12,
+   12,13,11, 6, 9,14,10, 9,11,12,13,11,14,10,12, 0,
 ];
 
 /// Per-position context offset for significant_coeff_flag in 8x8 blocks of
 /// field-coded macroblocks (spec Table 9-43, field column).
 #[rustfmt::skip]
-const SIGNIFICANT_COEFF_FLAG_OFFSET_8X8_FIELD: [u8; 63] = [
+const SIGNIFICANT_COEFF_FLAG_OFFSET_8X8_FIELD: [u8; 64] = [
     0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 7, 7, 7, 8, 4, 5,
     6, 9,10,10, 8,11,12,11, 9, 9,10,10, 8,11,12,11,
     9, 9,10,10, 8,11,12,11, 9, 9,10,10, 8,13,13, 9,
-    9,10,10, 8,13,13, 9, 9,10,10,14,14,14,14,14,
+    9,10,10, 8,13,13, 9, 9,10,10,14,14,14,14,14, 0,
 ];
 
 /// Per-position context offset for last_significant_coeff_flag in 8x8 blocks.
 #[rustfmt::skip]
-const LAST_COEFF_FLAG_OFFSET_8X8: [u8; 63] = [
+const LAST_COEFF_FLAG_OFFSET_8X8: [u8; 64] = [
     0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
     2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
     3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4,
-    5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8,
+    5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 0,
 ];
+
+/// ctxIdxInc of significant/last_significant_coeff_flag by scan position
+/// for 4x4 blocks: the position itself.
+const CTX_INC_POS: [u8; 64] = {
+    let mut t = [0u8; 64];
+    let mut i = 0;
+    while i < 64 {
+        t[i] = i as u8;
+        i += 1;
+    }
+    t
+};
+
+/// ctxIdxInc for 4:2:0 chroma DC: Min(i, 2).
+const CTX_INC_DC_420: [u8; 64] = {
+    let mut t = [2u8; 64];
+    t[0] = 0;
+    t[1] = 1;
+    t
+};
+
+/// ctxIdxInc for 4:2:2 chroma DC: Min(i / 2, 2).
+const CTX_INC_DC_422: [u8; 64] = {
+    let mut t = [2u8; 64];
+    t[0] = 0;
+    t[1] = 0;
+    t[2] = 1;
+    t[3] = 1;
+    t
+};
 
 /// Node context to CABAC context mapping for coeff_abs_level == 1.
 const COEFF_ABS_LEVEL1_CTX: [u8; 8] = [1, 2, 3, 4, 0, 0, 0, 0];
@@ -515,17 +553,23 @@ impl CabacReader<'_> {
             LAST_COEFF_FLAG_OFFSET[cat]
         };
         let abs_base = COEFF_ABS_LEVEL_M1_OFFSET[cat];
-        let is_8x8 = cat == 5;
-        // Chroma DC (cat 3): ctxIdxInc is Min(i / NumC8x8, 2), NumC8x8 = 1
-        // for 4:2:0 (4 coefficients) and 2 for 4:2:2 (8); its greater-than-1
-        // context stops at 5 + 3 (spec 9.3.3.1.3)
-        let dc_shift = (cat == 3 && max_coeff == 8) as u32;
-        let ctx_cap = if cat == 3 { 2 } else { usize::MAX };
-        let ctx_inc = |pos: usize| (pos >> dc_shift).min(ctx_cap);
-        let sig_8x8 = if field_coded {
-            &SIGNIFICANT_COEFF_FLAG_OFFSET_8X8_FIELD
-        } else {
-            &SIGNIFICANT_COEFF_FLAG_OFFSET_8X8
+        // ctxIdxInc of the significance map by scan position: per-position
+        // tables for 8x8 (cat 5); for chroma DC (cat 3) Min(i / NumC8x8, 2),
+        // NumC8x8 = 1 for 4:2:0 (4 coefficients) and 2 for 4:2:2 (8), whose
+        // greater-than-1 context also stops at 5 + 3 (spec 9.3.3.1.3); else
+        // the position
+        let (sig_inc, last_inc) = match (cat, max_coeff) {
+            (5, _) if field_coded => (
+                &SIGNIFICANT_COEFF_FLAG_OFFSET_8X8_FIELD,
+                &LAST_COEFF_FLAG_OFFSET_8X8,
+            ),
+            (5, _) => (
+                &SIGNIFICANT_COEFF_FLAG_OFFSET_8X8,
+                &LAST_COEFF_FLAG_OFFSET_8X8,
+            ),
+            (3, 8) => (&CTX_INC_DC_422, &CTX_INC_DC_422),
+            (3, _) => (&CTX_INC_DC_420, &CTX_INC_DC_420),
+            _ => (&CTX_INC_POS, &CTX_INC_POS),
         };
 
         // Phase 1: Decode significance map. Positions are bounded by
@@ -535,22 +579,13 @@ impl CabacReader<'_> {
         let mut found_last = false;
 
         for pos in 0..max_coeff - 1 {
-            // For 8x8 blocks, use per-position context offsets
-            let sig_ctx = if is_8x8 {
-                sig_base + sig_8x8[pos] as usize
-            } else {
-                sig_base + ctx_inc(pos)
-            };
-            let sig = self.get_cabac(&mut state[sig_ctx]);
+            let sig_ctx = sig_base + sig_inc[pos & 63] as usize;
+            let sig = self.get_cabac(&mut state[sig_ctx & 1023]);
             if sig != 0 {
                 sig_positions[sig_count] = pos as u8;
                 sig_count += 1;
-                let last_ctx = if is_8x8 {
-                    last_base + LAST_COEFF_FLAG_OFFSET_8X8[pos] as usize
-                } else {
-                    last_base + ctx_inc(pos)
-                };
-                let last = self.get_cabac(&mut state[last_ctx]);
+                let last_ctx = last_base + last_inc[pos & 63] as usize;
+                let last = self.get_cabac(&mut state[last_ctx & 1023]);
                 if last != 0 {
                     found_last = true;
                     break;
@@ -574,7 +609,7 @@ impl CabacReader<'_> {
             // Decode |level| - 1
             let level1_ctx = abs_base + COEFF_ABS_LEVEL1_CTX[node_ctx] as usize;
 
-            let abs_level = if self.get_cabac(&mut state[level1_ctx]) == 0 {
+            let abs_level = if self.get_cabac(&mut state[level1_ctx & 1023]) == 0 {
                 // |level| == 1
                 node_ctx = LEVEL_TRANSITION_1[node_ctx] as usize;
                 1i32
@@ -589,7 +624,7 @@ impl CabacReader<'_> {
                 node_ctx = LEVEL_TRANSITION_GT1[node_ctx] as usize;
 
                 let mut abs_val = 2u32;
-                while abs_val < 15 && self.get_cabac(&mut state[gt1_ctx]) != 0 {
+                while abs_val < 15 && self.get_cabac(&mut state[gt1_ctx & 1023]) != 0 {
                     abs_val += 1;
                 }
 

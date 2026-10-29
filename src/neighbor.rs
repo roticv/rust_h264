@@ -935,7 +935,7 @@ pub(crate) fn compute_nc(
 
 /// Dequantize AC coefficients in a 4x4 block in raster order (skip DC at [0][0]).
 pub(crate) fn dequant_4x4_ac_raster(block: &mut [i32; 16], qp: i32, scale: &[u8; 16]) {
-    use crate::residual::ZIGZAG_4X4;
+    use crate::residual::RASTER_TO_ZIGZAG_4X4;
 
     let qp_per = qp / 6;
     let qp_rem = (qp % 6) as usize;
@@ -957,11 +957,8 @@ pub(crate) fn dequant_4x4_ac_raster(block: &mut [i32; 16], qp: i32, scale: &[u8;
             let idx = r * 4 + c;
             if block[idx] != 0 {
                 let pc = (r & 1) + (c & 1);
-                let scan_idx = ZIGZAG_4X4
-                    .iter()
-                    .position(|&(zr, zc)| zr == r && zc == c)
-                    .unwrap();
-                let v = LEVEL_SCALE[qp_rem][pc] * scale[scan_idx] as i32;
+                // Scaling lists are in (frame) zigzag order
+                let v = LEVEL_SCALE[qp_rem][pc] * scale[RASTER_TO_ZIGZAG_4X4[idx] as usize] as i32;
                 if qp_per >= 4 {
                     block[idx] = block[idx].wrapping_mul(v).wrapping_shl((qp_per - 4) as u32);
                 } else {
