@@ -10,8 +10,9 @@ a bitstream copy, so both decoders see identical Annex-B input — the
 intended check for real content such as PS5 cutscenes pulled from game
 .mp4 files.
 
-Both sides decode to raw YUV420P in display order:
-  - reference: ffmpeg -pix_fmt yuv420p -f rawvideo
+Both sides decode to raw planar YUV in display order, 4:2:2 for 4:2:2
+streams and 4:2:0 otherwise (monochrome included):
+  - reference: ffmpeg -pix_fmt yuv420p (or yuv422p) -f rawvideo
   - rust_h264: cargo run --release --example dump_frames
 
 The two files are compared byte-wise; on mismatch the first differing
@@ -52,10 +53,19 @@ def extract_h264(path, out):
         sys.exit(f"ffmpeg extraction failed on {path}:\n{r.stderr}")
 
 
+def output_pix_fmt(path):
+    """yuv422p for 4:2:2 streams, else yuv420p (what rust_h264 outputs)."""
+    r = run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=pix_fmt", "-of", "csv=p=0", path,
+    ])
+    return "yuv422p" if r.stdout.strip().startswith("yuv422p") else "yuv420p"
+
+
 def ffmpeg_decode(path, out):
     r = run([
         "ffmpeg", "-y", "-loglevel", "error", "-i", path,
-        "-pix_fmt", "yuv420p", "-f", "rawvideo", out,
+        "-pix_fmt", output_pix_fmt(path), "-f", "rawvideo", out,
     ])
     if r.returncode != 0:
         sys.exit(f"ffmpeg decode failed on {path}:\n{r.stderr}")

@@ -279,6 +279,7 @@ impl ThreadedDecoder {
             } else {
                 PictureStructure::Frame
             },
+            chroma_422: first.sps.chroma_format_idc == 2,
         };
         let (pic, writer) = DecodedPicture::new_in_progress(meta);
         apply_reference_marking(
@@ -565,6 +566,7 @@ mod tests {
             mb_width: 2,
             is_intra: false,
             structure: PictureStructure::Frame,
+            chroma_422: false,
         };
         let (pic, mut writer) = DecodedPicture::new_in_progress(meta);
         assert!(pic.luma().is_empty());
@@ -598,7 +600,6 @@ mod tests {
     #[test]
     fn threaded_rejects_unsupported_formats() {
         for name in [
-            "unsupported_422",
             "unsupported_444",
             "unsupported_420_10bit",
             "unsupported_lossless",

@@ -429,31 +429,6 @@ fn mbaff_luma_neighbor_at(
     ))
 }
 
-/// MBAFF 4:2:0 chroma neighbour block (left or above) of chroma 4x4 block
-/// `blk` (0..4, raster order), as `(mb, blk)`, or `None` if unavailable.
-#[inline]
-fn mbaff_chroma_neighbor_blk(
-    mb_idx: usize,
-    mb_width: usize,
-    mb_field_decoding: &[bool],
-    blk: usize,
-    is_left: bool,
-    mb_slice_id: &[u16],
-    cur_slice_id: u16,
-) -> Option<(usize, usize)> {
-    let (row, col) = ((blk / 2) * 4, (blk % 2) * 4);
-    let (xn, yn) = if is_left {
-        (col as i32 - 1, row as i32)
-    } else {
-        (col as i32, row as i32 - 1)
-    };
-    let (mb_n, xw, yw) = mbaff_neighbor_loc(mb_idx, mb_width, mb_field_decoding, xn, yn, 8, 8)?;
-    if mb_slice_id[mb_n] != cur_slice_id {
-        return None;
-    }
-    Some((mb_n, (yw / 4) * 2 + xw / 4))
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cabac_neighbor_nz_luma(
     nc_luma: &[u8],
@@ -534,7 +509,62 @@ pub(crate) fn cabac_neighbor_nz_luma(
     }
 }
 
-/// CABAC coded_block_flag neighbor lookup for chroma 4x4 blocks (4 blocks per MB).
+/// The chroma 4x4 block left of (`is_left`) or above block `blk` of
+/// `mb_idx`, as `(mb, blk)`, or `None` if unavailable (outside the picture,
+/// not decoded yet, or in another slice). Chroma blocks are numbered in
+/// raster order, two per row, over `rows` rows: 2 for 4:2:0, 4 for 4:2:2.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn chroma_neighbor_blk(
+    mb_idx: usize,
+    mb_width: usize,
+    blk: usize,
+    is_left: bool,
+    rows: usize,
+    mb_slice_id: &[u16],
+    cur_slice_id: u16,
+    mbaff: bool,
+    mb_field_decoding: &[bool],
+) -> Option<(usize, usize)> {
+    let (row, col) = (blk / 2, blk % 2);
+    if is_left && col == 1 {
+        return Some((mb_idx, blk - 1));
+    }
+    if !is_left && row > 0 {
+        return Some((mb_idx, blk - 2));
+    }
+    let (mb_n, blk_n) = if mbaff {
+        let (xn, yn) = if is_left {
+            (-1, (row * 4) as i32)
+        } else {
+            ((col * 4) as i32, -1)
+        };
+        let (mb_n, xw, yw) = mbaff_neighbor_loc(
+            mb_idx,
+            mb_width,
+            mb_field_decoding,
+            xn,
+            yn,
+            8,
+            4 * rows as i32,
+        )?;
+        (mb_n, (yw / 4) * 2 + xw / 4)
+    } else if is_left {
+        if mb_idx.is_multiple_of(mb_width) {
+            return None;
+        }
+        (mb_idx - 1, row * 2 + 1)
+    } else {
+        if mb_idx < mb_width {
+            return None;
+        }
+        (mb_idx - mb_width, (rows - 1) * 2 + col)
+    };
+    (mb_slice_id[mb_n] == cur_slice_id).then_some((mb_n, blk_n))
+}
+
+/// CABAC coded_block_flag condition of a chroma AC block's neighbour:
+/// whether it has coefficients (`nc_chroma`, 8 entries per MB), or for an
+/// unavailable neighbour whether the current MB is intra.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cabac_neighbor_nz_chroma(
     nc_chroma: &[u8],
@@ -543,87 +573,60 @@ pub(crate) fn cabac_neighbor_nz_chroma(
     blk: usize,
     is_left: bool,
     is_intra: bool,
+    rows: usize,
     mb_slice_id: &[u16],
     cur_slice_id: u16,
     mbaff: bool,
-    _mb_field_decoding: &[bool],
+    mb_field_decoding: &[bool],
 ) -> bool {
-    // Chroma block layout: 0=(0,0), 1=(0,4), 2=(4,0), 3=(4,4)
-    // Left neighbors: blk0→left_mb blk1, blk1→blk0, blk2→left_mb blk3, blk3→blk2
-    // Top neighbors: blk0→top_mb blk2, blk1→top_mb blk3, blk2→blk0, blk3→blk1
-    let (same_mb_neighbor, cross_mb_blk) = if is_left {
-        match blk {
-            0 => (None, Some(1)),
-            1 => (Some(0), None),
-            2 => (None, Some(3)),
-            3 => (Some(2), None),
-            _ => (None, None),
-        }
-    } else {
-        match blk {
-            0 => (None, Some(2)),
-            1 => (None, Some(3)),
-            2 => (Some(0), None),
-            3 => (Some(1), None),
-            _ => (None, None),
-        }
-    };
+    match chroma_neighbor_blk(
+        mb_idx,
+        mb_width,
+        blk,
+        is_left,
+        rows,
+        mb_slice_id,
+        cur_slice_id,
+        mbaff,
+        mb_field_decoding,
+    ) {
+        Some((mb_n, blk_n)) => nc_chroma[mb_n * 8 + blk_n] > 0,
+        None => is_intra,
+    }
+}
 
-    if let Some(nb) = same_mb_neighbor {
-        nc_chroma[mb_idx * 4 + nb] > 0
-    } else if mbaff && cross_mb_blk.is_some() {
-        match mbaff_chroma_neighbor_blk(
+/// CAVLC nC of chroma AC block `blk` (spec 9.2.1) from its neighbours'
+/// total_coeff (`nc_chroma`, 8 entries per MB).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_nc_chroma(
+    nc_chroma: &[u8],
+    mb_idx: usize,
+    mb_width: usize,
+    blk: usize,
+    rows: usize,
+    mb_slice_id: &[u16],
+    cur_slice_id: u16,
+    mbaff: bool,
+    mb_field_decoding: &[bool],
+) -> i32 {
+    let n = |is_left: bool| {
+        chroma_neighbor_blk(
             mb_idx,
             mb_width,
-            _mb_field_decoding,
             blk,
             is_left,
+            rows,
             mb_slice_id,
             cur_slice_id,
-        ) {
-            Some((mb_n, blk_n)) => nc_chroma[mb_n * 4 + blk_n] > 0,
-            None => is_intra,
-        }
-    } else if let Some(nb) = cross_mb_blk {
-        let neighbor_mb = if is_left {
-            let has_left = if !mbaff {
-                mb_idx.checked_rem(mb_width) != Some(0)
-            } else {
-                !(mb_idx / 2).is_multiple_of(mb_width)
-            };
-            if !has_left {
-                return is_intra;
-            }
-            if !mbaff {
-                mb_idx - 1
-            } else {
-                (mb_idx / 2 - 1) * 2 + (mb_idx % 2)
-            }
-        } else {
-            let has_above = if !mbaff {
-                mb_idx >= mb_width
-            } else if _mb_field_decoding[mb_idx / 2] {
-                (mb_idx / 2) >= mb_width
-            } else {
-                !mb_idx.is_multiple_of(2) || (mb_idx / 2) >= mb_width
-            };
-            if !has_above {
-                return is_intra;
-            }
-            if !mbaff {
-                mb_idx - mb_width
-            } else if !mb_idx.is_multiple_of(2) && !_mb_field_decoding[mb_idx / 2] {
-                mb_idx - 1 // Frame-coded: top of same pair
-            } else {
-                ((mb_idx / 2) - mb_width) * 2 + 1
-            }
-        };
-        if mb_slice_id[neighbor_mb] != cur_slice_id {
-            return is_intra;
-        }
-        nc_chroma[neighbor_mb * 4 + nb] > 0
-    } else {
-        false
+            mbaff,
+            mb_field_decoding,
+        )
+        .map(|(mb_n, blk_n)| nc_chroma[mb_n * 8 + blk_n])
+    };
+    match (n(true), n(false)) {
+        (Some(a), Some(b)) => (a as i32 + b as i32 + 1) >> 1,
+        (Some(v), None) | (None, Some(v)) => v as i32,
+        (None, None) => 0,
     }
 }
 
@@ -829,37 +832,19 @@ pub(crate) fn compute_nc(
             _ => unreachable!(),
         }
     } else {
-        match blk_idx {
-            0 => (1, false),
-            2 => (3, false),
-            1 => (0, true),
-            3 => (2, true),
-            _ => unreachable!(),
-        }
+        unreachable!("compute_nc is for luma; chroma uses compute_nc_chroma")
     };
 
     let mbaff_blk = |is_left: bool| {
-        if blks_per_mb == 16 {
-            mbaff_luma_neighbor_blk(
-                mb_idx,
-                mb_width,
-                _mb_field_decoding,
-                blk_idx,
-                is_left,
-                mb_slice_id,
-                cur_slice_id,
-            )
-        } else {
-            mbaff_chroma_neighbor_blk(
-                mb_idx,
-                mb_width,
-                _mb_field_decoding,
-                blk_idx,
-                is_left,
-                mb_slice_id,
-                cur_slice_id,
-            )
-        }
+        mbaff_luma_neighbor_blk(
+            mb_idx,
+            mb_width,
+            _mb_field_decoding,
+            blk_idx,
+            is_left,
+            mb_slice_id,
+            cur_slice_id,
+        )
     };
     let nc_a: Option<u8> = if left_in_mb {
         Some(nc_array[mb_idx * blks_per_mb + left_blk])
@@ -908,13 +893,7 @@ pub(crate) fn compute_nc(
             _ => unreachable!(),
         }
     } else {
-        match blk_idx {
-            0 => (2, false),
-            1 => (3, false),
-            2 => (0, true),
-            3 => (1, true),
-            _ => unreachable!(),
-        }
+        unreachable!("compute_nc is for luma; chroma uses compute_nc_chroma")
     };
 
     let nc_b: Option<u8> = if above_in_mb {

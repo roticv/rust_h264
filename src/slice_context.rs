@@ -51,17 +51,13 @@ pub(crate) struct SliceParams<'a> {
 use crate::dpb::{DecodedPicture, PictureStructure};
 use crate::inter_pred;
 use crate::intra_pred::{
-    predict_chroma_8x8_halves, predict_intra_16x16, predict_intra_4x4, predict_intra_8x8,
+    predict_chroma, predict_intra_16x16, predict_intra_4x4, predict_intra_8x8,
 };
 use crate::mv_pred::{
     apply_spatial_direct_col_zero, derive_spatial_direct_base, derive_spatial_direct_blk,
     derive_temporal_direct_blk, predict_mv_skip, ref_pic_safe, MbaffCtx, WeightContext,
 };
-use crate::neighbor::dequant_4x4_ac_raster;
 use crate::residual::BLOCK_INDEX_TO_OFFSET;
-use crate::residual::{
-    dequant_chroma_dc, inverse_dct_4x4, inverse_hadamard_2x2, ZIGZAG_4X4, ZIGZAG_4X4_FIELD,
-};
 
 /// Mutable per-slice state passed to MB decode routines.
 ///
@@ -185,6 +181,18 @@ pub(crate) fn chroma_mv_offset_impl(
 use crate::deblock::MbType;
 
 impl SliceContext<'_> {
+    /// log2 of the luma rows per chroma row: 1 for 4:2:0, 0 for 4:2:2.
+    #[inline]
+    pub(crate) fn chroma_shift_y(&self) -> usize {
+        self.frame.chroma_format.shift_y() as usize
+    }
+
+    /// Whether the chroma planes are 4:2:2 (8x16 chroma per MB).
+    #[inline]
+    pub(crate) fn chroma_422(&self) -> bool {
+        self.frame.chroma_format == crate::decoder::ChromaFormat::Yuv422
+    }
+
     /// Returns true if the current MB uses field coefficient scan order.
     /// True for field pictures and for field-coded MBs in MBAFF.
     pub(crate) fn is_field_scan(&self, mb_idx: usize) -> bool {
@@ -212,6 +220,7 @@ impl SliceContext<'_> {
     pub(crate) fn set_mb_layout(&mut self, mb_idx: usize, mb_x: usize, mb_y: usize) {
         let w = self.stride;
         let cw = (self.width / 2) as usize;
+        let sy = self.chroma_shift_y();
         if self.mbaff && self.mb_field_decoding[mb_idx / 2] {
             // Field-coded MB pair: doubled stride, field-line offset
             let pair_row = (mb_idx / 2) / self.mb_width as usize;
@@ -220,14 +229,14 @@ impl SliceContext<'_> {
             self.ly_stride = w * 2;
             self.ly_offset = (pair_y + if is_bottom { 1 } else { 0 }) * w;
             self.lc_stride = cw * 2;
-            let pair_cy = pair_row * 16; // chroma pair y
+            let pair_cy = (pair_row * 32) >> sy; // chroma pair y
             self.lc_offset = (pair_cy + if is_bottom { 1 } else { 0 }) * cw;
         } else {
             // Frame-coded (progressive or MBAFF frame-coded pair)
             self.ly_stride = w;
             self.ly_offset = mb_y * w;
             self.lc_stride = cw;
-            self.lc_offset = (mb_y / 2) * cw;
+            self.lc_offset = (mb_y >> sy) * cw;
         }
         let _ = mb_x; // mb_x not needed for layout, only mb_y
     }
@@ -258,13 +267,20 @@ impl SliceContext<'_> {
             // Even ref_idx → same parity, odd ref_idx → opposite parity
             let ref_is_bottom = is_bottom ^ (ref_idx % 2 != 0);
             let ref_y_off = if ref_is_bottom { ref_width } else { 0 };
-            let mc_cy = pair_row * 8;
+            let mc_cy = (pair_row * 16) >> self.chroma_shift_y();
             let cw = ref_width / 2;
             let c_ref_stride = cw * 2;
             let c_ref_off = if ref_is_bottom { cw } else { 0 };
             (mc_y, ref_stride, ref_y_off, mc_cy, c_ref_stride, c_ref_off)
         } else {
-            (mb_y as i32, ref_width, 0, mb_y / 2, ref_width / 2, 0)
+            (
+                mb_y as i32,
+                ref_width,
+                0,
+                mb_y >> self.chroma_shift_y(),
+                ref_width / 2,
+                0,
+            )
         }
     }
 
@@ -513,7 +529,7 @@ impl SliceContext<'_> {
             },
         );
         if let Some(ref_pic) = ref_pic_list.first() {
-            let (mc_y, ref_stride, ref_y_off, mc_cy, c_ref_stride, c_ref_off) =
+            let (mc_y, ref_stride, ref_y_off, _, _, _) =
                 self.mc_params(mb_idx, mb_y, ref_pic.width as usize, 0i8);
             // Luma MC
             let mut luma_pred = [0u8; 256];
@@ -538,51 +554,15 @@ impl SliceContext<'_> {
                         luma_pred[r * 16 + c];
                 }
             }
-            // Chroma MC
-            let cw = c_ref_stride;
-            let cx = mb_x / 2;
-            let cy = mc_cy;
-            let cstride = self.lc_stride;
-            let cbase = self.lc_offset;
-            // Field picture chroma MV offset for opposite-parity reference
-            let chroma_mv_y_offset = self.chroma_mv_offset(ref_pic, c_ref_off);
-            let cmv_y = mvp_y as i32 + chroma_mv_y_offset;
-            let mut cb_pred = [0u8; 64];
-            let mut cr_pred = [0u8; 64];
-            inter_pred::chroma_mc(
-                ref_pic.chroma_ref(0, c_ref_off),
-                cw,
-                (self.height / 2) as usize,
-                cx as i32,
-                cy as i32,
-                mvp_x as i32,
-                cmv_y,
-                8,
-                8,
-                &mut cb_pred,
+            self.predict_chroma_part(
+                mb_idx,
+                mb_x,
+                mb_y,
+                sp,
+                (0, 0, 16, 16),
+                Some((ref_pic, 0, [mvp_x, mvp_y])),
+                None,
             );
-            inter_pred::chroma_mc(
-                ref_pic.chroma_ref(1, c_ref_off),
-                cw,
-                (self.height / 2) as usize,
-                cx as i32,
-                cy as i32,
-                mvp_x as i32,
-                cmv_y,
-                8,
-                8,
-                &mut cr_pred,
-            );
-            if use_weight == 1 {
-                wctx.apply_uni(&mut cb_pred, 0, 0, true, 0);
-                wctx.apply_uni(&mut cr_pred, 0, 0, true, 1);
-            }
-            for r in 0..8 {
-                for c in 0..8 {
-                    self.frame.u[cbase + r * cstride + cx + c] = cb_pred[r * 8 + c];
-                    self.frame.v[cbase + r * cstride + cx + c] = cr_pred[r * 8 + c];
-                }
-            }
         }
         // Store MVs and ref indices
         for blk in 0..16 {
@@ -927,135 +907,15 @@ impl SliceContext<'_> {
             }
         }
 
-        let cx = mb_x / 2;
-        let cstride = self.lc_stride;
-        let cbase = self.lc_offset;
-        let chroma_h = (self.height / 2) as usize;
-        for plane_idx in 0..2 {
-            let mut chroma_pred = [0u8; 64];
-            match (ref_l0, ref_l1) {
-                (Some(ref0), Some(ref1)) => {
-                    let mut c0 = [0u8; 64];
-                    let mut c1 = [0u8; 64];
-                    let (_, _, _, mc_cy_l0, c_ref_stride_l0, c_ref_off_l0) =
-                        self.mc_params(mb_idx, mb_y, ref0.width as usize, r0);
-                    let (_, _, _, mc_cy_l1, c_ref_stride_l1, c_ref_off_l1) =
-                        self.mc_params(mb_idx, mb_y, ref1.width as usize, r1);
-                    let cr0 = if plane_idx == 0 {
-                        ref0.chroma_ref(0, c_ref_off_l0)
-                    } else {
-                        ref0.chroma_ref(1, c_ref_off_l0)
-                    };
-                    let cr1 = if plane_idx == 0 {
-                        ref1.chroma_ref(0, c_ref_off_l1)
-                    } else {
-                        ref1.chroma_ref(1, c_ref_off_l1)
-                    };
-                    let cmv_y0 = mv0[1] as i32 + self.chroma_mv_offset(ref0, c_ref_off_l0);
-                    let cmv_y1 = mv1[1] as i32 + self.chroma_mv_offset(ref1, c_ref_off_l1);
-                    inter_pred::chroma_mc(
-                        cr0,
-                        c_ref_stride_l0,
-                        chroma_h,
-                        cx as i32,
-                        mc_cy_l0 as i32,
-                        mv0[0] as i32,
-                        cmv_y0,
-                        8,
-                        8,
-                        &mut c0,
-                    );
-                    inter_pred::chroma_mc(
-                        cr1,
-                        c_ref_stride_l1,
-                        chroma_h,
-                        cx as i32,
-                        mc_cy_l1 as i32,
-                        mv1[0] as i32,
-                        cmv_y1,
-                        8,
-                        8,
-                        &mut c1,
-                    );
-                    sp.wctx
-                        .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
-                        .apply_bi(
-                            &c0,
-                            &c1,
-                            &mut chroma_pred,
-                            r0 as usize,
-                            r1 as usize,
-                            true,
-                            plane_idx,
-                        );
-                }
-                (Some(ref0), None) => {
-                    let (_, _, _, mc_cy, c_ref_stride, c_ref_off) =
-                        self.mc_params(mb_idx, mb_y, ref0.width as usize, r0);
-                    let cr = if plane_idx == 0 {
-                        ref0.chroma_ref(0, c_ref_off)
-                    } else {
-                        ref0.chroma_ref(1, c_ref_off)
-                    };
-                    let cmv_y = mv0[1] as i32 + self.chroma_mv_offset(ref0, c_ref_off);
-                    inter_pred::chroma_mc(
-                        cr,
-                        c_ref_stride,
-                        chroma_h,
-                        cx as i32,
-                        mc_cy as i32,
-                        mv0[0] as i32,
-                        cmv_y,
-                        8,
-                        8,
-                        &mut chroma_pred,
-                    );
-                    if sp.use_weight == 1 {
-                        sp.wctx
-                            .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
-                            .apply_uni(&mut chroma_pred, 0, r0 as usize, true, plane_idx);
-                    }
-                }
-                (None, Some(ref1)) => {
-                    let (_, _, _, mc_cy, c_ref_stride, c_ref_off) =
-                        self.mc_params(mb_idx, mb_y, ref1.width as usize, r1);
-                    let cr = if plane_idx == 0 {
-                        ref1.chroma_ref(0, c_ref_off)
-                    } else {
-                        ref1.chroma_ref(1, c_ref_off)
-                    };
-                    let cmv_y = mv1[1] as i32 + self.chroma_mv_offset(ref1, c_ref_off);
-                    inter_pred::chroma_mc(
-                        cr,
-                        c_ref_stride,
-                        chroma_h,
-                        cx as i32,
-                        mc_cy as i32,
-                        mv1[0] as i32,
-                        cmv_y,
-                        8,
-                        8,
-                        &mut chroma_pred,
-                    );
-                    if sp.use_weight == 1 {
-                        sp.wctx
-                            .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
-                            .apply_uni(&mut chroma_pred, 1, r1 as usize, true, plane_idx);
-                    }
-                }
-                (None, None) => {}
-            }
-            let fp = if plane_idx == 0 {
-                &mut self.frame.u
-            } else {
-                &mut self.frame.v
-            };
-            for r in 0..8 {
-                for c in 0..8 {
-                    fp[cbase + r * cstride + cx + c] = chroma_pred[r * 8 + c];
-                }
-            }
-        }
+        self.predict_chroma_part(
+            mb_idx,
+            mb_x,
+            mb_y,
+            sp,
+            (0, 0, 16, 16),
+            ref_l0.map(|pic| (&**pic, r0, mv0)),
+            ref_l1.map(|pic| (&**pic, r1, mv1)),
+        );
 
         true
     }
@@ -1209,16 +1069,11 @@ impl SliceContext<'_> {
             }
         }
 
-        // Chroma MC: per-4x4-block
-        let cx = mb_x / 2;
-        let cstride = self.lc_stride;
-        let cbase = self.lc_offset;
-        let chroma_h = (self.height / 2) as usize;
-        // Chroma blocks: one 4x4 per 8x8 whose four 4x4 luma blocks share
-        // motion, else a 2x2 per luma block (direct without
+        // Chroma: one partition per 8x8 whose four 4x4 luma blocks share
+        // motion, else one per luma 4x4 (direct without
         // direct_8x8_inference can give each 4x4 its own motion).
-        // (luma block, chroma row, chroma col, size)
-        let mut cparts = [(0usize, 0usize, 0usize, 0usize); 16];
+        // (luma block, luma rectangle)
+        let mut cparts = [(0usize, (0usize, 0usize, 0usize, 0usize)); 16];
         let mut n_cparts = 0;
         for b8 in 0..4 {
             let base = mb_idx * 16 + b8 * 4;
@@ -1229,7 +1084,7 @@ impl SliceContext<'_> {
                     && self.ref_idx_store_l1[base + k] == self.ref_idx_store_l1[base]
             });
             if same {
-                cparts[n_cparts] = (b8 * 4, (b8 / 2) * 4, (b8 % 2) * 4, 4);
+                cparts[n_cparts] = (b8 * 4, ((b8 % 2) * 8, (b8 / 2) * 8, 8, 8));
                 n_cparts += 1;
             } else {
                 for (blk, &(row, col)) in BLOCK_INDEX_TO_OFFSET
@@ -1238,170 +1093,31 @@ impl SliceContext<'_> {
                     .skip(b8 * 4)
                     .take(4)
                 {
-                    cparts[n_cparts] = (blk, row / 2, col / 2, 2);
+                    cparts[n_cparts] = (blk, (col, row, 4, 4));
                     n_cparts += 1;
                 }
             }
         }
-        for plane_idx in 0..2 {
-            let mut chroma_pred = [0u8; 64];
-            for &(luma_blk, cblk_row, cblk_col, csize) in &cparts[..n_cparts] {
-                let mv0 = self.mv_store_l0[mb_idx * 16 + luma_blk];
-                let mv1 = self.mv_store_l1[mb_idx * 16 + luma_blk];
-                let r0 = self.ref_idx_store_l0[mb_idx * 16 + luma_blk];
-                let r1 = self.ref_idx_store_l1[mb_idx * 16 + luma_blk];
-                let bp0 = r0 >= 0;
-                let bp1 = r1 >= 0;
-                let mut cblk_pred = [0u8; 16];
-                if bp0 && bp1 {
-                    let mut c0 = [0u8; 16];
-                    let c0 = &mut c0[..csize * csize];
-                    let mut c1 = [0u8; 16];
-                    let c1 = &mut c1[..csize * csize];
-                    let Some(rl0) = ref_pic_safe(ref_pic_list_l0, self.frame_ref_idx(mb_idx, r0))
-                    else {
-                        return;
-                    };
-                    let Some(rl1) = ref_pic_safe(ref_pic_list_l1, self.frame_ref_idx(mb_idx, r1))
-                    else {
-                        return;
-                    };
-                    let (_mc_y_l0, _rs_l0, _ref_y_off_l0, mc_cy_l0, c_ref_stride_l0, c_ref_off_l0) =
-                        self.mc_params(mb_idx, mb_y, rl0.width as usize, r0);
-                    let (_mc_y_l1, _rs_l1, _ref_y_off_l1, mc_cy_l1, c_ref_stride_l1, c_ref_off_l1) =
-                        self.mc_params(mb_idx, mb_y, rl1.width as usize, r1);
-                    let cr0 = if plane_idx == 0 {
-                        rl0.chroma_ref(0, c_ref_off_l0)
-                    } else {
-                        rl0.chroma_ref(1, c_ref_off_l0)
-                    };
-                    let cr1 = if plane_idx == 0 {
-                        rl1.chroma_ref(0, c_ref_off_l1)
-                    } else {
-                        rl1.chroma_ref(1, c_ref_off_l1)
-                    };
-                    let cmv_y0 = mv0[1] as i32 + self.chroma_mv_offset(rl0, c_ref_off_l0);
-                    let cmv_y1 = mv1[1] as i32 + self.chroma_mv_offset(rl1, c_ref_off_l1);
-                    inter_pred::chroma_mc(
-                        cr0,
-                        c_ref_stride_l0,
-                        chroma_h,
-                        (cx + cblk_col) as i32,
-                        (mc_cy_l0 + cblk_row) as i32,
-                        mv0[0] as i32,
-                        cmv_y0,
-                        csize,
-                        csize,
-                        c0,
-                    );
-                    inter_pred::chroma_mc(
-                        cr1,
-                        c_ref_stride_l1,
-                        chroma_h,
-                        (cx + cblk_col) as i32,
-                        (mc_cy_l1 + cblk_row) as i32,
-                        mv1[0] as i32,
-                        cmv_y1,
-                        csize,
-                        csize,
-                        c1,
-                    );
-                    wctx.apply_bi(
-                        c0,
-                        c1,
-                        &mut cblk_pred[..csize * csize],
-                        r0 as usize,
-                        r1 as usize,
-                        true,
-                        plane_idx,
-                    );
-                } else if bp0 {
-                    let Some(ref_pic) =
-                        ref_pic_safe(ref_pic_list_l0, self.frame_ref_idx(mb_idx, r0))
-                    else {
-                        return;
-                    };
-                    let (_mc_y, _rs, _ref_y_off, mc_cy, c_ref_stride, c_ref_off) =
-                        self.mc_params(mb_idx, mb_y, ref_pic.width as usize, r0);
-                    let cr = if plane_idx == 0 {
-                        ref_pic.chroma_ref(0, c_ref_off)
-                    } else {
-                        ref_pic.chroma_ref(1, c_ref_off)
-                    };
-                    let cmv_y = mv0[1] as i32 + self.chroma_mv_offset(ref_pic, c_ref_off);
-                    inter_pred::chroma_mc(
-                        cr,
-                        c_ref_stride,
-                        chroma_h,
-                        (cx + cblk_col) as i32,
-                        (mc_cy + cblk_row) as i32,
-                        mv0[0] as i32,
-                        cmv_y,
-                        csize,
-                        csize,
-                        &mut cblk_pred[..csize * csize],
-                    );
-                    if use_weight == 1 {
-                        wctx.apply_uni(
-                            &mut cblk_pred[..csize * csize],
-                            0,
-                            r0 as usize,
-                            true,
-                            plane_idx,
-                        );
-                    }
-                } else if bp1 {
-                    let Some(ref_pic) =
-                        ref_pic_safe(ref_pic_list_l1, self.frame_ref_idx(mb_idx, r1))
-                    else {
-                        return;
-                    };
-                    let (_mc_y, _rs, _ref_y_off, mc_cy, c_ref_stride, c_ref_off) =
-                        self.mc_params(mb_idx, mb_y, ref_pic.width as usize, r1);
-                    let cr = if plane_idx == 0 {
-                        ref_pic.chroma_ref(0, c_ref_off)
-                    } else {
-                        ref_pic.chroma_ref(1, c_ref_off)
-                    };
-                    let cmv_y = mv1[1] as i32 + self.chroma_mv_offset(ref_pic, c_ref_off);
-                    inter_pred::chroma_mc(
-                        cr,
-                        c_ref_stride,
-                        chroma_h,
-                        (cx + cblk_col) as i32,
-                        (mc_cy + cblk_row) as i32,
-                        mv1[0] as i32,
-                        cmv_y,
-                        csize,
-                        csize,
-                        &mut cblk_pred[..csize * csize],
-                    );
-                    if use_weight == 1 {
-                        wctx.apply_uni(
-                            &mut cblk_pred[..csize * csize],
-                            1,
-                            r1 as usize,
-                            true,
-                            plane_idx,
-                        );
-                    }
-                }
-                for r in 0..csize {
-                    for c in 0..csize {
-                        chroma_pred[(cblk_row + r) * 8 + cblk_col + c] = cblk_pred[r * csize + c];
-                    }
-                }
+        for &(luma_blk, rect) in &cparts[..n_cparts] {
+            let i = mb_idx * 16 + luma_blk;
+            let (r0, r1) = (self.ref_idx_store_l0[i], self.ref_idx_store_l1[i]);
+            let mut m0 = None;
+            let mut m1 = None;
+            if r0 >= 0 {
+                let Some(pic) = ref_pic_safe(ref_pic_list_l0, self.frame_ref_idx(mb_idx, r0))
+                else {
+                    return;
+                };
+                m0 = Some((&**pic, r0, self.mv_store_l0[i]));
             }
-            let fp = if plane_idx == 0 {
-                &mut self.frame.u
-            } else {
-                &mut self.frame.v
-            };
-            for r in 0..8 {
-                for c in 0..8 {
-                    fp[cbase + r * cstride + cx + c] = chroma_pred[r * 8 + c];
-                }
+            if r1 >= 0 {
+                let Some(pic) = ref_pic_safe(ref_pic_list_l1, self.frame_ref_idx(mb_idx, r1))
+                else {
+                    return;
+                };
+                m1 = Some((&**pic, r1, self.mv_store_l1[i]));
             }
+            self.predict_chroma_part(mb_idx, mb_x, mb_y, sp, rect, m0, m1);
         }
         self.mb_is_direct[mb_idx] = true;
         for blk in 0..16 {
@@ -1454,67 +1170,6 @@ impl SliceContext<'_> {
         let left_cbp_c = ((left_cbp_raw >> 4) & 3) as u8;
         let top_cbp_c = ((top_cbp_raw >> 4) & 3) as u8;
         (left_cbp, top_cbp, left_cbp_c, top_cbp_c)
-    }
-
-    /// Fill per-4x4-block MV/ref/nnz data into MbInfo for deblocking bS derivation,
-    /// and build the per-block ref POC table for temporal direct mode.
-    /// Reconstruct one chroma plane: Hadamard + dequant DC, unzigzag + dequant AC,
-    /// IDCT, add prediction, clamp, and write to frame.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn reconstruct_chroma_plane(
-        &mut self,
-        plane_dc: &mut [i32; 4],
-        plane_ac: &[[i32; 15]; 4],
-        pred: &[u8; 64],
-        is_u: bool,
-        cbp_chroma: u8,
-        qp_c: i32,
-        chroma_scale: &[u8; 16],
-        mb_x: usize,
-        mb_idx: usize,
-    ) {
-        let chroma_mb_x = mb_x / 2;
-
-        if cbp_chroma >= 1 {
-            inverse_hadamard_2x2(plane_dc);
-            dequant_chroma_dc(plane_dc, qp_c, chroma_scale[0]);
-        }
-        let mut chroma_residual = [0i32; 64];
-        for blk in 0..4 {
-            let blk_row = (blk / 2) * 4;
-            let blk_col = (blk % 2) * 4;
-            let mut block_raster = [0i32; 16];
-            block_raster[0] = plane_dc[blk];
-            if cbp_chroma >= 2 {
-                let zigzag = if self.is_field_scan(mb_idx) {
-                    &ZIGZAG_4X4_FIELD
-                } else {
-                    &ZIGZAG_4X4
-                };
-                for scan_idx in 0..15 {
-                    let (r, c) = zigzag[scan_idx + 1];
-                    block_raster[r * 4 + c] = plane_ac[blk][scan_idx];
-                }
-                dequant_4x4_ac_raster(&mut block_raster, qp_c, chroma_scale);
-            }
-            inverse_dct_4x4(&mut block_raster);
-            for r in 0..4 {
-                for c in 0..4 {
-                    chroma_residual[(blk_row + r) * 8 + blk_col + c] = block_raster[r * 4 + c];
-                }
-            }
-        }
-        let fp = if is_u {
-            &mut self.frame.u
-        } else {
-            &mut self.frame.v
-        };
-        for y in 0..8 {
-            for x in 0..8 {
-                let val = (pred[y * 8 + x] as i32 + chroma_residual[y * 8 + x]).clamp(0, 255) as u8;
-                fp[self.lc_offset + y * self.lc_stride + chroma_mb_x + x] = val;
-            }
-        }
     }
 
     /// Compute intra chroma prediction for both U and V planes.
@@ -1776,56 +1431,54 @@ impl SliceContext<'_> {
     }
 
     /// Compute intra chroma prediction for both U and V planes.
-    pub(crate) fn predict_chroma_intra(
-        &self,
+    /// Intra chroma prediction of the current MB written to both chroma
+    /// planes of the frame.
+    pub(crate) fn write_chroma_intra_pred(
+        &mut self,
         mb_x: usize,
         intra_chroma_pred_mode: u8,
         above_avail: bool,
         left_avail: [bool; 2],
         above_left_avail: bool,
-    ) -> ([u8; 64], [u8; 64]) {
-        let chroma_mb_x = mb_x / 2;
-
-        let mut pred_u = [0u8; 64];
-        let mut pred_v = [0u8; 64];
-
-        let cbase = self.lc_offset;
-        let cstride = self.lc_stride;
-        for (plane_buf, pred) in [(&self.frame.u, &mut pred_u), (&self.frame.v, &mut pred_v)] {
-            let above = if cbase >= cstride && above_avail {
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(
-                    &plane_buf[cbase - cstride + chroma_mb_x..cbase - cstride + chroma_mb_x + 8],
-                );
-                Some(buf)
+    ) {
+        let cx = mb_x / 2;
+        let h = 16 >> self.chroma_shift_y();
+        let (base, stride) = (self.lc_offset, self.lc_stride);
+        for plane in 0..2 {
+            let buf: &mut [u8] = if plane == 0 {
+                &mut self.frame.u
             } else {
-                None
+                &mut self.frame.v
             };
-            let left = if mb_x > 0 && (left_avail[0] || left_avail[1]) {
-                let mut buf = [0u8; 8];
-                for (i, b) in buf.iter_mut().enumerate() {
-                    *b = plane_buf[cbase + i * cstride + chroma_mb_x - 1];
+            let above = (base >= stride && above_avail).then(|| {
+                let mut a = [0u8; 8];
+                a.copy_from_slice(&buf[base - stride + cx..base - stride + cx + 8]);
+                a
+            });
+            let left = (cx > 0 && (left_avail[0] || left_avail[1])).then(|| {
+                let mut l = [0u8; 16];
+                for (r, v) in l.iter_mut().enumerate().take(h) {
+                    *v = buf[base + r * stride + cx - 1];
                 }
-                Some(buf)
-            } else {
-                None
-            };
-            let above_left = if mb_x > 0 && cbase >= cstride && above_left_avail {
-                Some(plane_buf[cbase - cstride + chroma_mb_x - 1])
-            } else {
-                None
-            };
-            predict_chroma_8x8_halves(
+                l
+            });
+            let above_left =
+                (cx > 0 && base >= stride && above_left_avail).then(|| buf[base - stride + cx - 1]);
+            let mut pred = [0u8; 128];
+            predict_chroma(
                 intra_chroma_pred_mode,
-                above.as_ref().map(|b| &b[..]),
-                left.as_ref().map(|b| &b[..]),
+                above.as_ref().map(|a| &a[..]),
+                left.as_ref().map(|l| &l[..h]),
                 left_avail,
                 above_left,
-                pred,
+                h,
+                &mut pred,
             );
+            for r in 0..h {
+                let o = base + r * stride + cx;
+                buf[o..o + 8].copy_from_slice(&pred[r * 8..r * 8 + 8]);
+            }
         }
-
-        (pred_u, pred_v)
     }
 
     ///

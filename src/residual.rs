@@ -181,6 +181,42 @@ pub fn dequant_chroma_dc(dc: &mut [i32; 4], qp: i32, scale_dc: u8) {
     }
 }
 
+/// Inverse transform and scaling of 4:2:2 chroma DC (spec 8.5.11.1-2).
+/// `dc` holds the 8 coefficients in parse order; on return it holds the DC
+/// of each 4x4 chroma block in raster order (two per row, four rows).
+/// Scaling uses QP'c + 3.
+pub fn chroma_dc_422(dc: &mut [i32; 8], qp_c: i32, scale_dc: u8) {
+    use core::num::Wrapping as W;
+    // Parse order to the 4x2 matrix c (spec 8.5.11.1)
+    const ORDER: [usize; 8] = [0, 2, 1, 5, 3, 6, 4, 7];
+    let mut c = [W(0i32); 8];
+    for (i, &o) in ORDER.iter().enumerate() {
+        c[i] = W(dc[o]);
+    }
+    // f = A * c * B, A the 4x4 Hadamard-like matrix, B = [[1, 1], [1, -1]]
+    let mut t = [W(0i32); 8];
+    for col in 0..2 {
+        let (c0, c1, c2, c3) = (c[col], c[2 + col], c[4 + col], c[6 + col]);
+        t[col] = c0 + c1 + c2 + c3;
+        t[2 + col] = c0 + c1 - c2 - c3;
+        t[4 + col] = c0 - c1 - c2 + c3;
+        t[6 + col] = c0 - c1 + c2 - c3;
+    }
+    let qp_dc = qp_c + 3;
+    let (qp_per, qp_rem) = (qp_dc / 6, (qp_dc % 6) as usize);
+    let v = LEVEL_SCALE[qp_rem][0] * scale_dc as i32;
+    for row in 0..4 {
+        let (a, b) = (t[row * 2], t[row * 2 + 1]);
+        for (k, f) in [(a + b).0, (a - b).0].into_iter().enumerate() {
+            dc[row * 2 + k] = if qp_per >= 6 {
+                f.wrapping_mul(v).wrapping_shl((qp_per - 6) as u32)
+            } else {
+                f.wrapping_mul(v).wrapping_add(1 << (5 - qp_per)) >> (6 - qp_per)
+            };
+        }
+    }
+}
+
 /// QP_C lookup table from QP_I (H.264 Table 8-15).
 /// qPI = clip3(0, 51, QP_Y + chroma_qp_index_offset)
 /// QP_C = QPC_TABLE[qPI]

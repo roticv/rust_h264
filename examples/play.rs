@@ -10,15 +10,18 @@ use rust_h264::decoder::{Decoder, Frame};
 use rust_h264::nal::{parse_annex_b, NalUnitType};
 use std::time::{Duration, Instant};
 
-/// Convert YUV420 frame to ARGB pixel buffer for display.
-fn yuv_to_argb(y: &[u8], u: &[u8], v: &[u8], width: usize, height: usize) -> Vec<u32> {
+/// Convert a YUV 4:2:0 or 4:2:2 frame to ARGB pixel buffer for display.
+fn yuv_to_argb(f: &rust_h264::decoder::Frame, width: usize, height: usize) -> Vec<u32> {
+    let (y, u, v) = (&f.y, &f.u, &f.v);
     let cw = width / 2;
+    // Chroma rows per luma row: 1 for 4:2:2, 1/2 for 4:2:0
+    let c_row = |row: usize| row * f.chroma_height() as usize / f.height.max(1) as usize;
     let mut argb = vec![0u32; width * height];
     for row in 0..height {
         for col in 0..width {
             let y_val = y[row * width + col] as i32;
-            let u_val = u[(row / 2) * cw + col / 2] as i32 - 128;
-            let v_val = v[(row / 2) * cw + col / 2] as i32 - 128;
+            let u_val = u[c_row(row) * cw + col / 2] as i32 - 128;
+            let v_val = v[c_row(row) * cw + col / 2] as i32 - 128;
 
             let r = (y_val + ((v_val * 359 + 128) >> 8)).clamp(0, 255) as u32;
             let g = (y_val - ((u_val * 88 + v_val * 183 + 128) >> 8)).clamp(0, 255) as u32;
@@ -141,13 +144,7 @@ fn main() {
             idr_count += 1;
         }
         if let Some(display_frame) = reorder_buf.pop_if_ready() {
-            first_frame_argb = Some(yuv_to_argb(
-                &display_frame.y,
-                &display_frame.u,
-                &display_frame.v,
-                width,
-                height,
-            ));
+            first_frame_argb = Some(yuv_to_argb(&display_frame, width, height));
             nal_idx += 1;
             break;
         }
@@ -160,7 +157,7 @@ fn main() {
         if let Some(f) = flushed.into_iter().next() {
             width = f.width as usize;
             height = f.height as usize;
-            first_frame_argb = Some(yuv_to_argb(&f.y, &f.u, &f.v, width, height));
+            first_frame_argb = Some(yuv_to_argb(&f, width, height));
         }
     }
 
@@ -303,7 +300,7 @@ fn main() {
         }
 
         let f = display_frame.unwrap();
-        current_argb = yuv_to_argb(&f.y, &f.u, &f.v, width, height);
+        current_argb = yuv_to_argb(&f, width, height);
         frame_count += 1;
 
         // Wait for frame timing

@@ -5,7 +5,7 @@ While working on rust_media, it was found that there isn't any sufficiently good
 Hence, the idea is to attempt to create an open source h264 decoder.
 Yes, most devices have hardware h264 decoder, but if we want to be truly portable, then software implementation of h264 decoder is needed.
 
-Decodes Baseline, Main and High profile H.264 (8-bit 4:2:0, and monochrome output as 4:2:0 with mid-grey chroma):
+Decodes Baseline, Main, High and High 4:2:2 profile H.264 (8-bit 4:2:0 and 4:2:2, and monochrome output as 4:2:0 with mid-grey chroma):
 
 - CAVLC and CABAC entropy coding, 4x4 and 8x8 transforms, custom scaling matrices
 - All partition types (16x16 through 4x4), P and B slices, B-pyramid, spatial and temporal direct mode
@@ -30,7 +30,7 @@ tiny synthetic clips up to 1080p x264 and JM reference-encoder streams.
 Streams using any of these are rejected with `DecodeError::Unsupported` on
 every slice, rather than decoded into wrong pictures:
 
-- 4:2:2 or 4:4:4 chroma
+- 4:4:4 chroma
 - Bit depths above 8 (High 10 and up)
 - Lossless coding (transform bypass)
 

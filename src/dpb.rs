@@ -85,6 +85,8 @@ pub(crate) struct PictureMeta {
     pub(crate) mb_width: u32,
     pub(crate) is_intra: bool,
     pub(crate) structure: PictureStructure,
+    /// 4:2:2 chroma planes (full height) instead of 4:2:0
+    pub(crate) chroma_422: bool,
 }
 
 /// A decoded picture in the DPB, shared via Arc.
@@ -108,6 +110,8 @@ pub struct DecodedPicture {
     pub is_intra: bool,
     /// Whether this decoded picture is a frame, top field, or bottom field.
     pub structure: PictureStructure,
+    /// 4:2:2 chroma planes (full height) instead of 4:2:0
+    pub(crate) chroma_422: bool,
     /// Y, Cb, Cr planes in coded layout (stride = width, width / 2).
     planes: [SharedPlane; 3],
     /// Final macroblock rows of the planes.
@@ -151,6 +155,7 @@ impl DecodedPicture {
             mb_width: meta.mb_width,
             is_intra: meta.is_intra,
             structure: meta.structure,
+            chroma_422: meta.chroma_422,
             planes,
             progress,
             motion: OnceLock::new(),
@@ -192,6 +197,7 @@ impl DecodedPicture {
             field_poc: [poc, poc],
             mb_width: self.mb_width,
             is_intra: self.is_intra,
+            chroma_422: self.chroma_422,
             structure: if bottom {
                 PictureStructure::BottomField
             } else {
@@ -237,6 +243,7 @@ impl DecodedPicture {
             field_poc: [top.pic_order_cnt, bottom.pic_order_cnt],
             mb_width: top.mb_width,
             is_intra: top.is_intra && bottom.is_intra,
+            chroma_422: top.chroma_422,
             structure: PictureStructure::Frame,
         };
         let total_mbs = top.mb_width as usize * (top.height as usize / 8);
@@ -278,7 +285,11 @@ impl DecodedPicture {
     #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(crate) fn new_in_progress(meta: PictureMeta) -> (Arc<Self>, PictureWriter) {
         let luma_len = meta.width as usize * meta.height as usize;
-        let chroma_len = luma_len / 4;
+        let chroma_len = if meta.chroma_422 {
+            luma_len / 2
+        } else {
+            luma_len / 4
+        };
         let rows = Self::mb_rows(meta.width, luma_len);
         let pic = Arc::new(Self::with_planes(
             meta,
@@ -307,7 +318,7 @@ impl DecodedPicture {
         let (w, h) = if p == 0 {
             (self.width as usize, 16)
         } else {
-            (self.width as usize / 2, 8)
+            (self.width as usize / 2, self.chroma_mb_rows())
         };
         (rows as usize * h * w).min(len)
     }
@@ -354,7 +365,17 @@ impl DecodedPicture {
     /// Block until chroma bytes `0..end` (of both chroma planes) are final.
     #[inline]
     pub(crate) fn wait_chroma(&self, end: usize) {
-        self.wait_plane_bytes(self.width as usize / 2, 8, end);
+        self.wait_plane_bytes(self.width as usize / 2, self.chroma_mb_rows(), end);
+    }
+
+    /// Chroma lines per macroblock row: 8 for 4:2:0, 16 for 4:2:2.
+    #[inline]
+    pub(crate) fn chroma_mb_rows(&self) -> usize {
+        if self.chroma_422 {
+            16
+        } else {
+            8
+        }
     }
 
     #[inline]
@@ -574,6 +595,7 @@ impl Dpb {
                 mb_width: latest.mb_width,
                 is_intra: true,
                 structure: PictureStructure::Frame,
+                chroma_422: latest.chroma_422,
             };
             let total_mbs = latest.mb_width as usize * (latest.height as usize / 16);
             let pic = DecodedPicture::new_complete(
@@ -1478,6 +1500,7 @@ mod tests {
                 mb_width: 1,
                 is_intra: false,
                 structure: crate::dpb::PictureStructure::Frame,
+                chroma_422: false,
             },
             vec![],
             vec![],

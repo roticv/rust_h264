@@ -10,10 +10,9 @@ use crate::inter_pred;
 use crate::mv_pred::{predict_mv, predict_mv_sub, ref_pic_safe, MbaffCtx};
 use crate::neighbor::{compute_nc, dequant_4x4_ac_raster, predict_i4x4_mode};
 use crate::residual::{
-    chroma_qp, dequant_4x4_full, dequant_8x8, dequant_chroma_dc, dequant_luma_dc_i16x16,
-    inverse_dct_4x4, inverse_dct_8x8, inverse_hadamard_2x2, inverse_hadamard_4x4,
-    BLOCK_INDEX_TO_OFFSET, OFFSET_TO_BLOCK, ZIGZAG_4X4, ZIGZAG_4X4_FIELD, ZIGZAG_8X8_CAVLC,
-    ZIGZAG_8X8_CAVLC_FIELD,
+    dequant_4x4_full, dequant_8x8, dequant_luma_dc_i16x16, inverse_dct_4x4, inverse_dct_8x8,
+    inverse_hadamard_4x4, BLOCK_INDEX_TO_OFFSET, OFFSET_TO_BLOCK, ZIGZAG_4X4, ZIGZAG_4X4_FIELD,
+    ZIGZAG_8X8_CAVLC, ZIGZAG_8X8_CAVLC_FIELD,
 };
 use crate::slice_context::{SliceContext, SliceParams};
 
@@ -797,7 +796,6 @@ impl SliceContext<'_> {
                 self.prev_mb_qp
             };
             self.prev_mb_qp = qp_y;
-            let qp_c = chroma_qp(qp_y, sp.chroma_qp_index_offset);
 
             // Decode luma residual
             let mut luma_residual = [0i32; 256];
@@ -1005,293 +1003,33 @@ impl SliceContext<'_> {
             }
 
             // Chroma
-            let mut chroma_dc_cb = [0i32; 4];
-            let mut chroma_dc_cr = [0i32; 4];
-            if cbp_chroma >= 1 {
-                parse_residual_block_cavlc(reader, &mut chroma_dc_cb, 4, -1)?;
-                parse_residual_block_cavlc(reader, &mut chroma_dc_cr, 4, -1)?;
-            }
-            let mut chroma_ac_scan_cb = [[0i32; 15]; 4];
-            let mut chroma_ac_scan_cr = [[0i32; 15]; 4];
-            if cbp_chroma >= 2 {
-                for blk in 0..4 {
-                    let nc = compute_nc(
-                        self.nc_cb,
-                        mb_idx,
-                        self.mb_width as usize,
-                        blk,
-                        4,
-                        self.mb_slice_id,
-                        self.this_slice_id,
-                        self.mbaff,
-                        self.mb_field_decoding,
-                    );
-                    let tc =
-                        parse_residual_block_cavlc(reader, &mut chroma_ac_scan_cb[blk], 15, nc)?;
-                    self.nc_cb[mb_idx * 4 + blk] = tc;
-                }
-                for blk in 0..4 {
-                    let nc = compute_nc(
-                        self.nc_cr,
-                        mb_idx,
-                        self.mb_width as usize,
-                        blk,
-                        4,
-                        self.mb_slice_id,
-                        self.this_slice_id,
-                        self.mbaff,
-                        self.mb_field_decoding,
-                    );
-                    let tc =
-                        parse_residual_block_cavlc(reader, &mut chroma_ac_scan_cr[blk], 15, nc)?;
-                    self.nc_cr[mb_idx * 4 + blk] = tc;
-                }
-            }
-
-            let chroma_mb_x = mb_x / 2;
-            // Precompute mc_params per sub_part before entering the plane loop
-            // (avoids borrow conflict with &mut self.frame inside the loop).
-            let mut sub_mc: Vec<(i32, usize, usize, usize, usize, usize)> =
-                Vec::with_capacity(sub_parts.len());
+            let chroma = self.decode_chroma_residual_cavlc(reader, mb_idx, cbp_chroma)?;
             for sub_part in sub_parts.iter() {
-                if sub_part.pred_l0 && sub_part.pred_l1 {
-                    // We'll handle L0/L1 separately inside; store L0 params as placeholder
-                    let ref_l0 = ref_pic_safe(sp.ref_pic_list_l0, fri(sub_part.ref_idx_l0));
-                    let w = ref_l0
-                        .map(|r| r.width as usize)
-                        .unwrap_or(self.width as usize);
-                    sub_mc.push(self.mc_params(mb_idx, mb_y, w, sub_part.ref_idx_l0));
-                } else if sub_part.pred_l0 {
-                    let ref_pic = ref_pic_safe(sp.ref_pic_list_l0, fri(sub_part.ref_idx_l0));
-                    let w = ref_pic
-                        .map(|r| r.width as usize)
-                        .unwrap_or(self.width as usize);
-                    sub_mc.push(self.mc_params(mb_idx, mb_y, w, sub_part.ref_idx_l0));
+                let m0 = if sub_part.pred_l0 {
+                    let pic = ref_pic_safe(sp.ref_pic_list_l0, fri(sub_part.ref_idx_l0))
+                        .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
+                    Some((&**pic, sub_part.ref_idx_l0, sub_part.mv_l0))
                 } else {
-                    let ref_pic = ref_pic_safe(sp.ref_pic_list_l1, fri(sub_part.ref_idx_l1));
-                    let w = ref_pic
-                        .map(|r| r.width as usize)
-                        .unwrap_or(self.width as usize);
-                    sub_mc.push(self.mc_params(mb_idx, mb_y, w, sub_part.ref_idx_l1));
-                }
-            }
-            // Also precompute L1 mc_params for bi-pred sub_parts
-            let mut sub_mc_l1: Vec<(i32, usize, usize, usize, usize, usize)> =
-                Vec::with_capacity(sub_parts.len());
-            for sub_part in sub_parts.iter() {
-                if sub_part.pred_l0 && sub_part.pred_l1 {
-                    let ref_l1 = ref_pic_safe(sp.ref_pic_list_l1, fri(sub_part.ref_idx_l1));
-                    let w = ref_l1
-                        .map(|r| r.width as usize)
-                        .unwrap_or(self.width as usize);
-                    sub_mc_l1.push(self.mc_params(mb_idx, mb_y, w, sub_part.ref_idx_l1));
-                } else {
-                    sub_mc_l1.push((0, 0, 0, 0, 0, 0)); // unused
-                }
-            }
-
-            for (plane_dc, plane_ac, frame_plane, scale_idx) in [
-                (
-                    &mut chroma_dc_cb,
-                    &chroma_ac_scan_cb,
-                    &mut self.frame.u,
-                    4usize,
-                ),
-                (
-                    &mut chroma_dc_cr,
-                    &chroma_ac_scan_cr,
-                    &mut self.frame.v,
-                    5usize,
-                ),
-            ] {
-                let chroma_scale = &sp.scaling_list_4x4[scale_idx];
-                // Cr (lists 2 and 5) takes the second chroma QP offset
-                let plane_qp_c = if matches!(scale_idx, 2 | 5) {
-                    chroma_qp(qp_y, sp.second_chroma_qp_index_offset)
-                } else {
-                    qp_c
+                    None
                 };
-                if cbp_chroma >= 1 {
-                    inverse_hadamard_2x2(plane_dc);
-                    dequant_chroma_dc(plane_dc, plane_qp_c, chroma_scale[0]);
-                }
-
-                let mut chroma_residual = [0i32; 64];
-                for blk in 0..4 {
-                    let blk_row = (blk / 2) * 4;
-                    let blk_col = (blk % 2) * 4;
-                    let mut block_raster = [0i32; 16];
-                    block_raster[0] = plane_dc[blk];
-                    if cbp_chroma >= 2 {
-                        for scan_idx in 0..15 {
-                            let (r, c) = zigzag_4x4[scan_idx + 1];
-                            block_raster[r * 4 + c] = plane_ac[blk][scan_idx];
-                        }
-                        dequant_4x4_ac_raster(&mut block_raster, plane_qp_c, chroma_scale);
-                    }
-                    inverse_dct_4x4(&mut block_raster);
-                    for r in 0..4 {
-                        for c in 0..4 {
-                            chroma_residual[(blk_row + r) * 8 + blk_col + c] =
-                                block_raster[r * 4 + c];
-                        }
-                    }
-                }
-
-                // Chroma MC for each sub-partition
-                let mut chroma_pred = [0u8; 64];
-                for (sp_i, sub_part) in sub_parts.iter().enumerate() {
-                    let cx_off = sub_part.x / 2;
-                    let cy_off = sub_part.y / 2;
-                    let cw = sub_part.w.max(2) / 2;
-                    let ch = sub_part.h.max(2) / 2;
-                    if cw == 0 || ch == 0 {
-                        continue;
-                    }
-
-                    let chroma_h = (self.height / 2) as usize;
-
-                    let mut part_pred = [0u8; 64];
-                    if sub_part.pred_l0 && sub_part.pred_l1 {
-                        let ref_l0 = ref_pic_safe(sp.ref_pic_list_l0, fri(sub_part.ref_idx_l0))
-                            .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
-                        let ref_l1 = ref_pic_safe(sp.ref_pic_list_l1, fri(sub_part.ref_idx_l1))
-                            .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
-                        let (
-                            _mc_y_l0,
-                            _rs_l0,
-                            _ref_y_off_l0,
-                            mc_cy_l0,
-                            c_ref_stride_l0,
-                            c_ref_off_l0,
-                        ) = sub_mc[sp_i];
-                        let (
-                            _mc_y_l1,
-                            _rs_l1,
-                            _ref_y_off_l1,
-                            mc_cy_l1,
-                            c_ref_stride_l1,
-                            c_ref_off_l1,
-                        ) = sub_mc_l1[sp_i];
-                        let cr_l0 = if scale_idx == 4 {
-                            ref_l0.chroma_ref(0, c_ref_off_l0)
-                        } else {
-                            ref_l0.chroma_ref(1, c_ref_off_l0)
-                        };
-                        let cr_l1 = if scale_idx == 4 {
-                            ref_l1.chroma_ref(0, c_ref_off_l1)
-                        } else {
-                            ref_l1.chroma_ref(1, c_ref_off_l1)
-                        };
-                        let mut c_l0 = vec![0u8; cw * ch];
-                        let mut c_l1 = vec![0u8; cw * ch];
-                        let cmv_y_off_l0 = crate::slice_context::chroma_mv_offset_impl(
-                            (self.field_pic_flag, self.bottom_field_flag),
-                            (self.mbaff, self.width, self.lc_stride, self.lc_offset),
-                            ref_l0,
-                            c_ref_off_l0,
-                        );
-                        let cmv_y_off_l1 = crate::slice_context::chroma_mv_offset_impl(
-                            (self.field_pic_flag, self.bottom_field_flag),
-                            (self.mbaff, self.width, self.lc_stride, self.lc_offset),
-                            ref_l1,
-                            c_ref_off_l1,
-                        );
-                        inter_pred::chroma_mc(
-                            cr_l0,
-                            c_ref_stride_l0,
-                            chroma_h,
-                            (chroma_mb_x + cx_off) as i32,
-                            (mc_cy_l0 + cy_off) as i32,
-                            sub_part.mv_l0[0] as i32,
-                            sub_part.mv_l0[1] as i32 + cmv_y_off_l0,
-                            cw,
-                            ch,
-                            &mut c_l0,
-                        );
-                        inter_pred::chroma_mc(
-                            cr_l1,
-                            c_ref_stride_l1,
-                            chroma_h,
-                            (chroma_mb_x + cx_off) as i32,
-                            (mc_cy_l1 + cy_off) as i32,
-                            sub_part.mv_l1[0] as i32,
-                            sub_part.mv_l1[1] as i32 + cmv_y_off_l1,
-                            cw,
-                            ch,
-                            &mut c_l1,
-                        );
-                        let chroma_comp = if scale_idx == 4 { 0 } else { 1 };
-                        sp.wctx
-                            .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
-                            .apply_bi(
-                                &c_l0,
-                                &c_l1,
-                                &mut part_pred,
-                                sub_part.ref_idx_l0 as usize,
-                                sub_part.ref_idx_l1 as usize,
-                                true,
-                                chroma_comp,
-                            );
-                    } else {
-                        let (ref_list, ref_idx, mv) = if sub_part.pred_l0 {
-                            (sp.ref_pic_list_l0, sub_part.ref_idx_l0, sub_part.mv_l0)
-                        } else {
-                            (sp.ref_pic_list_l1, sub_part.ref_idx_l1, sub_part.mv_l1)
-                        };
-                        let ref_pic = ref_pic_safe(ref_list, fri(ref_idx))
-                            .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
-                        let (_mc_y, _rs, _ref_y_off, mc_cy, c_ref_stride, c_ref_off) = sub_mc[sp_i];
-                        let cr = if scale_idx == 4 {
-                            ref_pic.chroma_ref(0, c_ref_off)
-                        } else {
-                            ref_pic.chroma_ref(1, c_ref_off)
-                        };
-                        let cmv_y_off = crate::slice_context::chroma_mv_offset_impl(
-                            (self.field_pic_flag, self.bottom_field_flag),
-                            (self.mbaff, self.width, self.lc_stride, self.lc_offset),
-                            ref_pic,
-                            c_ref_off,
-                        );
-                        inter_pred::chroma_mc(
-                            cr,
-                            c_ref_stride,
-                            chroma_h,
-                            (chroma_mb_x + cx_off) as i32,
-                            (mc_cy + cy_off) as i32,
-                            mv[0] as i32,
-                            mv[1] as i32 + cmv_y_off,
-                            cw,
-                            ch,
-                            &mut part_pred,
-                        );
-                        if sp.use_weight == 1 {
-                            let chroma_comp = if scale_idx == 4 { 0 } else { 1 };
-                            let (list, ri_val) = if sub_part.pred_l0 {
-                                (0, sub_part.ref_idx_l0 as usize)
-                            } else {
-                                (1, sub_part.ref_idx_l1 as usize)
-                            };
-                            sp.wctx
-                                .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
-                                .apply_uni(&mut part_pred, list, ri_val, true, chroma_comp);
-                        }
-                    }
-                    for r in 0..ch {
-                        for c in 0..cw {
-                            chroma_pred[(cy_off + r) * 8 + cx_off + c] = part_pred[r * cw + c];
-                        }
-                    }
-                }
-
-                for y in 0..8 {
-                    for x in 0..8 {
-                        let val = (chroma_pred[y * 8 + x] as i32 + chroma_residual[y * 8 + x])
-                            .clamp(0, 255) as u8;
-                        frame_plane[self.lc_offset + y * self.lc_stride + chroma_mb_x + x] = val;
-                    }
-                }
+                let m1 = if sub_part.pred_l1 {
+                    let pic = ref_pic_safe(sp.ref_pic_list_l1, fri(sub_part.ref_idx_l1))
+                        .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
+                    Some((&**pic, sub_part.ref_idx_l1, sub_part.mv_l1))
+                } else {
+                    None
+                };
+                self.predict_chroma_part(
+                    mb_idx,
+                    mb_x,
+                    mb_y,
+                    sp,
+                    (sub_part.x, sub_part.y, sub_part.w, sub_part.h),
+                    m0,
+                    m1,
+                );
             }
+            self.add_chroma_residual(&chroma, cbp_chroma, qp_y, false, mb_x, mb_idx, sp);
 
             self.mb_info[mb_idx] = MbInfo {
                 mb_type: MbType::Inter,
@@ -1503,7 +1241,6 @@ impl SliceContext<'_> {
                 self.prev_mb_qp
             };
             self.prev_mb_qp = qp_y;
-            let qp_c = chroma_qp(qp_y, sp.chroma_qp_index_offset);
             // Decode luma residual
             let mut luma_residual = [0i32; 256];
             if use_8x8_dct {
@@ -1636,197 +1373,26 @@ impl SliceContext<'_> {
             }
 
             // Chroma (P-slice inter)
-            let mut chroma_dc_cb = [0i32; 4];
-            let mut chroma_dc_cr = [0i32; 4];
-            if cbp_chroma >= 1 {
-                parse_residual_block_cavlc(reader, &mut chroma_dc_cb, 4, -1)?;
-                parse_residual_block_cavlc(reader, &mut chroma_dc_cr, 4, -1)?;
-            }
-            let mut chroma_ac_scan_cb = [[0i32; 15]; 4];
-            let mut chroma_ac_scan_cr = [[0i32; 15]; 4];
-            if cbp_chroma >= 2 {
-                for blk in 0..4 {
-                    let nc = compute_nc(
-                        self.nc_cb,
-                        mb_idx,
-                        self.mb_width as usize,
-                        blk,
-                        4,
-                        self.mb_slice_id,
-                        self.this_slice_id,
-                        self.mbaff,
-                        self.mb_field_decoding,
-                    );
-                    let tc =
-                        parse_residual_block_cavlc(reader, &mut chroma_ac_scan_cb[blk], 15, nc)?;
-                    self.nc_cb[mb_idx * 4 + blk] = tc;
-                }
-                for blk in 0..4 {
-                    let nc = compute_nc(
-                        self.nc_cr,
-                        mb_idx,
-                        self.mb_width as usize,
-                        blk,
-                        4,
-                        self.mb_slice_id,
-                        self.this_slice_id,
-                        self.mbaff,
-                        self.mb_field_decoding,
-                    );
-                    let tc =
-                        parse_residual_block_cavlc(reader, &mut chroma_ac_scan_cr[blk], 15, nc)?;
-                    self.nc_cr[mb_idx * 4 + blk] = tc;
-                }
-            }
-
-            let chroma_mb_x = mb_x / 2;
-
-            // Precompute mc_params per sub_part before entering the plane loop
-            // (avoids borrow conflict with &mut self.frame inside the loop).
-            let mut p_sub_mc = [(0i32, 0usize, 0usize, 0usize, 0usize, 0usize); 16];
-            for (sp_i, sp_part) in sub_parts.iter().take(sub_part_count).enumerate() {
-                let fri = self.frame_ref_idx(mb_idx, sp_part.ref_idx);
-                let ref_pic = sp
+            let chroma = self.decode_chroma_residual_cavlc(reader, mb_idx, cbp_chroma)?;
+            for sub_part in sub_parts.iter().take(sub_part_count) {
+                let pic = sp
                     .ref_pic_list
-                    .get(fri as usize)
-                    .or_else(|| sp.ref_pic_list.last());
-                let w = ref_pic
-                    .map(|r| r.width as usize)
-                    .unwrap_or(self.width as usize);
-                p_sub_mc[sp_i] = self.mc_params(mb_idx, mb_y, w, sp_part.ref_idx);
+                    .get(self.frame_ref_idx(mb_idx, sub_part.ref_idx) as usize)
+                    .or_else(|| sp.ref_pic_list.last())
+                    .ok_or(DecodeError::InvalidSyntax(
+                        "P sub-partition chroma references empty ref_pic_list",
+                    ))?;
+                self.predict_chroma_part(
+                    mb_idx,
+                    mb_x,
+                    mb_y,
+                    sp,
+                    (sub_part.x, sub_part.y, sub_part.w, sub_part.h),
+                    Some((&**pic, sub_part.ref_idx, sub_part.mv)),
+                    None,
+                );
             }
-
-            // Chroma MC + residual for each chroma plane
-            // Each partition gets its own chroma MC with its own MV
-            {
-                for (plane_dc, plane_ac, frame_plane, scale_idx) in [
-                    (
-                        &mut chroma_dc_cb,
-                        &chroma_ac_scan_cb,
-                        &mut self.frame.u,
-                        4usize,
-                    ),
-                    (
-                        &mut chroma_dc_cr,
-                        &chroma_ac_scan_cr,
-                        &mut self.frame.v,
-                        5usize,
-                    ),
-                ] {
-                    let chroma_scale = &sp.scaling_list_4x4[scale_idx];
-                    // Cr (lists 2 and 5) takes the second chroma QP offset
-                    let plane_qp_c = if matches!(scale_idx, 2 | 5) {
-                        chroma_qp(qp_y, sp.second_chroma_qp_index_offset)
-                    } else {
-                        qp_c
-                    };
-                    if cbp_chroma >= 1 {
-                        inverse_hadamard_2x2(plane_dc);
-                        dequant_chroma_dc(plane_dc, plane_qp_c, chroma_scale[0]);
-                    }
-
-                    let mut chroma_residual = [0i32; 64];
-                    for blk in 0..4 {
-                        let blk_row = (blk / 2) * 4;
-                        let blk_col = (blk % 2) * 4;
-                        let mut block_raster = [0i32; 16];
-                        block_raster[0] = plane_dc[blk];
-                        if cbp_chroma >= 2 {
-                            for scan_idx in 0..15 {
-                                let (r, c) = zigzag_4x4[scan_idx + 1];
-                                block_raster[r * 4 + c] = plane_ac[blk][scan_idx];
-                            }
-                            dequant_4x4_ac_raster(&mut block_raster, plane_qp_c, chroma_scale);
-                        }
-                        inverse_dct_4x4(&mut block_raster);
-                        for r in 0..4 {
-                            for c in 0..4 {
-                                chroma_residual[(blk_row + r) * 8 + blk_col + c] =
-                                    block_raster[r * 4 + c];
-                            }
-                        }
-                    }
-
-                    // MC each sub-partition's chroma region
-                    let mut chroma_pred = [0u8; 64];
-                    for (sp_i, sub_part) in sub_parts.iter().take(sub_part_count).enumerate() {
-                        // Chroma coordinates are half of luma
-                        let cx_off = sub_part.x / 2;
-                        let cy_off = sub_part.y / 2;
-                        let cw = sub_part.w.max(2) / 2; // min chroma block = 1, but MC needs >= 1
-                        let ch = sub_part.h.max(2) / 2;
-                        if cw == 0 || ch == 0 {
-                            continue;
-                        }
-                        let fri_val = p_sub_mc[sp_i]; // mc_params already computed
-                        let _ = fri_val; // ref_idx mapping is embedded in mc_params
-                        let fri = if self.mbaff && self.mb_field_decoding[mb_idx / 2] {
-                            sub_part.ref_idx / 2
-                        } else {
-                            sub_part.ref_idx
-                        };
-                        let part_ref_pic = sp
-                            .ref_pic_list
-                            .get(fri as usize)
-                            .or_else(|| sp.ref_pic_list.last())
-                            .ok_or(DecodeError::InvalidSyntax(
-                                "P sub-partition chroma references empty ref_pic_list",
-                            ))?;
-                        let (_mc_y, _rs, _ref_y_off, mc_cy, c_ref_stride, c_ref_off) =
-                            p_sub_mc[sp_i];
-                        let chroma_ref = if scale_idx == 4 {
-                            part_ref_pic.chroma_ref(0, c_ref_off)
-                        } else {
-                            part_ref_pic.chroma_ref(1, c_ref_off)
-                        };
-                        let mut part_pred = [0u8; 64];
-                        let cmv_y_off = crate::slice_context::chroma_mv_offset_impl(
-                            (self.field_pic_flag, self.bottom_field_flag),
-                            (self.mbaff, self.width, self.lc_stride, self.lc_offset),
-                            part_ref_pic,
-                            c_ref_off,
-                        );
-                        inter_pred::chroma_mc(
-                            chroma_ref,
-                            c_ref_stride,
-                            (self.height / 2) as usize,
-                            (chroma_mb_x + cx_off) as i32,
-                            (mc_cy + cy_off) as i32,
-                            sub_part.mv[0] as i32,
-                            sub_part.mv[1] as i32 + cmv_y_off,
-                            cw,
-                            ch,
-                            &mut part_pred,
-                        );
-                        if sp.use_weight == 1 {
-                            let chroma_comp = if scale_idx == 4 { 0 } else { 1 };
-                            sp.wctx
-                                .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
-                                .apply_uni(
-                                    &mut part_pred,
-                                    0,
-                                    sub_part.ref_idx as usize,
-                                    true,
-                                    chroma_comp,
-                                );
-                        }
-                        for r in 0..ch {
-                            for c in 0..cw {
-                                chroma_pred[(cy_off + r) * 8 + cx_off + c] = part_pred[r * cw + c];
-                            }
-                        }
-                    }
-
-                    for y in 0..8 {
-                        for x in 0..8 {
-                            let val = (chroma_pred[y * 8 + x] as i32 + chroma_residual[y * 8 + x])
-                                .clamp(0, 255) as u8;
-                            frame_plane[self.lc_offset + y * self.lc_stride + chroma_mb_x + x] =
-                                val;
-                        }
-                    }
-                }
-            }
+            self.add_chroma_residual(&chroma, cbp_chroma, qp_y, false, mb_x, mb_idx, sp);
 
             self.mb_info[mb_idx] = MbInfo {
                 mb_type: MbType::Inter,
@@ -1852,7 +1418,6 @@ impl SliceContext<'_> {
         let intra_chroma_pred_mode;
         let cbp_chroma: u8;
         let qp_y;
-        let qp_c;
 
         if mb_type == 0 {
             // === I_NxN (I4x4 or I8x8) macroblock ===
@@ -1921,7 +1486,6 @@ impl SliceContext<'_> {
                 qp_y = self.prev_mb_qp;
             }
             self.prev_mb_qp = qp_y;
-            qp_c = chroma_qp(qp_y, sp.chroma_qp_index_offset);
 
             // Parse luma residual and reconstruct
             if use_8x8_intra {
@@ -2046,7 +1610,6 @@ impl SliceContext<'_> {
             let mb_qp_delta = reader.read_se()?;
             qp_y = ((self.prev_mb_qp + mb_qp_delta + 52) % 52 + 52) % 52;
             self.prev_mb_qp = qp_y;
-            qp_c = chroma_qp(qp_y, sp.chroma_qp_index_offset);
 
             // Parse luma DC
             let mut luma_dc = [0i32; 16];
@@ -2141,7 +1704,8 @@ impl SliceContext<'_> {
                 }
             }
             let cx = mb_x / 2;
-            for r in 0..8 {
+            let ch = 16 >> self.chroma_shift_y();
+            for r in 0..ch {
                 for c in 0..8 {
                     let val = if sp.monochrome {
                         128
@@ -2154,7 +1718,7 @@ impl SliceContext<'_> {
                     }
                 }
             }
-            for r in 0..8 {
+            for r in 0..ch {
                 for c in 0..8 {
                     let val = if sp.monochrome {
                         128
@@ -2170,9 +1734,9 @@ impl SliceContext<'_> {
             for blk in 0..16 {
                 self.nc_luma[mb_idx * 16 + blk] = 16;
             }
-            for blk in 0..4 {
-                self.nc_cb[mb_idx * 4 + blk] = 16;
-                self.nc_cr[mb_idx * 4 + blk] = 16;
+            for blk in 0..8 {
+                self.nc_cb[mb_idx * 8 + blk] = 16;
+                self.nc_cr[mb_idx * 8 + blk] = 16;
             }
             self.mb_info[mb_idx] = MbInfo {
                 mb_type: MbType::Ipcm,
@@ -2197,145 +1761,15 @@ impl SliceContext<'_> {
         // excludes intra neighbors from directional prediction.
 
         // === Reconstruct chroma (shared by I4x4 and I16x16) ===
-        let mut chroma_dc_cb = [0i32; 4];
-        let mut chroma_dc_cr = [0i32; 4];
-        if cbp_chroma >= 1 {
-            parse_residual_block_cavlc(reader, &mut chroma_dc_cb, 4, -1)?;
-            parse_residual_block_cavlc(reader, &mut chroma_dc_cr, 4, -1)?;
-        }
-
-        let mut chroma_ac_scan_cb = [[0i32; 15]; 4];
-        let mut chroma_ac_scan_cr = [[0i32; 15]; 4];
-        if cbp_chroma >= 2 {
-            for blk in 0..4 {
-                let nc = compute_nc(
-                    self.nc_cb,
-                    mb_idx,
-                    self.mb_width as usize,
-                    blk,
-                    4,
-                    self.mb_slice_id,
-                    self.this_slice_id,
-                    self.mbaff,
-                    self.mb_field_decoding,
-                );
-                let tc = parse_residual_block_cavlc(reader, &mut chroma_ac_scan_cb[blk], 15, nc)?;
-                self.nc_cb[mb_idx * 4 + blk] = tc;
-            }
-            for blk in 0..4 {
-                let nc = compute_nc(
-                    self.nc_cr,
-                    mb_idx,
-                    self.mb_width as usize,
-                    blk,
-                    4,
-                    self.mb_slice_id,
-                    self.this_slice_id,
-                    self.mbaff,
-                    self.mb_field_decoding,
-                );
-                let tc = parse_residual_block_cavlc(reader, &mut chroma_ac_scan_cr[blk], 15, nc)?;
-                self.nc_cr[mb_idx * 4 + blk] = tc;
-            }
-        }
-
-        let chroma_mb_x = mb_x / 2;
-
-        // Scaling list indices: 1=Intra Cb, 2=Intra Cr
-        for (plane_dc, plane_ac_scan, plane_buf, scale_idx) in [
-            (
-                &mut chroma_dc_cb,
-                &chroma_ac_scan_cb,
-                &mut self.frame.u,
-                1usize,
-            ),
-            (
-                &mut chroma_dc_cr,
-                &chroma_ac_scan_cr,
-                &mut self.frame.v,
-                2usize,
-            ),
-        ] {
-            let chroma_scale = &sp.scaling_list_4x4[scale_idx];
-            // Cr (lists 2 and 5) takes the second chroma QP offset
-            let plane_qp_c = if matches!(scale_idx, 2 | 5) {
-                chroma_qp(qp_y, sp.second_chroma_qp_index_offset)
-            } else {
-                qp_c
-            };
-            if cbp_chroma >= 1 {
-                inverse_hadamard_2x2(plane_dc);
-                dequant_chroma_dc(plane_dc, plane_qp_c, chroma_scale[0]);
-            }
-
-            let mut chroma_residual = [0i32; 64];
-            for blk in 0..4 {
-                let blk_row = (blk / 2) * 4;
-                let blk_col = (blk % 2) * 4;
-                let mut block_raster = [0i32; 16];
-                block_raster[0] = plane_dc[blk];
-
-                if cbp_chroma >= 2 {
-                    for scan_idx in 0..15 {
-                        let (r, c) = zigzag_4x4[scan_idx + 1];
-                        block_raster[r * 4 + c] = plane_ac_scan[blk][scan_idx];
-                    }
-                    dequant_4x4_ac_raster(&mut block_raster, plane_qp_c, chroma_scale);
-                }
-
-                inverse_dct_4x4(&mut block_raster);
-
-                for r in 0..4 {
-                    for c in 0..4 {
-                        chroma_residual[(blk_row + r) * 8 + blk_col + c] = block_raster[r * 4 + c];
-                    }
-                }
-            }
-
-            let mut chroma_pred = [0u8; 64];
-            let cbase = self.lc_offset;
-            let cstride = self.lc_stride;
-            let above_c: Option<Vec<u8>> = if cbase >= cstride && above_mb_avail {
-                Some(
-                    (0..8)
-                        .map(|x| plane_buf[cbase - cstride + chroma_mb_x + x])
-                        .collect(),
-                )
-            } else {
-                None
-            };
-            let left_c: Option<Vec<u8>> = if chroma_mb_x > 0 && (left_halves[0] || left_halves[1]) {
-                Some(
-                    (0..8)
-                        .map(|y| plane_buf[cbase + y * cstride + chroma_mb_x - 1])
-                        .collect(),
-                )
-            } else {
-                None
-            };
-            let above_left_c = if chroma_mb_x > 0 && cbase >= cstride && above_left_mb_avail {
-                Some(plane_buf[cbase - cstride + chroma_mb_x - 1])
-            } else {
-                None
-            };
-
-            crate::intra_pred::predict_chroma_8x8_halves(
-                intra_chroma_pred_mode,
-                above_c.as_deref(),
-                left_c.as_deref(),
-                left_halves,
-                above_left_c,
-                &mut chroma_pred,
-            );
-
-            for y in 0..8 {
-                for x in 0..8 {
-                    let val = (chroma_pred[y * 8 + x] as i32 + chroma_residual[y * 8 + x])
-                        .clamp(0, 255) as u8;
-                    plane_buf[cbase + y * cstride + chroma_mb_x + x] = val;
-                }
-            }
-        }
+        let chroma = self.decode_chroma_residual_cavlc(reader, mb_idx, cbp_chroma)?;
+        self.write_chroma_intra_pred(
+            mb_x,
+            intra_chroma_pred_mode,
+            above_mb_avail,
+            left_halves,
+            above_left_mb_avail,
+        );
+        self.add_chroma_residual(&chroma, cbp_chroma, qp_y, true, mb_x, mb_idx, sp);
         Ok(())
     }
 }

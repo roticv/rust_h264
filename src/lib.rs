@@ -1,9 +1,10 @@
 //! Pure Rust H.264/AVC video decoder.
 //!
 //! A standalone, portable software H.264 decoder. Supports Baseline, Main,
-//! and High profile (8-bit 4:2:0 progressive), with both CAVLC and CABAC
-//! entropy coding, B-frames, multi-reference, weighted prediction, long-term
-//! references, and multi-slice frames. NEON SIMD acceleration on aarch64,
+//! High and High 4:2:2 profile (8-bit 4:2:0, 4:2:2 and monochrome,
+//! progressive and interlaced), with both CAVLC and CABAC entropy coding,
+//! B-frames, multi-reference, weighted prediction, long-term references, and
+//! multi-slice frames. NEON SIMD acceleration on aarch64,
 //! with an optional `core::simd` backend behind the nightly-only
 //! `portable-simd` feature.
 //!
@@ -19,7 +20,7 @@
 //!
 //! for nal in &nals {
 //!     if let Ok(Some(frame)) = decoder.decode_nal(nal) {
-//!         // `frame` has y/u/v planes (4:2:0), width, height, pic_order_cnt
+//!         // `frame` has y/u/v planes (4:2:0 or 4:2:2), width, height, pic_order_cnt
 //!     }
 //! }
 //! if let Some(frame) = decoder.flush() {
@@ -52,8 +53,9 @@
 //!
 //! # Not supported
 //!
-//! Only 8-bit 4:2:0 and monochrome (4:0:0, output as 4:2:0 with mid-grey
-//! chroma) video is decoded. Streams using 4:2:2 or 4:4:4 chroma, bit
+//! Only 8-bit 4:2:0, 4:2:2 and monochrome (4:0:0, output as 4:2:0 with
+//! mid-grey chroma) video is decoded; [`Frame::chroma_format`](decoder::Frame::chroma_format)
+//! says which layout the chroma planes have. Streams using 4:4:4 chroma, bit
 //! depths above 8 (High 10 and up) or lossless transform
 //! bypass are rejected with [`DecodeError::Unsupported`](error::DecodeError::Unsupported)
 //! on every slice, rather than decoded into wrong pictures.
@@ -77,6 +79,7 @@ mod bitstream;
 mod cabac;
 mod cabac_tables;
 mod cavlc;
+mod chroma;
 #[allow(dead_code)]
 mod deblock;
 mod decode_cabac;

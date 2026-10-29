@@ -684,6 +684,7 @@ mod tests {
                 mb_width: width / 16,
                 is_intra: false,
                 structure: crate::dpb::PictureStructure::Frame,
+                chroma_422: false,
             },
             y_data,
             vec![128; uv_size],

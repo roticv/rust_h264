@@ -511,6 +511,17 @@ impl CabacReader<'_> {
         };
         let abs_base = COEFF_ABS_LEVEL_M1_OFFSET[cat];
         let is_8x8 = cat == 5;
+        // Chroma DC (cat 3): ctxIdxInc is Min(i / NumC8x8, 2), NumC8x8 = 1
+        // for 4:2:0 (4 coefficients) and 2 for 4:2:2 (8); its greater-than-1
+        // context stops at 5 + 3 (spec 9.3.3.1.3)
+        let dc_shift = (cat == 3 && max_coeff == 8) as usize;
+        let ctx_inc = |pos: usize| {
+            if cat == 3 {
+                (pos >> dc_shift).min(2)
+            } else {
+                pos
+            }
+        };
         let sig_8x8 = if field_coded {
             &SIGNIFICANT_COEFF_FLAG_OFFSET_8X8_FIELD
         } else {
@@ -528,7 +539,7 @@ impl CabacReader<'_> {
             let sig_ctx = if is_8x8 {
                 sig_base + sig_8x8[pos] as usize
             } else {
-                sig_base + pos
+                sig_base + ctx_inc(pos)
             };
             let sig = self.get_cabac(&mut state[sig_ctx]);
             if sig != 0 {
@@ -537,7 +548,7 @@ impl CabacReader<'_> {
                 let last_ctx = if is_8x8 {
                     last_base + LAST_COEFF_FLAG_OFFSET_8X8[pos] as usize
                 } else {
-                    last_base + pos
+                    last_base + ctx_inc(pos)
                 };
                 let last = self.get_cabac(&mut state[last_ctx]);
                 if last != 0 {
@@ -573,7 +584,12 @@ impl CabacReader<'_> {
                 1i32
             } else {
                 // |level| > 1: unary coding
-                let gt1_ctx = abs_base + COEFF_ABS_LEVELGT1_CTX[node_ctx] as usize;
+                let gt1_ctx = abs_base
+                    + if cat == 3 {
+                        COEFF_ABS_LEVELGT1_CTX[node_ctx].min(8)
+                    } else {
+                        COEFF_ABS_LEVELGT1_CTX[node_ctx]
+                    } as usize;
                 node_ctx = LEVEL_TRANSITION_GT1[node_ctx] as usize;
 
                 let mut abs_val = 2u32;

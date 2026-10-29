@@ -16,13 +16,45 @@ use crate::slice::{parse_slice_header, SliceHeader, SliceType};
 use crate::slice_context::{SliceContext, SliceParams};
 use crate::sps::{parse_sps, Sps};
 
-/// A decoded YUV 4:2:0 frame.
+/// Chroma sampling of a [`Frame`]'s U and V planes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChromaFormat {
+    /// 4:2:0: chroma planes are half width and half height. Monochrome
+    /// (4:0:0) streams also decode to this, with U and V filled with 128.
+    #[default]
+    Yuv420,
+    /// 4:2:2: chroma planes are half width and full height.
+    Yuv422,
+}
+
+impl ChromaFormat {
+    /// Format of the chroma planes for `chroma_format_idc` (4:0:0 outputs
+    /// mid-grey 4:2:0 planes).
+    pub(crate) fn from_idc(chroma_format_idc: u32) -> Self {
+        if chroma_format_idc == 2 {
+            ChromaFormat::Yuv422
+        } else {
+            ChromaFormat::Yuv420
+        }
+    }
+
+    /// log2 of the luma rows per chroma row: 1 for 4:2:0, 0 for 4:2:2.
+    pub(crate) fn shift_y(self) -> u32 {
+        match self {
+            ChromaFormat::Yuv420 => 1,
+            ChromaFormat::Yuv422 => 0,
+        }
+    }
+}
+
+/// A decoded YUV frame, 4:2:0 or 4:2:2 (see [`Frame::chroma_format`]).
 ///
 /// The Y plane is `width × height` bytes; the U and V planes are each
-/// `(width/2) × (height/2)` bytes (4:2:0 chroma subsampling). Pixels are
-/// stored row-major with no inter-row padding (stride == width). Monochrome
-/// (4:0:0) streams decode to the same layout with U and V filled with 128,
-/// as FFmpeg outputs them.
+/// [`chroma_width`](Frame::chroma_width) × [`chroma_height`](Frame::chroma_height)
+/// bytes: `(width/2) × (height/2)` for 4:2:0, `(width/2) × height` for
+/// 4:2:2. Pixels are stored row-major with no inter-row padding (stride ==
+/// width). Monochrome (4:0:0) streams decode to the 4:2:0 layout with U and
+/// V filled with 128, as FFmpeg outputs them.
 ///
 /// Frames returned by [`Decoder::decode_nal`] are emitted in **decode order**,
 /// not display order. To present them in the intended order, sort by
@@ -36,13 +68,27 @@ pub struct Frame {
     pub height: u32,
     /// Luma plane, `width * height` bytes, row-major.
     pub y: Vec<u8>,
-    /// Cb chroma plane, `(width/2) * (height/2)` bytes, row-major.
+    /// Cb chroma plane, `chroma_width() * chroma_height()` bytes, row-major.
     pub u: Vec<u8>,
-    /// Cr chroma plane, `(width/2) * (height/2)` bytes, row-major.
+    /// Cr chroma plane, `chroma_width() * chroma_height()` bytes, row-major.
     pub v: Vec<u8>,
     /// Picture order count — the H.264 spec's display ordering value.
     /// Use this to sort frames into display order within a GOP.
     pub pic_order_cnt: i32,
+    /// Chroma sampling of `u` and `v`.
+    pub chroma_format: ChromaFormat,
+}
+
+impl Frame {
+    /// Width of the U and V planes.
+    pub fn chroma_width(&self) -> u32 {
+        self.width / 2
+    }
+
+    /// Height of the U and V planes.
+    pub fn chroma_height(&self) -> u32 {
+        self.height >> self.chroma_format.shift_y()
+    }
 }
 
 /// In-progress picture state shared across slices within the same frame.
@@ -327,16 +373,15 @@ impl Decoder {
     }
 }
 
-/// Reject sequences this decoder cannot decode correctly. Only 8-bit 4:2:0
-/// and 4:0:0 with the normal transform path are implemented; anything else would decode
+/// Reject sequences this decoder cannot decode correctly. Only 8-bit 4:2:0,
+/// 4:2:2 and 4:0:0 with the normal transform path are implemented; anything else would decode
 /// to wrong pictures instead of failing. Checked when a slice activates its
 /// SPS (not when the SPS is parsed), so streams that merely carry such an
 /// SPS still decode, and [`parse_sps_info`](crate::nal::parse_sps_info)
 /// can still describe it.
 pub(crate) fn check_supported(sps: &Sps) -> Result<(), DecodeError> {
     match sps.chroma_format_idc {
-        0 | 1 => {}
-        2 => return Err(DecodeError::Unsupported("4:2:2 chroma")),
+        0..=2 => {}
         3 => return Err(DecodeError::Unsupported("4:4:4 chroma")),
         _ => return Err(DecodeError::InvalidSyntax("chroma_format_idc out of range")),
     }
@@ -783,14 +828,17 @@ pub(crate) fn run_slice(
     let ps = if is_continuation {
         pending.take().unwrap()
     } else {
+        let chroma_format = ChromaFormat::from_idc(sps.chroma_format_idc);
+        let chroma_len = ((coded_width / 2) * (coded_height >> chroma_format.shift_y())) as usize;
         PictureState {
             frame: Frame {
                 width,
                 height,
                 y: vec![0u8; (coded_width * coded_height) as usize],
-                u: vec![0u8; (coded_width * coded_height / 4) as usize],
-                v: vec![0u8; (coded_width * coded_height / 4) as usize],
+                u: vec![0u8; chroma_len],
+                v: vec![0u8; chroma_len],
                 pic_order_cnt: current_poc,
+                chroma_format,
             },
             frame_num: header.frame_num,
             poc: current_poc,
@@ -798,8 +846,8 @@ pub(crate) fn run_slice(
             nal_unit_type: plan.nal_unit_type,
             nal_ref_idc: plan.nal_ref_idc,
             nc_luma: vec![0u8; total_mbs * 16],
-            nc_cb: vec![0u8; total_mbs * 4],
-            nc_cr: vec![0u8; total_mbs * 4],
+            nc_cb: vec![0u8; total_mbs * 8],
+            nc_cr: vec![0u8; total_mbs * 8],
             mv_store_l0: vec![[0i16; 2]; total_mbs * 16],
             mv_store_l1: vec![[0i16; 2]; total_mbs * 16],
             ref_idx_store_l0: vec![-1i8; total_mbs * 16],
@@ -1344,6 +1392,7 @@ pub(crate) fn picture_meta(ps: &PictureState) -> PictureMeta {
         } else {
             crate::dpb::PictureStructure::Frame
         },
+        chroma_422: ps.frame.chroma_format == ChromaFormat::Yuv422,
     }
 }
 
@@ -1663,10 +1712,11 @@ pub(crate) fn finish_output(
         {
             return None;
         }
+        let sy = ps.frame.chroma_format.shift_y();
         let chroma_coded_w = coded_w / 2;
         let chroma_w = display_w / 2;
-        let chroma_h = display_h / 2;
-        let (cx0, cy0) = (x0 / 2, y0 / 2);
+        let chroma_h = display_h >> sy;
+        let (cx0, cy0) = (x0 / 2, y0 >> sy);
 
         if x0 == 0 && y0 == 0 && coded_w == display_w {
             // Bottom crop only: the display rows are a prefix of the planes
@@ -1697,13 +1747,15 @@ pub(crate) fn finish_output(
             let full_h = ps.frame_height as usize;
             let field_h = full_h / 2;
             let mut y = vec![0u8; w * full_h];
-            let mut u = vec![0u8; (w / 2) * (full_h / 2)];
-            let mut v = vec![0u8; (w / 2) * (full_h / 2)];
+            let chroma_format = field_frame.chroma_format;
+            let sy = chroma_format.shift_y();
+            let mut u = vec![0u8; (w / 2) * (full_h >> sy)];
+            let mut v = vec![0u8; (w / 2) * (full_h >> sy)];
             let cw = w / 2;
 
             // The two fields must agree on geometry and hold enough samples;
             // a corrupt stream can change SPS dimensions between fields.
-            let ch = full_h / 4;
+            let ch = field_h >> sy;
             let field_ok = |f: &Frame| {
                 f.width as usize == w
                     && f.y.len() >= field_h * w
@@ -1748,6 +1800,7 @@ pub(crate) fn finish_output(
                 width: w as u32,
                 height: full_h as u32,
                 pic_order_cnt: field_frame.pic_order_cnt.min(first_field.pic_order_cnt),
+                chroma_format,
             });
         } else {
             // First field — hold it, return None
@@ -3037,6 +3090,88 @@ mod tests {
         );
     }
 
+    // 4:2:2 streams from x264 (--output-csp i422), SHA-256 of ffmpeg's
+    // yuv422p decode
+
+    #[test]
+    fn test_yuv422_x264_cavlc() {
+        // CAVLC with B-pyramid, explicit weighted P and 8x8 transform: 2x4
+        // chroma DC (nC -2 coeff_token and total_zeros tables), 8 AC blocks
+        // per plane, quarter-sample vertical chroma MVs
+        decode_and_compare_hash(
+            "yuv422_x264_cavlc",
+            24,
+            176,
+            144,
+            "7a50ba6f3dbed359da6f5429a6e3cdfc958e0ec2fc2c6d903e00023de0bf21b9",
+        );
+    }
+
+    #[test]
+    fn test_yuv422_x264_cabac() {
+        // CABAC, weighted P and B, two slices: chroma DC contexts for 8
+        // coefficients
+        decode_and_compare_hash(
+            "yuv422_x264_cabac",
+            24,
+            176,
+            144,
+            "bcdc344e5bbd73673e74abc2ab9330881cf3f33d1bdc26a4896dc10107887b83",
+        );
+    }
+
+    #[test]
+    fn test_yuv422_x264_cabac_mbaff() {
+        // CABAC MBAFF with temporal direct: field MB chroma (16 lines per
+        // MB) and deblocking of mixed frame/field edges
+        decode_and_compare_hash(
+            "yuv422_x264_cabac_mbaff",
+            24,
+            176,
+            144,
+            "3cb0298c93aa9db69e0dfa9e1455e5441fcb21b6304f90d8f5c0b4b51562d004",
+        );
+    }
+
+    #[test]
+    fn test_yuv422_x264_cavlc_mbaff() {
+        // CAVLC MBAFF with spatial direct and two slices: chroma nC
+        // neighbours across frame/field pairs
+        decode_and_compare_hash(
+            "yuv422_x264_cavlc_mbaff",
+            24,
+            176,
+            144,
+            "abd5655addb8d6e84fa4e931edad80bc31d9fecdb64601d51f2b8a31604b9169",
+        );
+    }
+
+    #[test]
+    fn test_yuv422_x264_mbaff_constrained_intra() {
+        // MBAFF with constrained intra prediction: 8x16 chroma DC with
+        // half-available left columns
+        decode_and_compare_hash(
+            "yuv422_x264_mbaff_constrained_intra",
+            24,
+            176,
+            144,
+            "58a7e32def47df01ae875100005075c19a76b72807bf3e1b9ac6d90053ffaabf",
+        );
+    }
+
+    #[test]
+    fn test_yuv422_x264_crop_low_qp() {
+        // 168x136 (cropped) at QP 10: large chroma DC levels and the QP+3
+        // chroma DC scaling
+        decode_and_compare_hash(
+            "yuv422_x264_crop_low_qp",
+            16,
+            168,
+            136,
+            "c42b837c8570844db4dca38655a75ee9351402a278825d7ce932bc711c884f89",
+        );
+    }
+
     // x264 --interlaced (MBAFF) streams, SHA-256 of ffmpeg's decode. Mixed
     // frame/field pairs exercise the spec Table 6-4 neighbours throughout.
 
@@ -3472,7 +3607,6 @@ mod tests {
     #[test]
     fn test_unsupported_formats_are_rejected() {
         for (name, what) in [
-            ("unsupported_422", "4:2:2 chroma"),
             ("unsupported_444", "4:4:4 chroma"),
             ("unsupported_420_10bit", "bit depth above 8"),
             ("unsupported_lossless", "lossless (transform bypass) coding"),

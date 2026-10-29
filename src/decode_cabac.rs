@@ -7,14 +7,13 @@ use crate::error::DecodeError;
 use crate::inter_pred;
 use crate::mv_pred::{predict_mv, predict_mv_sub, ref_pic_safe, MbaffCtx};
 use crate::neighbor::{
-    cabac_amvd, cabac_neighbor_nz_chroma, cabac_neighbor_nz_luma, cabac_neighbor_ref,
-    dequant_4x4_ac_raster, predict_i4x4_mode,
+    cabac_amvd, cabac_neighbor_nz_luma, cabac_neighbor_ref, dequant_4x4_ac_raster,
+    predict_i4x4_mode,
 };
 use crate::residual::{
-    chroma_qp, dequant_4x4_full, dequant_8x8, dequant_chroma_dc, dequant_luma_dc_i16x16,
-    inverse_dct_4x4, inverse_dct_8x8, inverse_hadamard_2x2, inverse_hadamard_4x4,
-    BLOCK_INDEX_TO_OFFSET, OFFSET_TO_BLOCK, ZIGZAG_4X4, ZIGZAG_4X4_FIELD, ZIGZAG_8X8_CABAC,
-    ZIGZAG_8X8_CABAC_FIELD,
+    dequant_4x4_full, dequant_8x8, dequant_luma_dc_i16x16, inverse_dct_4x4, inverse_dct_8x8,
+    inverse_hadamard_4x4, BLOCK_INDEX_TO_OFFSET, OFFSET_TO_BLOCK, ZIGZAG_4X4, ZIGZAG_4X4_FIELD,
+    ZIGZAG_8X8_CABAC, ZIGZAG_8X8_CABAC_FIELD,
 };
 use crate::slice_context::{SliceContext, SliceParams};
 
@@ -315,7 +314,6 @@ impl SliceContext<'_> {
                         self.prev_mb_qp
                     };
                     self.prev_mb_qp = qp_y;
-                    let _qp_c = chroma_qp(qp_y, sp.chroma_qp_index_offset);
 
                     // Decode luma residual + prediction
                     if use_8x8_intra_pb {
@@ -435,172 +433,16 @@ impl SliceContext<'_> {
                     let _chroma_width = (self.width / 2) as usize;
                     let _chroma_mb_x = mb_x / 2;
                     let _chroma_mb_y = mb_y / 2;
-                    let (pred_u, pred_v) = self.predict_chroma_intra(
+                    self.write_chroma_intra_pred(
                         mb_x,
                         intra_chroma_pred_mode,
                         above_mb_avail,
                         left_halves,
                         above_left_mb_avail,
                     );
-
-                    // Chroma DC residual
-                    let mut chroma_dc_cb = [0i32; 4];
-                    let mut chroma_dc_cr = [0i32; 4];
-                    if cbp_chroma >= 1 {
-                        let left_dc_nz = if let Some(left) = self.left_mb(mb_idx) {
-                            (self.mb_cbp[left] >> 6) & 1 != 0
-                        } else {
-                            true
-                        };
-                        let top_dc_nz = if let Some(above) = self.above_mb(mb_idx) {
-                            (self.mb_cbp[above] >> 6) & 1 != 0
-                        } else {
-                            true
-                        };
-                        if cr.decode_coded_block_flag(st, 3, left_dc_nz, top_dc_nz) {
-                            let (coeffs, _) = cr.decode_residual_cabac_field(
-                                st,
-                                3,
-                                4,
-                                self.is_field_coded(mb_idx),
-                            );
-                            for (p, v) in coeffs {
-                                chroma_dc_cb[p] = v;
-                            }
-                            self.mb_cbp[mb_idx] |= 0x40;
-                        }
-
-                        let left_dc_nz_cr = if let Some(left) = self.left_mb(mb_idx) {
-                            (self.mb_cbp[left] >> 7) & 1 != 0
-                        } else {
-                            true
-                        };
-                        let top_dc_nz_cr = if let Some(above) = self.above_mb(mb_idx) {
-                            (self.mb_cbp[above] >> 7) & 1 != 0
-                        } else {
-                            true
-                        };
-                        if cr.decode_coded_block_flag(st, 3, left_dc_nz_cr, top_dc_nz_cr) {
-                            let (coeffs, _) = cr.decode_residual_cabac_field(
-                                st,
-                                3,
-                                4,
-                                self.is_field_coded(mb_idx),
-                            );
-                            for (p, v) in coeffs {
-                                chroma_dc_cr[p] = v;
-                            }
-                            self.mb_cbp[mb_idx] |= 0x80;
-                        }
-                    }
-
-                    // Chroma AC residual
-                    let mut chroma_ac_cb = [[0i32; 15]; 4];
-                    let mut chroma_ac_cr = [[0i32; 15]; 4];
-                    if cbp_chroma >= 2 {
-                        for blk in 0..4 {
-                            let left_nz = cabac_neighbor_nz_chroma(
-                                self.nc_cb,
-                                mb_idx,
-                                self.mb_width as usize,
-                                blk,
-                                true,
-                                true,
-                                self.mb_slice_id,
-                                self.this_slice_id,
-                                self.mbaff,
-                                self.mb_field_decoding,
-                            );
-                            let top_nz = cabac_neighbor_nz_chroma(
-                                self.nc_cb,
-                                mb_idx,
-                                self.mb_width as usize,
-                                blk,
-                                false,
-                                true,
-                                self.mb_slice_id,
-                                self.this_slice_id,
-                                self.mbaff,
-                                self.mb_field_decoding,
-                            );
-                            if cr.decode_coded_block_flag(st, 4, left_nz, top_nz) {
-                                let (coeffs, tc) = cr.decode_residual_cabac_field(
-                                    st,
-                                    4,
-                                    15,
-                                    self.is_field_coded(mb_idx),
-                                );
-                                self.nc_cb[mb_idx * 4 + blk] = tc;
-                                for (p, v) in coeffs {
-                                    chroma_ac_cb[blk][p] = v;
-                                }
-                            }
-                        }
-                        for blk in 0..4 {
-                            let left_nz = cabac_neighbor_nz_chroma(
-                                self.nc_cr,
-                                mb_idx,
-                                self.mb_width as usize,
-                                blk,
-                                true,
-                                true,
-                                self.mb_slice_id,
-                                self.this_slice_id,
-                                self.mbaff,
-                                self.mb_field_decoding,
-                            );
-                            let top_nz = cabac_neighbor_nz_chroma(
-                                self.nc_cr,
-                                mb_idx,
-                                self.mb_width as usize,
-                                blk,
-                                false,
-                                true,
-                                self.mb_slice_id,
-                                self.this_slice_id,
-                                self.mbaff,
-                                self.mb_field_decoding,
-                            );
-                            if cr.decode_coded_block_flag(st, 4, left_nz, top_nz) {
-                                let (coeffs, tc) = cr.decode_residual_cabac_field(
-                                    st,
-                                    4,
-                                    15,
-                                    self.is_field_coded(mb_idx),
-                                );
-                                self.nc_cr[mb_idx * 4 + blk] = tc;
-                                for (p, v) in coeffs {
-                                    chroma_ac_cr[blk][p] = v;
-                                }
-                            }
-                        }
-                    }
-
-                    // Chroma reconstruction
-                    {
-                        self.reconstruct_chroma_plane(
-                            &mut chroma_dc_cb,
-                            &chroma_ac_cb,
-                            &pred_u,
-                            true,
-                            cbp_chroma,
-                            _qp_c,
-                            &sp.scaling_list_4x4[1],
-                            mb_x,
-                            mb_idx,
-                        );
-                        self.reconstruct_chroma_plane(
-                            &mut chroma_dc_cr,
-                            &chroma_ac_cr,
-                            &pred_v,
-                            false,
-                            cbp_chroma,
-                            chroma_qp(qp_y, sp.second_chroma_qp_index_offset),
-                            &sp.scaling_list_4x4[2],
-                            mb_x,
-                            mb_idx,
-                        );
-                    }
+                    let chroma =
+                        self.decode_chroma_residual_cabac(cr, st, mb_idx, cbp_chroma, true);
+                    self.add_chroma_residual(&chroma, cbp_chroma, qp_y, true, mb_x, mb_idx, sp);
                     self.mb_info[mb_idx] = MbInfo {
                         mb_type: MbType::Intra,
                         qp_y,
@@ -634,7 +476,6 @@ impl SliceContext<'_> {
                     self.last_qp_delta_nonzero = delta != 0;
                     let qp_y = ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52;
                     self.prev_mb_qp = qp_y;
-                    let qp_c = chroma_qp(qp_y, sp.chroma_qp_index_offset);
 
                     // Luma DC (cat=0, 16 coefficients)
                     let mut luma_dc = [0i32; 16];
@@ -749,172 +590,17 @@ impl SliceContext<'_> {
                     let _chroma_width = (self.width / 2) as usize;
                     let _chroma_mb_x = mb_x / 2;
                     let _chroma_mb_y = mb_y / 2;
-                    let (pred_u, pred_v) = self.predict_chroma_intra(
+                    self.write_chroma_intra_pred(
                         mb_x,
                         intra_chroma_pred_mode,
                         above_mb_avail,
                         left_halves,
                         above_left_mb_avail,
                     );
-
-                    // Chroma DC residual
-                    let mut chroma_dc_cb = [0i32; 4];
-                    let mut chroma_dc_cr = [0i32; 4];
-                    if cbp_chroma >= 1 {
-                        let left_dc_nz = if let Some(left) = self.left_mb(mb_idx) {
-                            (self.mb_cbp[left] >> 6) & 1 != 0
-                        } else {
-                            true
-                        };
-                        let top_dc_nz = if let Some(above) = self.above_mb(mb_idx) {
-                            (self.mb_cbp[above] >> 6) & 1 != 0
-                        } else {
-                            true
-                        };
-                        if cr.decode_coded_block_flag(st, 3, left_dc_nz, top_dc_nz) {
-                            let (coeffs, _) = cr.decode_residual_cabac_field(
-                                st,
-                                3,
-                                4,
-                                self.is_field_coded(mb_idx),
-                            );
-                            for (p, v) in coeffs {
-                                chroma_dc_cb[p] = v;
-                            }
-                            self.mb_cbp[mb_idx] |= 0x40;
-                        }
-                        let left_dc_nz_cr = if let Some(left) = self.left_mb(mb_idx) {
-                            (self.mb_cbp[left] >> 7) & 1 != 0
-                        } else {
-                            true
-                        };
-                        let top_dc_nz_cr = if let Some(above) = self.above_mb(mb_idx) {
-                            (self.mb_cbp[above] >> 7) & 1 != 0
-                        } else {
-                            true
-                        };
-                        if cr.decode_coded_block_flag(st, 3, left_dc_nz_cr, top_dc_nz_cr) {
-                            let (coeffs, _) = cr.decode_residual_cabac_field(
-                                st,
-                                3,
-                                4,
-                                self.is_field_coded(mb_idx),
-                            );
-                            for (p, v) in coeffs {
-                                chroma_dc_cr[p] = v;
-                            }
-                            self.mb_cbp[mb_idx] |= 0x80;
-                        }
-                    }
-
-                    // Chroma AC residual
-                    let mut chroma_ac_cb = [[0i32; 15]; 4];
-                    let mut chroma_ac_cr = [[0i32; 15]; 4];
-                    if cbp_chroma >= 2 {
-                        for blk in 0..4 {
-                            let left_nz = cabac_neighbor_nz_chroma(
-                                self.nc_cb,
-                                mb_idx,
-                                self.mb_width as usize,
-                                blk,
-                                true,
-                                true,
-                                self.mb_slice_id,
-                                self.this_slice_id,
-                                self.mbaff,
-                                self.mb_field_decoding,
-                            );
-                            let top_nz = cabac_neighbor_nz_chroma(
-                                self.nc_cb,
-                                mb_idx,
-                                self.mb_width as usize,
-                                blk,
-                                false,
-                                true,
-                                self.mb_slice_id,
-                                self.this_slice_id,
-                                self.mbaff,
-                                self.mb_field_decoding,
-                            );
-                            if cr.decode_coded_block_flag(st, 4, left_nz, top_nz) {
-                                let (coeffs, tc) = cr.decode_residual_cabac_field(
-                                    st,
-                                    4,
-                                    15,
-                                    self.is_field_coded(mb_idx),
-                                );
-                                self.nc_cb[mb_idx * 4 + blk] = tc;
-                                for (p, v) in coeffs {
-                                    chroma_ac_cb[blk][p] = v;
-                                }
-                            }
-                        }
-                        for blk in 0..4 {
-                            let left_nz = cabac_neighbor_nz_chroma(
-                                self.nc_cr,
-                                mb_idx,
-                                self.mb_width as usize,
-                                blk,
-                                true,
-                                true,
-                                self.mb_slice_id,
-                                self.this_slice_id,
-                                self.mbaff,
-                                self.mb_field_decoding,
-                            );
-                            let top_nz = cabac_neighbor_nz_chroma(
-                                self.nc_cr,
-                                mb_idx,
-                                self.mb_width as usize,
-                                blk,
-                                false,
-                                true,
-                                self.mb_slice_id,
-                                self.this_slice_id,
-                                self.mbaff,
-                                self.mb_field_decoding,
-                            );
-                            if cr.decode_coded_block_flag(st, 4, left_nz, top_nz) {
-                                let (coeffs, tc) = cr.decode_residual_cabac_field(
-                                    st,
-                                    4,
-                                    15,
-                                    self.is_field_coded(mb_idx),
-                                );
-                                self.nc_cr[mb_idx * 4 + blk] = tc;
-                                for (p, v) in coeffs {
-                                    chroma_ac_cr[blk][p] = v;
-                                }
-                            }
-                        }
-                    }
+                    let chroma =
+                        self.decode_chroma_residual_cabac(cr, st, mb_idx, cbp_chroma, true);
                     self.mb_cbp[mb_idx] |= (cbp_luma as u16) | ((cbp_chroma as u16) << 4);
-
-                    // Chroma reconstruction
-                    {
-                        self.reconstruct_chroma_plane(
-                            &mut chroma_dc_cb,
-                            &chroma_ac_cb,
-                            &pred_u,
-                            true,
-                            cbp_chroma,
-                            qp_c,
-                            &sp.scaling_list_4x4[1],
-                            mb_x,
-                            mb_idx,
-                        );
-                        self.reconstruct_chroma_plane(
-                            &mut chroma_dc_cr,
-                            &chroma_ac_cr,
-                            &pred_v,
-                            false,
-                            cbp_chroma,
-                            chroma_qp(qp_y, sp.second_chroma_qp_index_offset),
-                            &sp.scaling_list_4x4[2],
-                            mb_x,
-                            mb_idx,
-                        );
-                    }
+                    self.add_chroma_residual(&chroma, cbp_chroma, qp_y, true, mb_x, mb_idx, sp);
 
                     self.mb_info[mb_idx] = MbInfo {
                         mb_type: MbType::Intra,
@@ -924,7 +610,15 @@ impl SliceContext<'_> {
                 } else {
                     // I_PCM in P/B via CABAC
                     let pcm_pos = cr.pcm_byte_position();
-                    if pcm_pos + if sp.monochrome { 256 } else { 384 } > rbsp.len() {
+                    if pcm_pos
+                        + 256
+                        + if sp.monochrome {
+                            0
+                        } else {
+                            16 * (16 >> self.chroma_shift_y())
+                        }
+                        > rbsp.len()
+                    {
                         return Err(DecodeError::UnexpectedEof);
                     }
                     let pcm_data = &rbsp[pcm_pos..];
@@ -939,7 +633,8 @@ impl SliceContext<'_> {
                         }
                     }
                     let cx = mb_x / 2;
-                    for r in 0..8 {
+                    let ch = 16 >> self.chroma_shift_y();
+                    for r in 0..ch {
                         for c in 0..8 {
                             let idx = self.lc_offset + r * self.lc_stride + cx + c;
                             if idx < self.frame.u.len() {
@@ -948,7 +643,7 @@ impl SliceContext<'_> {
                             off += usize::from(!sp.monochrome);
                         }
                     }
-                    for r in 0..8 {
+                    for r in 0..ch {
                         for c in 0..8 {
                             let idx = self.lc_offset + r * self.lc_stride + cx + c;
                             if idx < self.frame.v.len() {
@@ -960,9 +655,9 @@ impl SliceContext<'_> {
                     for blk in 0..16 {
                         self.nc_luma[mb_idx * 16 + blk] = 16;
                     }
-                    for blk in 0..4 {
-                        self.nc_cb[mb_idx * 4 + blk] = 16;
-                        self.nc_cr[mb_idx * 4 + blk] = 16;
+                    for blk in 0..8 {
+                        self.nc_cb[mb_idx * 8 + blk] = 16;
+                        self.nc_cr[mb_idx * 8 + blk] = 16;
                     }
                     cr.reinit(pcm_pos + off);
                     // mb_qp_delta is absent: QP_Y (and the next MB's prediction) is
@@ -1141,7 +836,6 @@ impl SliceContext<'_> {
                         }
                     }
                     // Chroma MC for P_8x8 (per sub-partition)
-                    let cx = mb_x / 2;
                     for smb in 0..4 {
                         let (sy, sx) = sub_mb_origins[smb];
                         let ref_pic = sp
@@ -1151,8 +845,6 @@ impl SliceContext<'_> {
                             .ok_or(DecodeError::InvalidSyntax(
                                 "P_8x8 references empty ref_pic_list",
                             ))?;
-                        let (_mc_y, _rs, _ref_y_off, mc_cy, c_ref_stride, c_ref_off) =
-                            self.mc_params(mb_idx, mb_y, ref_pic.width as usize, sub_ref[smb]);
                         let sub_parts: &[(usize, usize, usize, usize)] = match sub_mb_types[smb] {
                             0 => &[(0, 0, 8, 8)],
                             1 => &[(0, 0, 8, 4), (0, 4, 8, 4)],
@@ -1161,66 +853,18 @@ impl SliceContext<'_> {
                             _ => &[(0, 0, 8, 8)],
                         };
                         for &(dx, dy, spw, sph) in sub_parts {
-                            let px = sx + dx;
-                            let py = sy + dy;
-                            let blk_idx = OFFSET_TO_BLOCK[py / 4][px / 4];
-                            let mv = self.mv_store_l0[mb_idx * 16 + blk_idx];
-                            let ccx = px / 2;
-                            let ccy = py / 2;
-                            let ccw = spw.max(2) / 2;
-                            let cch = sph.max(2) / 2;
-                            if ccw == 0 || cch == 0 {
-                                continue;
-                            }
-                            let mut cb_pred = [0u8; 64]; // stack: max 8x8
-                            let mut cr_pred_buf = [0u8; 64]; // stack: max 8x8
-                            let cmv_y = mv[1] as i32 + self.chroma_mv_offset(ref_pic, c_ref_off);
-                            inter_pred::chroma_mc(
-                                ref_pic.chroma_ref(0, c_ref_off),
-                                c_ref_stride,
-                                (self.height / 2) as usize,
-                                (cx + ccx) as i32,
-                                (mc_cy + ccy) as i32,
-                                mv[0] as i32,
-                                cmv_y,
-                                ccw,
-                                cch,
-                                &mut cb_pred,
+                            let (px, py) = (sx + dx, sy + dy);
+                            let mv =
+                                self.mv_store_l0[mb_idx * 16 + OFFSET_TO_BLOCK[py / 4][px / 4]];
+                            self.predict_chroma_part(
+                                mb_idx,
+                                mb_x,
+                                mb_y,
+                                sp,
+                                (px, py, spw, sph),
+                                Some((&**ref_pic, sub_ref[smb], mv)),
+                                None,
                             );
-                            inter_pred::chroma_mc(
-                                ref_pic.chroma_ref(1, c_ref_off),
-                                c_ref_stride,
-                                (self.height / 2) as usize,
-                                (cx + ccx) as i32,
-                                (mc_cy + ccy) as i32,
-                                mv[0] as i32,
-                                cmv_y,
-                                ccw,
-                                cch,
-                                &mut cr_pred_buf,
-                            );
-                            if sp.use_weight == 1 {
-                                sp.wctx
-                                    .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
-                                    .apply_uni(&mut cb_pred, 0, sub_ref[smb] as usize, true, 0);
-                                sp.wctx
-                                    .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
-                                    .apply_uni(&mut cr_pred_buf, 0, sub_ref[smb] as usize, true, 1);
-                            }
-                            for r in 0..cch {
-                                for c in 0..ccw {
-                                    self.frame.u[self.lc_offset
-                                        + (ccy + r) * self.lc_stride
-                                        + cx
-                                        + ccx
-                                        + c] = cb_pred[r * ccw + c];
-                                    self.frame.v[self.lc_offset
-                                        + (ccy + r) * self.lc_stride
-                                        + cx
-                                        + ccx
-                                        + c] = cr_pred_buf[r * ccw + c];
-                                }
-                            }
                         }
                     }
                 } else {
@@ -1334,7 +978,7 @@ impl SliceContext<'_> {
                             .ok_or(DecodeError::InvalidSyntax(
                                 "P 16x8/8x16 references empty ref_pic_list",
                             ))?;
-                        let (mc_y, ref_stride, ref_y_off, mc_cy, c_ref_stride, c_ref_off) =
+                        let (mc_y, ref_stride, ref_y_off, _, _, _) =
                             self.mc_params(mb_idx, mb_y, ref_pic.width as usize, part_ref[p]);
                         let mut luma_pred = [0u8; 256]; // stack: max 16x16
                         inter_pred::luma_mc_stride(
@@ -1364,61 +1008,15 @@ impl SliceContext<'_> {
                             }
                         }
 
-                        // Chroma
-                        let cx_off = px_off / 2;
-                        let cy_off = py_off / 2;
-                        let chroma_mb_x = mb_x / 2;
-                        let chw = part_w.max(2) / 2;
-                        let chh = part_h.max(2) / 2;
-                        let mut cb_pred = [0u8; 64]; // stack: max 8x8
-                        let mut cr_pred_buf = [0u8; 64]; // stack: max 8x8
-                        let cmv_y = mv[1] as i32 + self.chroma_mv_offset(ref_pic, c_ref_off);
-                        inter_pred::chroma_mc(
-                            ref_pic.chroma_ref(0, c_ref_off),
-                            c_ref_stride,
-                            (self.height / 2) as usize,
-                            (chroma_mb_x + cx_off) as i32,
-                            (mc_cy + cy_off) as i32,
-                            mv[0] as i32,
-                            cmv_y,
-                            chw,
-                            chh,
-                            &mut cb_pred,
+                        self.predict_chroma_part(
+                            mb_idx,
+                            mb_x,
+                            mb_y,
+                            sp,
+                            (px_off, py_off, part_w, part_h),
+                            Some((&**ref_pic, part_ref[p], mv)),
+                            None,
                         );
-                        inter_pred::chroma_mc(
-                            ref_pic.chroma_ref(1, c_ref_off),
-                            c_ref_stride,
-                            (self.height / 2) as usize,
-                            (chroma_mb_x + cx_off) as i32,
-                            (mc_cy + cy_off) as i32,
-                            mv[0] as i32,
-                            cmv_y,
-                            chw,
-                            chh,
-                            &mut cr_pred_buf,
-                        );
-                        if sp.use_weight == 1 {
-                            sp.wctx
-                                .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
-                                .apply_uni(&mut cb_pred, 0, part_ref[p] as usize, true, 0);
-                            sp.wctx
-                                .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
-                                .apply_uni(&mut cr_pred_buf, 0, part_ref[p] as usize, true, 1);
-                        }
-                        for r in 0..chh {
-                            for c in 0..chw {
-                                self.frame.u[self.lc_offset
-                                    + (cy_off + r) * self.lc_stride
-                                    + chroma_mb_x
-                                    + cx_off
-                                    + c] = cb_pred[r * chw + c];
-                                self.frame.v[self.lc_offset
-                                    + (cy_off + r) * self.lc_stride
-                                    + chroma_mb_x
-                                    + cx_off
-                                    + c] = cr_pred_buf[r * chw + c];
-                            }
-                        }
                     }
                 }
 
@@ -1579,138 +1177,8 @@ impl SliceContext<'_> {
                 }
 
                 // Chroma residual
-                let qp_c = chroma_qp(qp_y, sp.chroma_qp_index_offset);
-                if cbp_chroma >= 1 {
-                    let mut chroma_dc_cb = [0i32; 4];
-                    let mut chroma_dc_cr = [0i32; 4];
-                    let left_dc_nz = if let Some(left) = self.left_mb(mb_idx) {
-                        (self.mb_cbp[left] >> 6) & 1 != 0
-                    } else {
-                        false
-                    };
-                    let top_dc_nz = if let Some(above) = self.above_mb(mb_idx) {
-                        (self.mb_cbp[above] >> 6) & 1 != 0
-                    } else {
-                        false
-                    };
-                    if cr.decode_coded_block_flag(st, 3, left_dc_nz, top_dc_nz) {
-                        let (coeffs, _) =
-                            cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx));
-                        for (pos, val) in coeffs {
-                            chroma_dc_cb[pos] = val;
-                        }
-                        self.mb_cbp[mb_idx] |= 0x40;
-                    }
-                    let left_dc_cr = if let Some(left) = self.left_mb(mb_idx) {
-                        (self.mb_cbp[left] >> 7) & 1 != 0
-                    } else {
-                        false
-                    };
-                    let top_dc_cr = if let Some(above) = self.above_mb(mb_idx) {
-                        (self.mb_cbp[above] >> 7) & 1 != 0
-                    } else {
-                        false
-                    };
-                    if cr.decode_coded_block_flag(st, 3, left_dc_cr, top_dc_cr) {
-                        let (coeffs, _) =
-                            cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx));
-                        for (pos, val) in coeffs {
-                            chroma_dc_cr[pos] = val;
-                        }
-                        self.mb_cbp[mb_idx] |= 0x80;
-                    }
-
-                    let chroma_mb_x = mb_x / 2;
-                    let lc_off = self.lc_offset;
-                    let lc_str = self.lc_stride;
-                    let is_field_mb = self.is_field_coded(mb_idx);
-                    for (plane_dc, frame_plane, scale_idx) in [
-                        (&mut chroma_dc_cb, &mut self.frame.u, 4usize),
-                        (&mut chroma_dc_cr, &mut self.frame.v, 5usize),
-                    ] {
-                        let chroma_scale = &sp.scaling_list_4x4[scale_idx];
-                        // Cr (lists 2 and 5) takes the second chroma QP offset
-                        let plane_qp_c = if matches!(scale_idx, 2 | 5) {
-                            chroma_qp(qp_y, sp.second_chroma_qp_index_offset)
-                        } else {
-                            qp_c
-                        };
-                        inverse_hadamard_2x2(plane_dc);
-                        dequant_chroma_dc(plane_dc, plane_qp_c, chroma_scale[0]);
-                        let mut chroma_residual = [0i32; 64];
-                        for blk in 0..4 {
-                            let blk_row = (blk / 2) * 4;
-                            let blk_col = (blk % 2) * 4;
-                            let mut block_raster = [0i32; 16];
-                            block_raster[0] = plane_dc[blk];
-                            if cbp_chroma >= 2 {
-                                let nc_arr = if scale_idx == 4 {
-                                    &self.nc_cb
-                                } else {
-                                    &self.nc_cr
-                                };
-                                let left_nz = cabac_neighbor_nz_chroma(
-                                    nc_arr,
-                                    mb_idx,
-                                    self.mb_width as usize,
-                                    blk,
-                                    true,
-                                    false,
-                                    self.mb_slice_id,
-                                    self.this_slice_id,
-                                    self.mbaff,
-                                    self.mb_field_decoding,
-                                );
-                                let top_nz = cabac_neighbor_nz_chroma(
-                                    nc_arr,
-                                    mb_idx,
-                                    self.mb_width as usize,
-                                    blk,
-                                    false,
-                                    false,
-                                    self.mb_slice_id,
-                                    self.this_slice_id,
-                                    self.mbaff,
-                                    self.mb_field_decoding,
-                                );
-                                if cr.decode_coded_block_flag(st, 4, left_nz, top_nz) {
-                                    let (coeffs, tc) =
-                                        cr.decode_residual_cabac_field(st, 4, 15, is_field_mb);
-                                    if scale_idx == 4 {
-                                        self.nc_cb[mb_idx * 4 + blk] = tc;
-                                    } else {
-                                        self.nc_cr[mb_idx * 4 + blk] = tc;
-                                    }
-                                    for (pos, val) in coeffs {
-                                        let (r, c) = zigzag_4x4[pos + 1];
-                                        block_raster[r * 4 + c] = val;
-                                    }
-                                    dequant_4x4_ac_raster(
-                                        &mut block_raster,
-                                        plane_qp_c,
-                                        chroma_scale,
-                                    );
-                                }
-                            }
-                            inverse_dct_4x4(&mut block_raster);
-                            for r in 0..4 {
-                                for c in 0..4 {
-                                    chroma_residual[(blk_row + r) * 8 + blk_col + c] =
-                                        block_raster[r * 4 + c];
-                                }
-                            }
-                        }
-                        for y in 0..8 {
-                            for x in 0..8 {
-                                let val = (frame_plane[lc_off + y * lc_str + chroma_mb_x + x]
-                                    as i32
-                                    + chroma_residual[y * 8 + x])
-                                    .clamp(0, 255) as u8;
-                                frame_plane[lc_off + y * lc_str + chroma_mb_x + x] = val;
-                            }
-                        }
-                    }
-                }
+                let chroma = self.decode_chroma_residual_cabac(cr, st, mb_idx, cbp_chroma, false);
+                self.add_chroma_residual(&chroma, cbp_chroma, qp_y, false, mb_x, mb_idx, sp);
 
                 self.mb_info[mb_idx] = MbInfo {
                     mb_type: MbType::Inter,
@@ -2850,196 +2318,35 @@ impl SliceContext<'_> {
                         }
                     }
                     // Chroma MC
-                    let chroma_h = (self.height / 2) as usize;
-                    let cx = abs_x / 2;
-                    let chw = sub_part.w.max(2) / 2;
-                    let chh = sub_part.h.max(2) / 2;
-
-                    for plane_idx in 0..2 {
-                        let mut chroma_pred = [0u8; 64]; // stack: max 8x8
-                        if sub_part.pred_l0 && sub_part.pred_l1 {
-                            let ref_l0 = ref_pic_safe(
-                                sp.ref_pic_list_l0,
-                                self.frame_ref_idx(mb_idx, sub_part.ref_idx_l0),
-                            )
-                            .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
-                            let ref_l1 = ref_pic_safe(
-                                sp.ref_pic_list_l1,
-                                self.frame_ref_idx(mb_idx, sub_part.ref_idx_l1),
-                            )
-                            .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
-                            let (
-                                _mc_y_l0,
-                                _rs_l0,
-                                _ref_y_off_l0,
-                                mc_cy_l0,
-                                c_ref_stride_l0,
-                                c_ref_off_l0,
-                            ) = self.mc_params(
-                                mb_idx,
-                                mb_y,
-                                ref_l0.width as usize,
-                                sub_part.ref_idx_l0,
-                            );
-                            let (
-                                _mc_y_l1,
-                                _rs_l1,
-                                _ref_y_off_l1,
-                                mc_cy_l1,
-                                c_ref_stride_l1,
-                                c_ref_off_l1,
-                            ) = self.mc_params(
-                                mb_idx,
-                                mb_y,
-                                ref_l1.width as usize,
-                                sub_part.ref_idx_l1,
-                            );
-                            let cr0 = if plane_idx == 0 {
-                                ref_l0.chroma_ref(0, c_ref_off_l0)
-                            } else {
-                                ref_l0.chroma_ref(1, c_ref_off_l0)
-                            };
-                            let cr1 = if plane_idx == 0 {
-                                ref_l1.chroma_ref(0, c_ref_off_l1)
-                            } else {
-                                ref_l1.chroma_ref(1, c_ref_off_l1)
-                            };
-                            let mut c0 = vec![0u8; chw * chh];
-                            let mut c1 = vec![0u8; chw * chh];
-                            let cy_off = sub_part.y / 2;
-                            let cmv_y_l0 = sub_part.mv_l0[1] as i32
-                                + self.chroma_mv_offset(ref_l0, c_ref_off_l0);
-                            let cmv_y_l1 = sub_part.mv_l1[1] as i32
-                                + self.chroma_mv_offset(ref_l1, c_ref_off_l1);
-                            inter_pred::chroma_mc(
-                                cr0,
-                                c_ref_stride_l0,
-                                chroma_h,
-                                cx as i32,
-                                (mc_cy_l0 + cy_off) as i32,
-                                sub_part.mv_l0[0] as i32,
-                                cmv_y_l0,
-                                chw,
-                                chh,
-                                &mut c0,
-                            );
-                            inter_pred::chroma_mc(
-                                cr1,
-                                c_ref_stride_l1,
-                                chroma_h,
-                                cx as i32,
-                                (mc_cy_l1 + cy_off) as i32,
-                                sub_part.mv_l1[0] as i32,
-                                cmv_y_l1,
-                                chw,
-                                chh,
-                                &mut c1,
-                            );
-                            sp.wctx
-                                .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
-                                .apply_bi(
-                                    &c0,
-                                    &c1,
-                                    &mut chroma_pred,
-                                    sub_part.ref_idx_l0 as usize,
-                                    sub_part.ref_idx_l1 as usize,
-                                    true,
-                                    plane_idx,
-                                );
-                        } else if sub_part.pred_l0 {
-                            let ref_pic = ref_pic_safe(
-                                sp.ref_pic_list_l0,
-                                self.frame_ref_idx(mb_idx, sub_part.ref_idx_l0),
-                            )
-                            .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
-                            let (_mc_y, _rs, _ref_y_off, mc_cy, c_ref_stride, c_ref_off) = self
-                                .mc_params(
-                                    mb_idx,
-                                    mb_y,
-                                    ref_pic.width as usize,
-                                    sub_part.ref_idx_l0,
-                                );
-                            let plane = if plane_idx == 0 {
-                                ref_pic.chroma_ref(0, c_ref_off)
-                            } else {
-                                ref_pic.chroma_ref(1, c_ref_off)
-                            };
-                            let cy_off = sub_part.y / 2;
-                            let cmv_y = sub_part.mv_l0[1] as i32
-                                + self.chroma_mv_offset(ref_pic, c_ref_off);
-                            inter_pred::chroma_mc(
-                                plane,
-                                c_ref_stride,
-                                chroma_h,
-                                cx as i32,
-                                (mc_cy + cy_off) as i32,
-                                sub_part.mv_l0[0] as i32,
-                                cmv_y,
-                                chw,
-                                chh,
-                                &mut chroma_pred,
-                            );
-                            if sp.use_weight == 1 {
-                                sp.wctx
-                                    .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
-                                    .apply_uni(
-                                        &mut chroma_pred,
-                                        0,
-                                        sub_part.ref_idx_l0 as usize,
-                                        true,
-                                        plane_idx,
-                                    );
-                            }
-                        } else if sub_part.pred_l1 {
-                            let ref_pic = ref_pic_safe(
-                                sp.ref_pic_list_l1,
-                                self.frame_ref_idx(mb_idx, sub_part.ref_idx_l1),
-                            )
-                            .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
-                            let (_mc_y, _rs, _ref_y_off, mc_cy, c_ref_stride, c_ref_off) = self
-                                .mc_params(
-                                    mb_idx,
-                                    mb_y,
-                                    ref_pic.width as usize,
-                                    sub_part.ref_idx_l1,
-                                );
-                            let plane = if plane_idx == 0 {
-                                ref_pic.chroma_ref(0, c_ref_off)
-                            } else {
-                                ref_pic.chroma_ref(1, c_ref_off)
-                            };
-                            let cy_off = sub_part.y / 2;
-                            let cmv_y = sub_part.mv_l1[1] as i32
-                                + self.chroma_mv_offset(ref_pic, c_ref_off);
-                            inter_pred::chroma_mc(
-                                plane,
-                                c_ref_stride,
-                                chroma_h,
-                                cx as i32,
-                                (mc_cy + cy_off) as i32,
-                                sub_part.mv_l1[0] as i32,
-                                cmv_y,
-                                chw,
-                                chh,
-                                &mut chroma_pred,
-                            );
-                        }
-
-                        let fp = if plane_idx == 0 {
-                            &mut self.frame.u
-                        } else {
-                            &mut self.frame.v
-                        };
-                        let local_cy = sub_part.y / 2;
-                        let lc_off = self.lc_offset;
-                        let lc_str = self.lc_stride;
-                        for r in 0..chh {
-                            for c in 0..chw {
-                                fp[lc_off + (local_cy + r) * lc_str + cx + c] =
-                                    chroma_pred[r * chw + c];
-                            }
-                        }
-                    }
+                    let m0 = if sub_part.pred_l0 {
+                        let pic = ref_pic_safe(
+                            sp.ref_pic_list_l0,
+                            self.frame_ref_idx(mb_idx, sub_part.ref_idx_l0),
+                        )
+                        .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
+                        Some((&**pic, sub_part.ref_idx_l0, sub_part.mv_l0))
+                    } else {
+                        None
+                    };
+                    let m1 = if sub_part.pred_l1 {
+                        let pic = ref_pic_safe(
+                            sp.ref_pic_list_l1,
+                            self.frame_ref_idx(mb_idx, sub_part.ref_idx_l1),
+                        )
+                        .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
+                        Some((&**pic, sub_part.ref_idx_l1, sub_part.mv_l1))
+                    } else {
+                        None
+                    };
+                    self.predict_chroma_part(
+                        mb_idx,
+                        mb_x,
+                        mb_y,
+                        sp,
+                        (sub_part.x, sub_part.y, sub_part.w, sub_part.h),
+                        m0,
+                        m1,
+                    );
                 }
 
                 // Residual: CABAC CBP + coefficients
@@ -3190,138 +2497,8 @@ impl SliceContext<'_> {
                 }
 
                 // Chroma residual
-                let qp_c = chroma_qp(qp_y, sp.chroma_qp_index_offset);
-                if cbp_chroma >= 1 {
-                    let mut chroma_dc_cb = [0i32; 4];
-                    let mut chroma_dc_cr = [0i32; 4];
-                    let left_dc_nz = if let Some(left) = self.left_mb(mb_idx) {
-                        (self.mb_cbp[left] >> 6) & 1 != 0
-                    } else {
-                        false
-                    };
-                    let top_dc_nz = if let Some(above) = self.above_mb(mb_idx) {
-                        (self.mb_cbp[above] >> 6) & 1 != 0
-                    } else {
-                        false
-                    };
-                    if cr.decode_coded_block_flag(st, 3, left_dc_nz, top_dc_nz) {
-                        let (coeffs, _) =
-                            cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx));
-                        for (pos, val) in coeffs {
-                            chroma_dc_cb[pos] = val;
-                        }
-                        self.mb_cbp[mb_idx] |= 0x40;
-                    }
-                    let left_dc_cr = if let Some(left) = self.left_mb(mb_idx) {
-                        (self.mb_cbp[left] >> 7) & 1 != 0
-                    } else {
-                        false
-                    };
-                    let top_dc_cr = if let Some(above) = self.above_mb(mb_idx) {
-                        (self.mb_cbp[above] >> 7) & 1 != 0
-                    } else {
-                        false
-                    };
-                    if cr.decode_coded_block_flag(st, 3, left_dc_cr, top_dc_cr) {
-                        let (coeffs, _) =
-                            cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx));
-                        for (pos, val) in coeffs {
-                            chroma_dc_cr[pos] = val;
-                        }
-                        self.mb_cbp[mb_idx] |= 0x80;
-                    }
-
-                    let chroma_mb_x = mb_x / 2;
-                    let lc_off = self.lc_offset;
-                    let lc_str = self.lc_stride;
-                    let is_field_mb = self.is_field_coded(mb_idx);
-                    for (plane_dc, frame_plane, scale_idx) in [
-                        (&mut chroma_dc_cb, &mut self.frame.u, 4usize),
-                        (&mut chroma_dc_cr, &mut self.frame.v, 5usize),
-                    ] {
-                        let chroma_scale = &sp.scaling_list_4x4[scale_idx];
-                        // Cr (lists 2 and 5) takes the second chroma QP offset
-                        let plane_qp_c = if matches!(scale_idx, 2 | 5) {
-                            chroma_qp(qp_y, sp.second_chroma_qp_index_offset)
-                        } else {
-                            qp_c
-                        };
-                        inverse_hadamard_2x2(plane_dc);
-                        dequant_chroma_dc(plane_dc, plane_qp_c, chroma_scale[0]);
-                        let mut chroma_residual = [0i32; 64];
-                        for blk in 0..4 {
-                            let blk_row = (blk / 2) * 4;
-                            let blk_col = (blk % 2) * 4;
-                            let mut block_raster = [0i32; 16];
-                            block_raster[0] = plane_dc[blk];
-                            if cbp_chroma >= 2 {
-                                let nc_arr = if scale_idx == 4 {
-                                    &self.nc_cb
-                                } else {
-                                    &self.nc_cr
-                                };
-                                let left_nz = cabac_neighbor_nz_chroma(
-                                    nc_arr,
-                                    mb_idx,
-                                    self.mb_width as usize,
-                                    blk,
-                                    true,
-                                    false,
-                                    self.mb_slice_id,
-                                    self.this_slice_id,
-                                    self.mbaff,
-                                    self.mb_field_decoding,
-                                );
-                                let top_nz = cabac_neighbor_nz_chroma(
-                                    nc_arr,
-                                    mb_idx,
-                                    self.mb_width as usize,
-                                    blk,
-                                    false,
-                                    false,
-                                    self.mb_slice_id,
-                                    self.this_slice_id,
-                                    self.mbaff,
-                                    self.mb_field_decoding,
-                                );
-                                if cr.decode_coded_block_flag(st, 4, left_nz, top_nz) {
-                                    let (coeffs, tc) =
-                                        cr.decode_residual_cabac_field(st, 4, 15, is_field_mb);
-                                    if scale_idx == 4 {
-                                        self.nc_cb[mb_idx * 4 + blk] = tc;
-                                    } else {
-                                        self.nc_cr[mb_idx * 4 + blk] = tc;
-                                    }
-                                    for (pos, val) in coeffs {
-                                        let (r, c) = zigzag_4x4[pos + 1];
-                                        block_raster[r * 4 + c] = val;
-                                    }
-                                    dequant_4x4_ac_raster(
-                                        &mut block_raster,
-                                        plane_qp_c,
-                                        chroma_scale,
-                                    );
-                                }
-                            }
-                            inverse_dct_4x4(&mut block_raster);
-                            for r in 0..4 {
-                                for c in 0..4 {
-                                    chroma_residual[(blk_row + r) * 8 + blk_col + c] =
-                                        block_raster[r * 4 + c];
-                                }
-                            }
-                        }
-                        for y in 0..8 {
-                            for x in 0..8 {
-                                let val = (frame_plane[lc_off + y * lc_str + chroma_mb_x + x]
-                                    as i32
-                                    + chroma_residual[y * 8 + x])
-                                    .clamp(0, 255) as u8;
-                                frame_plane[lc_off + y * lc_str + chroma_mb_x + x] = val;
-                            }
-                        }
-                    }
-                }
+                let chroma = self.decode_chroma_residual_cabac(cr, st, mb_idx, cbp_chroma, false);
+                self.add_chroma_residual(&chroma, cbp_chroma, qp_y, false, mb_x, mb_idx, sp);
 
                 self.mb_info[mb_idx] = MbInfo {
                     mb_type: MbType::Inter,
@@ -3355,7 +2532,15 @@ impl SliceContext<'_> {
         // I_PCM via CABAC
         if mb_type == 25 {
             let pcm_pos = cr.pcm_byte_position();
-            if pcm_pos + if sp.monochrome { 256 } else { 384 } > rbsp.len() {
+            if pcm_pos
+                + 256
+                + if sp.monochrome {
+                    0
+                } else {
+                    16 * (16 >> self.chroma_shift_y())
+                }
+                > rbsp.len()
+            {
                 return Err(DecodeError::UnexpectedEof);
             }
             let pcm_data = &rbsp[pcm_pos..];
@@ -3370,7 +2555,8 @@ impl SliceContext<'_> {
                 }
             }
             let cx = mb_x / 2;
-            for r in 0..8 {
+            let ch = 16 >> self.chroma_shift_y();
+            for r in 0..ch {
                 for c in 0..8 {
                     let idx = self.lc_offset + r * self.lc_stride + cx + c;
                     if idx < self.frame.u.len() {
@@ -3379,7 +2565,7 @@ impl SliceContext<'_> {
                     off += usize::from(!sp.monochrome);
                 }
             }
-            for r in 0..8 {
+            for r in 0..ch {
                 for c in 0..8 {
                     let idx = self.lc_offset + r * self.lc_stride + cx + c;
                     if idx < self.frame.v.len() {
@@ -3391,9 +2577,9 @@ impl SliceContext<'_> {
             for blk in 0..16 {
                 self.nc_luma[mb_idx * 16 + blk] = 16;
             }
-            for blk in 0..4 {
-                self.nc_cb[mb_idx * 4 + blk] = 16;
-                self.nc_cr[mb_idx * 4 + blk] = 16;
+            for blk in 0..8 {
+                self.nc_cb[mb_idx * 8 + blk] = 16;
+                self.nc_cr[mb_idx * 8 + blk] = 16;
             }
             cr.reinit(pcm_pos + off);
             // mb_qp_delta is absent: QP_Y (and the next MB's prediction) is
@@ -3492,7 +2678,6 @@ impl SliceContext<'_> {
                 self.prev_mb_qp
             };
             self.prev_mb_qp = qp_y;
-            let _qp_c = chroma_qp(qp_y, sp.chroma_qp_index_offset);
             let above_mb_avail = above_mb_avail_i;
             let above_left_mb_avail = above_left_mb_avail_i;
             let above_right_mb_avail = self.intra_corner_avail(mb_idx, 16, -1, sp);
@@ -3617,155 +2802,15 @@ impl SliceContext<'_> {
             let _chroma_mb_y = mb_y / 2;
 
             // Chroma prediction (slice boundary: cross-slice neighbors unavailable)
-            let (pred_u, pred_v) = self.predict_chroma_intra(
+            self.write_chroma_intra_pred(
                 mb_x,
                 intra_chroma_pred_mode,
                 above_mb_avail,
                 left_halves,
                 above_left_mb_avail,
             );
-
-            // Chroma residual: DC + AC via CABAC
-            let mut chroma_dc_cb = [0i32; 4];
-            let mut chroma_dc_cr = [0i32; 4];
-            if cbp_chroma >= 1 {
-                // Chroma DC CBF context: uses bits 6-7 of neighbor cbp_table
-                let left_dc_nz = if let Some(left) = self.left_mb(mb_idx) {
-                    (self.mb_cbp[left] >> 6) & 1 != 0
-                } else {
-                    true
-                }; // unavailable intra: 0x7CF bit 6 = 1
-                let top_dc_nz = if let Some(above) = self.above_mb(mb_idx) {
-                    (self.mb_cbp[above] >> 6) & 1 != 0
-                } else {
-                    true
-                };
-                if cr.decode_coded_block_flag(st, 3, left_dc_nz, top_dc_nz) {
-                    let (coeffs, _tc) =
-                        cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx));
-                    for (pos, val) in coeffs {
-                        chroma_dc_cb[pos] = val;
-                    }
-                    self.mb_cbp[mb_idx] |= 0x40; // set Cb DC coded flag
-                }
-                let left_dc_nz_cr = if let Some(left) = self.left_mb(mb_idx) {
-                    (self.mb_cbp[left] >> 7) & 1 != 0
-                } else {
-                    true
-                };
-                let top_dc_nz_cr = if let Some(above) = self.above_mb(mb_idx) {
-                    (self.mb_cbp[above] >> 7) & 1 != 0
-                } else {
-                    true
-                };
-                if cr.decode_coded_block_flag(st, 3, left_dc_nz_cr, top_dc_nz_cr) {
-                    let (coeffs, _tc) =
-                        cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx));
-                    for (pos, val) in coeffs {
-                        chroma_dc_cr[pos] = val;
-                    }
-                    self.mb_cbp[mb_idx] |= 0x80; // set Cr DC coded flag
-                }
-            }
-            let mut chroma_ac_cb = [[0i32; 15]; 4];
-            let mut chroma_ac_cr = [[0i32; 15]; 4];
-            if cbp_chroma >= 2 {
-                // Chroma AC: cat=4, max_coeff=15
-                for blk in 0..4 {
-                    let left_nz = cabac_neighbor_nz_chroma(
-                        self.nc_cb,
-                        mb_idx,
-                        self.mb_width as usize,
-                        blk,
-                        true,
-                        true,
-                        self.mb_slice_id,
-                        self.this_slice_id,
-                        self.mbaff,
-                        self.mb_field_decoding,
-                    );
-                    let top_nz = cabac_neighbor_nz_chroma(
-                        self.nc_cb,
-                        mb_idx,
-                        self.mb_width as usize,
-                        blk,
-                        false,
-                        true,
-                        self.mb_slice_id,
-                        self.this_slice_id,
-                        self.mbaff,
-                        self.mb_field_decoding,
-                    );
-                    if cr.decode_coded_block_flag(st, 4, left_nz, top_nz) {
-                        let (coeffs, tc) =
-                            cr.decode_residual_cabac_field(st, 4, 15, self.is_field_coded(mb_idx));
-                        self.nc_cb[mb_idx * 4 + blk] = tc;
-                        for (pos, val) in coeffs {
-                            chroma_ac_cb[blk][pos] = val;
-                        }
-                    }
-                }
-                for blk in 0..4 {
-                    let left_nz = cabac_neighbor_nz_chroma(
-                        self.nc_cr,
-                        mb_idx,
-                        self.mb_width as usize,
-                        blk,
-                        true,
-                        true,
-                        self.mb_slice_id,
-                        self.this_slice_id,
-                        self.mbaff,
-                        self.mb_field_decoding,
-                    );
-                    let top_nz = cabac_neighbor_nz_chroma(
-                        self.nc_cr,
-                        mb_idx,
-                        self.mb_width as usize,
-                        blk,
-                        false,
-                        true,
-                        self.mb_slice_id,
-                        self.this_slice_id,
-                        self.mbaff,
-                        self.mb_field_decoding,
-                    );
-                    if cr.decode_coded_block_flag(st, 4, left_nz, top_nz) {
-                        let (coeffs, tc) =
-                            cr.decode_residual_cabac_field(st, 4, 15, self.is_field_coded(mb_idx));
-                        self.nc_cr[mb_idx * 4 + blk] = tc;
-                        for (pos, val) in coeffs {
-                            chroma_ac_cr[blk][pos] = val;
-                        }
-                    }
-                }
-            }
-
-            // Reconstruct chroma
-            {
-                self.reconstruct_chroma_plane(
-                    &mut chroma_dc_cb,
-                    &chroma_ac_cb,
-                    &pred_u,
-                    true,
-                    cbp_chroma,
-                    _qp_c,
-                    &sp.scaling_list_4x4[1],
-                    mb_x,
-                    mb_idx,
-                );
-                self.reconstruct_chroma_plane(
-                    &mut chroma_dc_cr,
-                    &chroma_ac_cr,
-                    &pred_v,
-                    false,
-                    cbp_chroma,
-                    chroma_qp(qp_y, sp.second_chroma_qp_index_offset),
-                    &sp.scaling_list_4x4[2],
-                    mb_x,
-                    mb_idx,
-                );
-            }
+            let chroma = self.decode_chroma_residual_cabac(cr, st, mb_idx, cbp_chroma, true);
+            self.add_chroma_residual(&chroma, cbp_chroma, qp_y, true, mb_x, mb_idx, sp);
 
             self.mb_info[mb_idx] = MbInfo {
                 mb_type: MbType::Intra,
@@ -3801,7 +2846,6 @@ impl SliceContext<'_> {
             self.last_qp_delta_nonzero = delta != 0;
             let qp_y = ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52;
             self.prev_mb_qp = qp_y;
-            let qp_c = chroma_qp(qp_y, sp.chroma_qp_index_offset);
             // Luma DC: cat=0, 16 coefficients
             // CBF context uses bit 8 of neighbor cbp_table (luma DC coded flag)
             let mut luma_dc = [0i32; 16];
@@ -3913,152 +2957,15 @@ impl SliceContext<'_> {
             let _chroma_width = (self.width / 2) as usize;
             let _chroma_mb_x = mb_x / 2;
             let _chroma_mb_y = mb_y / 2;
-            let (pred_u, pred_v) = self.predict_chroma_intra(
+            self.write_chroma_intra_pred(
                 mb_x,
                 intra_chroma_pred_mode,
                 above_mb_avail_i,
                 left_halves,
                 above_left_mb_avail_i,
             );
-
-            // Chroma residual
-            let mut chroma_dc_cb = [0i32; 4];
-            let mut chroma_dc_cr = [0i32; 4];
-            if cbp_chroma >= 1 {
-                let left_dc_nz = if let Some(left) = self.left_mb(mb_idx) {
-                    (self.mb_cbp[left] >> 6) & 1 != 0
-                } else {
-                    true
-                };
-                let top_dc_nz = if let Some(above) = self.above_mb(mb_idx) {
-                    (self.mb_cbp[above] >> 6) & 1 != 0
-                } else {
-                    true
-                };
-                if cr.decode_coded_block_flag(st, 3, left_dc_nz, top_dc_nz) {
-                    let (coeffs, _tc) =
-                        cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx));
-                    for (pos, val) in coeffs {
-                        chroma_dc_cb[pos] = val;
-                    }
-                    self.mb_cbp[mb_idx] |= 0x40;
-                }
-                let left_dc_nz_cr = if let Some(left) = self.left_mb(mb_idx) {
-                    (self.mb_cbp[left] >> 7) & 1 != 0
-                } else {
-                    true
-                };
-                let top_dc_nz_cr = if let Some(above) = self.above_mb(mb_idx) {
-                    (self.mb_cbp[above] >> 7) & 1 != 0
-                } else {
-                    true
-                };
-                if cr.decode_coded_block_flag(st, 3, left_dc_nz_cr, top_dc_nz_cr) {
-                    let (coeffs, _tc) =
-                        cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx));
-                    for (pos, val) in coeffs {
-                        chroma_dc_cr[pos] = val;
-                    }
-                    self.mb_cbp[mb_idx] |= 0x80;
-                }
-            }
-            let mut chroma_ac_cb = [[0i32; 15]; 4];
-            let mut chroma_ac_cr = [[0i32; 15]; 4];
-            if cbp_chroma >= 2 {
-                for blk in 0..4 {
-                    let left_nz = cabac_neighbor_nz_chroma(
-                        self.nc_cb,
-                        mb_idx,
-                        self.mb_width as usize,
-                        blk,
-                        true,
-                        true,
-                        self.mb_slice_id,
-                        self.this_slice_id,
-                        self.mbaff,
-                        self.mb_field_decoding,
-                    );
-                    let top_nz = cabac_neighbor_nz_chroma(
-                        self.nc_cb,
-                        mb_idx,
-                        self.mb_width as usize,
-                        blk,
-                        false,
-                        true,
-                        self.mb_slice_id,
-                        self.this_slice_id,
-                        self.mbaff,
-                        self.mb_field_decoding,
-                    );
-                    if cr.decode_coded_block_flag(st, 4, left_nz, top_nz) {
-                        let (coeffs, tc) =
-                            cr.decode_residual_cabac_field(st, 4, 15, self.is_field_coded(mb_idx));
-                        self.nc_cb[mb_idx * 4 + blk] = tc;
-                        for (pos, val) in coeffs {
-                            chroma_ac_cb[blk][pos] = val;
-                        }
-                    }
-                }
-                for blk in 0..4 {
-                    let left_nz = cabac_neighbor_nz_chroma(
-                        self.nc_cr,
-                        mb_idx,
-                        self.mb_width as usize,
-                        blk,
-                        true,
-                        true,
-                        self.mb_slice_id,
-                        self.this_slice_id,
-                        self.mbaff,
-                        self.mb_field_decoding,
-                    );
-                    let top_nz = cabac_neighbor_nz_chroma(
-                        self.nc_cr,
-                        mb_idx,
-                        self.mb_width as usize,
-                        blk,
-                        false,
-                        true,
-                        self.mb_slice_id,
-                        self.this_slice_id,
-                        self.mbaff,
-                        self.mb_field_decoding,
-                    );
-                    if cr.decode_coded_block_flag(st, 4, left_nz, top_nz) {
-                        let (coeffs, tc) =
-                            cr.decode_residual_cabac_field(st, 4, 15, self.is_field_coded(mb_idx));
-                        self.nc_cr[mb_idx * 4 + blk] = tc;
-                        for (pos, val) in coeffs {
-                            chroma_ac_cr[blk][pos] = val;
-                        }
-                    }
-                }
-            }
-
-            {
-                self.reconstruct_chroma_plane(
-                    &mut chroma_dc_cb,
-                    &chroma_ac_cb,
-                    &pred_u,
-                    true,
-                    cbp_chroma,
-                    qp_c,
-                    &sp.scaling_list_4x4[1],
-                    mb_x,
-                    mb_idx,
-                );
-                self.reconstruct_chroma_plane(
-                    &mut chroma_dc_cr,
-                    &chroma_ac_cr,
-                    &pred_v,
-                    false,
-                    cbp_chroma,
-                    chroma_qp(qp_y, sp.second_chroma_qp_index_offset),
-                    &sp.scaling_list_4x4[2],
-                    mb_x,
-                    mb_idx,
-                );
-            }
+            let chroma = self.decode_chroma_residual_cabac(cr, st, mb_idx, cbp_chroma, true);
+            self.add_chroma_residual(&chroma, cbp_chroma, qp_y, true, mb_x, mb_idx, sp);
 
             self.mb_info[mb_idx] = MbInfo {
                 mb_type: MbType::Intra,
@@ -4070,7 +2977,15 @@ impl SliceContext<'_> {
         } else {
             // I_PCM via CABAC (mb_type == 25)
             let pcm_pos = cr.pcm_byte_position();
-            if pcm_pos + if sp.monochrome { 256 } else { 384 } > rbsp.len() {
+            if pcm_pos
+                + 256
+                + if sp.monochrome {
+                    0
+                } else {
+                    16 * (16 >> self.chroma_shift_y())
+                }
+                > rbsp.len()
+            {
                 return Err(DecodeError::UnexpectedEof);
             }
             let pcm_data = &rbsp[pcm_pos..];
@@ -4085,7 +3000,8 @@ impl SliceContext<'_> {
                 }
             }
             let cx = mb_x / 2;
-            for r in 0..8 {
+            let ch = 16 >> self.chroma_shift_y();
+            for r in 0..ch {
                 for c in 0..8 {
                     let idx = self.lc_offset + r * self.lc_stride + cx + c;
                     if idx < self.frame.u.len() {
@@ -4094,7 +3010,7 @@ impl SliceContext<'_> {
                     off += usize::from(!sp.monochrome);
                 }
             }
-            for r in 0..8 {
+            for r in 0..ch {
                 for c in 0..8 {
                     let idx = self.lc_offset + r * self.lc_stride + cx + c;
                     if idx < self.frame.v.len() {
@@ -4106,9 +3022,9 @@ impl SliceContext<'_> {
             for blk in 0..16 {
                 self.nc_luma[mb_idx * 16 + blk] = 16;
             }
-            for blk in 0..4 {
-                self.nc_cb[mb_idx * 4 + blk] = 16;
-                self.nc_cr[mb_idx * 4 + blk] = 16;
+            for blk in 0..8 {
+                self.nc_cb[mb_idx * 8 + blk] = 16;
+                self.nc_cr[mb_idx * 8 + blk] = 16;
             }
             cr.reinit(pcm_pos + off);
             // mb_qp_delta is absent: QP_Y (and the next MB's prediction) is

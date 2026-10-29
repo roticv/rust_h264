@@ -222,6 +222,10 @@ fn filter_frame_inner(
     // so a row is mb_width MBs long whatever frame.width says
     let stride_y = mb_width * 16;
     let stride_c = mb_width * 8;
+    // 4:2:2 chroma has a line per luma line (16 per MB) and transform
+    // block edges every 4 of them
+    let c422 = frame.chroma_format == crate::decoder::ChromaFormat::Yuv422;
+    let sy = frame.chroma_format.shift_y() as usize;
 
     // 4x4 block index layout within an MB (raster scan):
     //  0  1  4  5
@@ -332,17 +336,13 @@ fn filter_frame_inner(
                 );
             }
 
-            // Chroma: per-pixel bS from all 4 luma segments
+            // Chroma: per-pixel bS from the luma segment of its line
             if edge % 2 == 0 {
                 let c_edge_x = mb_col * 8 + (edge / 2) * 4;
-                for cseg in 0..2 {
-                    let cy = mb_y / 2 + cseg * 4;
-                    let c_bs = [
-                        seg_bs[cseg * 2],
-                        seg_bs[cseg * 2],
-                        seg_bs[cseg * 2 + 1],
-                        seg_bs[cseg * 2 + 1],
-                    ];
+                for cseg in 0..(4 >> sy) {
+                    let cy = (mb_y >> sy) + cseg * 4;
+                    let c_bs: [i32; 4] =
+                        core::array::from_fn(|i| seg_bs[((cseg * 4 + i) << sy) / 4]);
                     for (plane, (c_index_a, c_alpha, c_beta)) in
                         [(&mut frame.u, cb), (&mut frame.v, cr)]
                     {
@@ -384,8 +384,10 @@ fn filter_frame_inner(
                 continue;
             }
 
-            // 8x8 transform: skip internal odd edges (spec 8.7.2.1).
-            if !is_mb_edge && (edge & 1) != 0 && mb_q.is_8x8dct {
+            // 8x8 transform: skip internal odd edges (spec 8.7.2.1),
+            // except for 4:2:2 chroma, whose 4x4 blocks still have edges there
+            let skip_luma = !is_mb_edge && (edge & 1) != 0 && mb_q.is_8x8dct;
+            if skip_luma && !c422 {
                 continue;
             }
 
@@ -437,7 +439,7 @@ fn filter_frame_inner(
 
             // Luma: filter each segment independently
             for seg in 0..4 {
-                if seg_bs[seg] == 0 {
+                if seg_bs[seg] == 0 || skip_luma {
                     continue;
                 }
                 let tc0 = if seg_bs[seg] < 4 {
@@ -459,9 +461,10 @@ fn filter_frame_inner(
                 );
             }
 
-            // Chroma: per-pixel bS from all 4 luma segments
-            if edge % 2 == 0 {
-                let c_edge_y = mb_y / 2 + (edge / 2) * 4;
+            // Chroma: per-pixel bS from all 4 luma segments. 4:2:0 chroma
+            // has an edge every other luma edge, 4:2:2 one at each.
+            if c422 || edge % 2 == 0 {
+                let c_edge_y = (mb_y >> sy) + (edge >> sy) * 4;
                 for cseg in 0..2 {
                     let cx = mb_x / 2 + cseg * 4;
                     let c_bs = [
@@ -531,8 +534,10 @@ struct MbGeom {
 }
 
 impl MbGeom {
-    fn mbaff(mb_idx: usize, mb_width: usize, field: bool) -> Self {
+    fn mbaff(mb_idx: usize, mb_width: usize, field: bool, sy: usize) -> Self {
         let (stride_y, stride_c) = (mb_width * 16, mb_width * 8);
+        // Chroma lines per MB: 8 for 4:2:0, 16 for 4:2:2
+        let ch = 16 >> sy;
         let pair = mb_idx / 2;
         let (col, prow, bottom) = (pair % mb_width, pair / mb_width, mb_idx % 2);
         if field {
@@ -541,7 +546,7 @@ impl MbGeom {
                 y0: prow * 16,
                 ls: 2 * stride_y,
                 cx0: bottom * stride_c + col * 8,
-                cy0: prow * 8,
+                cy0: prow * ch,
                 cls: 2 * stride_c,
             }
         } else {
@@ -550,7 +555,7 @@ impl MbGeom {
                 y0: prow * 32 + 16 * bottom,
                 ls: stride_y,
                 cx0: col * 8,
-                cy0: prow * 16 + 8 * bottom,
+                cy0: prow * 2 * ch + ch * bottom,
                 cls: stride_c,
             }
         }
@@ -609,11 +614,12 @@ fn filter_v_edge(frame: &mut Frame, g: MbGeom, ex: usize, bs: [i32; 4], qp: Edge
         }
     }
     if ex.is_multiple_of(8) {
+        let sy = frame.chroma_format.shift_y() as usize;
         for (plane, (c_index_a, c_alpha, c_beta)) in
             [(&mut frame.u, qp.chroma[0]), (&mut frame.v, qp.chroma[1])]
         {
-            for cy in 0..8 {
-                let b = bs[cy / 2];
+            for cy in 0..(16 >> sy) {
+                let b = bs[(cy << sy) / 4];
                 if b != 0 {
                     let tc0 = tc0_for(c_index_a, b);
                     filter_edge_v_chroma(
@@ -634,11 +640,14 @@ fn filter_v_edge(frame: &mut Frame, g: MbGeom, ex: usize, bs: [i32; 4], qp: Edge
 }
 
 /// Filter the horizontal edge at luma row `ey` of an MB with geometry `g`;
-/// `bs[k]` covers luma columns `4k..4k + 4`.
-fn filter_h_edge(frame: &mut Frame, g: MbGeom, ey: usize, bs: [i32; 4], qp: EdgeQp) {
+/// `bs[k]` covers luma columns `4k..4k + 4`. Chroma has an edge there at
+/// every other luma edge for 4:2:0 and at each for 4:2:2; `luma` false
+/// filters only chroma (4:2:2 edges inside an 8x8 luma transform block).
+fn filter_h_edge(frame: &mut Frame, g: MbGeom, ey: usize, bs: [i32; 4], qp: EdgeQp, luma: bool) {
     let (index_a, alpha, beta) = qp.luma;
+    let sy = frame.chroma_format.shift_y() as usize;
     for (seg, &b) in bs.iter().enumerate() {
-        if b != 0 {
+        if b != 0 && luma {
             let tc0 = tc0_for(index_a, b);
             filter_edge_h(
                 &mut frame.y,
@@ -653,7 +662,7 @@ fn filter_h_edge(frame: &mut Frame, g: MbGeom, ey: usize, bs: [i32; 4], qp: Edge
             );
         }
     }
-    if ey.is_multiple_of(8) {
+    if sy == 0 || ey.is_multiple_of(8) {
         for (plane, (c_index_a, c_alpha, c_beta)) in
             [(&mut frame.u, qp.chroma[0]), (&mut frame.v, qp.chroma[1])]
         {
@@ -665,7 +674,7 @@ fn filter_h_edge(frame: &mut Frame, g: MbGeom, ey: usize, bs: [i32; 4], qp: Edge
                         plane,
                         g.cls,
                         g.cx0 + cx,
-                        g.cy0 + ey / 2,
+                        g.cy0 + (ey >> sy),
                         1,
                         b,
                         c_alpha,
@@ -731,7 +740,8 @@ fn filter_mb_mbaff(
     let Some(&field) = mb_field.get(pair) else {
         return;
     };
-    let g = MbGeom::mbaff(m, mb_width, field);
+    let sy = frame.chroma_format.shift_y() as usize;
+    let g = MbGeom::mbaff(m, mb_width, field, sy);
     let q = &mb_info[m];
     let slice_id = mb_slice_id.get(m).copied().unwrap_or(0);
     let slice = slices
@@ -841,6 +851,7 @@ fn filter_mb_mbaff(
                     0,
                     bs,
                     EdgeQp::new(p.qp_y, q.qp_y, off_a, off_b, cqp_offset),
+                    true,
                 );
             }
         } else {
@@ -862,12 +873,16 @@ fn filter_mb_mbaff(
                 0,
                 bs,
                 EdgeQp::new(p.qp_y, q.qp_y, off_a, off_b, cqp_offset),
+                true,
             );
         }
     }
     // -- Internal horizontal edges --
     for edge in 1..4 {
-        if (edge & 1) != 0 && q.is_8x8dct {
+        // Inside an 8x8 transform block: no luma edge, but 4:2:2 chroma
+        // still has one
+        let luma = (edge & 1) == 0 || !q.is_8x8dct;
+        if !luma && sy != 0 {
             continue;
         }
         let bs = edge_bs(
@@ -885,6 +900,7 @@ fn filter_mb_mbaff(
             edge * 4,
             bs,
             EdgeQp::new(q.qp_y, q.qp_y, off_a, off_b, cqp_offset),
+            luma,
         );
     }
 }
@@ -943,10 +959,18 @@ fn filter_mixed_left_edge(
             tc0_for(index_a, b),
         );
     }
+    let c422 = frame.chroma_format == crate::decoder::ChromaFormat::Yuv422;
     for (c, plane) in [&mut frame.u, &mut frame.v].into_iter().enumerate() {
-        // Chroma row cy takes the bS of row pair cy (as FFmpeg)
-        for (cy, &b) in bs8.iter().enumerate() {
-            let j = if field { cy >> 2 } else { cy & 1 };
+        // As FFmpeg: 4:2:0 chroma row cy takes the bS of row pair cy; 4:2:2
+        // rows go two per bS, in field order for a frame MB
+        for cy in 0..if c422 { 16 } else { 8 } {
+            let (i, j) = match (c422, field) {
+                (false, true) => (cy, cy >> 2),
+                (false, false) => (cy, cy & 1),
+                (true, true) => (cy >> 1, cy >> 3),
+                (true, false) => (2 * (cy >> 2) + (cy & 1), cy & 1),
+            };
+            let b = bs8[i];
             let (c_index_a, c_alpha, c_beta) = qps[j].chroma[c];
             filter_edge_v_chroma(
                 plane,
@@ -1520,6 +1544,7 @@ mod tests {
             u: vec![128; 16 * 8],
             v: vec![128; 16 * 8],
             pic_order_cnt: 0,
+            chroma_format: Default::default(),
         }
     }
 

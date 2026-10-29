@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **4:2:2 streams** (High 4:2:2 profile, 8-bit) now decode instead of being
+  rejected, progressive and interlaced (MBAFF and field pictures).
+  `Frame` has a new `chroma_format` field (`ChromaFormat::Yuv420` or
+  `Yuv422`; code that builds `Frame` values must set it) and
+  `chroma_width()`/`chroma_height()`; 4:2:2 frames have full-height U and V
+  planes. Output matches FFmpeg's yuv422p on every
+  8-bit 4:2:2 JVT conformance vector (10 more pass: 186 of 204; the other
+  4:2:2 vectors are 10-bit) and on x264 test streams.
 - **Monochrome (4:0:0) streams** now decode instead of being rejected. Frames
   keep the 4:2:0 layout with U and V filled with 128, matching FFmpeg's
   output. Both JVT monochrome conformance vectors pass (176 of 204).

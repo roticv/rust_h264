@@ -62,12 +62,13 @@ pub fn parse_residual_block_cavlc(
         }
     }
 
-    // Total zeros
+    // Total zeros: chroma DC (nC -1 for 4:2:0, -2 for 4:2:2) has its own
+    // tables (spec Table 9-9)
     let total_zeros = if total_coeff < max_num_coeff as u8 {
-        if max_num_coeff > 4 {
-            parse_total_zeros(reader, total_coeff)?
-        } else {
-            parse_total_zeros_chroma_dc(reader, total_coeff)?
+        match nc {
+            -1 => parse_total_zeros_chroma_dc(reader, total_coeff)?,
+            -2 => parse_total_zeros_chroma_dc_422(reader, total_coeff)?,
+            _ => parse_total_zeros(reader, total_coeff)?,
         }
     } else {
         0
@@ -107,7 +108,11 @@ pub fn parse_residual_block_cavlc(
 }
 
 fn parse_coeff_token(reader: &mut BitstreamReader, nc: i32) -> Result<(u8, u8), &'static str> {
-    let result = if nc < 0 {
+    let result = if nc == -2 {
+        let lut =
+            LUT_COEFF_CHROMA_DC_422.get_or_init(|| build_coeff_lut(&COEFF_TOKEN_CHROMA_DC_422, 13));
+        coeff_lut_lookup(reader, lut, 13)
+    } else if nc < 0 {
         let lut = LUT_COEFF_CHROMA_DC.get_or_init(|| build_coeff_lut(&COEFF_TOKEN_CHROMA_DC, 8));
         coeff_lut_lookup(reader, lut, 8)
     } else if nc < 2 {
@@ -292,9 +297,11 @@ static LUT_COEFF_NC0: OnceLock<Vec<CoeffEntry>> = OnceLock::new(); // 16 bits �
 static LUT_COEFF_NC2: OnceLock<Vec<CoeffEntry>> = OnceLock::new(); // 14 bits → 16 KiB
 static LUT_COEFF_NC4: OnceLock<Vec<CoeffEntry>> = OnceLock::new(); // 10 bits →  1 KiB
 static LUT_COEFF_CHROMA_DC: OnceLock<Vec<CoeffEntry>> = OnceLock::new(); //  8 bits → 256 B
+static LUT_COEFF_CHROMA_DC_422: OnceLock<Vec<CoeffEntry>> = OnceLock::new(); // 13 bits → 8 KiB
 
 static LUT_TOTAL_ZEROS: [OnceLock<Vec<U8Entry>>; 15] = [const { OnceLock::new() }; 15];
 static LUT_TOTAL_ZEROS_CHROMA: [OnceLock<Vec<U8Entry>>; 3] = [const { OnceLock::new() }; 3];
+static LUT_TOTAL_ZEROS_CHROMA_422: [OnceLock<Vec<U8Entry>>; 7] = [const { OnceLock::new() }; 7];
 static LUT_RUN_BEFORE: [OnceLock<Vec<U8Entry>>; 7] = [const { OnceLock::new() }; 7];
 
 // ============================================================
@@ -573,6 +580,41 @@ static COEFF_TOKEN_CHROMA_DC: [(u32, u8, u8, u8); 14] = [
     (0b0000000,  7, 4, 3),
 ];
 
+/// Table 9-5: chroma DC of 4:2:2 (nC == -2), up to 8 coefficients
+#[rustfmt::skip]
+static COEFF_TOKEN_CHROMA_DC_422: [(u32, u8, u8, u8); 30] = [
+    (0b1,               1, 0, 0),
+    (0b0001111,         7, 1, 0),
+    (0b01,              2, 1, 1),
+    (0b0001110,         7, 2, 0),
+    (0b0001101,         7, 2, 1),
+    (0b001,             3, 2, 2),
+    (0b000000111,       9, 3, 0),
+    (0b0001100,         7, 3, 1),
+    (0b0001011,         7, 3, 2),
+    (0b00001,           5, 3, 3),
+    (0b000000110,       9, 4, 0),
+    (0b000000101,       9, 4, 1),
+    (0b0001010,         7, 4, 2),
+    (0b000001,          6, 4, 3),
+    (0b0000000111,     10, 5, 0),
+    (0b0000000110,     10, 5, 1),
+    (0b000000100,       9, 5, 2),
+    (0b0001001,         7, 5, 3),
+    (0b00000000111,    11, 6, 0),
+    (0b00000000110,    11, 6, 1),
+    (0b0000000101,     10, 6, 2),
+    (0b0001000,         7, 6, 3),
+    (0b000000000111,   12, 7, 0),
+    (0b000000000110,   12, 7, 1),
+    (0b00000000101,    11, 7, 2),
+    (0b0000000100,     10, 7, 3),
+    (0b0000000000111,  13, 8, 0),
+    (0b000000000101,   12, 8, 1),
+    (0b000000000100,   12, 8, 2),
+    (0b00000000100,    11, 8, 3),
+];
+
 // ============================================================
 // total_zeros VLC tables (H.264 Tables 9-7, 9-8)
 // ============================================================
@@ -624,6 +666,37 @@ fn parse_total_zeros_chroma_dc(
         build_u8_lut(src, bits)
     });
     u8_lut_lookup(r, lut, bits)
+}
+
+/// total_zeros of 4:2:2 chroma DC (Table 9-9(b)), by total_coeff 1..=7.
+fn parse_total_zeros_chroma_dc_422(
+    r: &mut BitstreamReader,
+    total_coeff: u8,
+) -> Result<u8, &'static str> {
+    // (codeword, length) for total_zeros 0, 1, ...
+    #[rustfmt::skip]
+    const CODES: [&[(u32, u8)]; 7] = [
+        &[(1, 1), (2, 3), (3, 3), (2, 4), (3, 4), (1, 4), (1, 5), (0, 5)],
+        &[(0, 3), (1, 2), (1, 3), (4, 3), (5, 3), (6, 3), (7, 3)],
+        &[(0, 3), (1, 3), (1, 2), (2, 2), (6, 3), (7, 3)],
+        &[(6, 3), (0, 2), (1, 2), (2, 2), (7, 3)],
+        &[(0, 2), (1, 2), (2, 2), (3, 2)],
+        &[(0, 2), (1, 2), (1, 1)],
+        &[(0, 1), (1, 1)],
+    ];
+    let idx = (total_coeff as usize)
+        .checked_sub(1)
+        .filter(|&i| i < 7)
+        .ok_or("invalid total_coeff for 4:2:2 chroma DC")?;
+    let lut = LUT_TOTAL_ZEROS_CHROMA_422[idx].get_or_init(|| {
+        let src: Vec<(u32, u8, u8)> = CODES[idx]
+            .iter()
+            .enumerate()
+            .map(|(tz, &(code, len))| (code, len, tz as u8))
+            .collect();
+        build_u8_lut(&src, 5)
+    });
+    u8_lut_lookup(r, lut, 5)
 }
 
 // ============================================================

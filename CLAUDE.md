@@ -19,8 +19,8 @@ This is a Rust project using Cargo:
 - **no_std check:** `cargo test --no-default-features` (the `std` feature is on by default; without it the crate is `#![no_std]` + `alloc`)
 - **Golden corpus digests:** `cargo test --release -- --ignored golden_corpus_digests` (decodes the full 720p/1080p bench corpus; ignored by default because it is slow)
 - **Benchmark:** `cargo run --release --features dev-internals --example bench_decode` (timing, allocation count, and digest per bench stream)
-- **Compare against FFmpeg:** `python3 tools/verify_vs_ffmpeg.py testdata/*.h264` (byte-for-byte; every 4:2:0 test and bench stream should match, only the `unsupported_*` streams fail)
-- **Conformance:** `tools/conformance/run.sh` (JVT-AVC_V1 and JVT-FR-EXT through Fluster, cloned into `target/fluster` with ~1 GB of suites downloaded on first run; extra args go to `fluster run`, e.g. `-tv CAPAMA3_Sand_F`). Every 8-bit 4:2:0 and 4:0:0 vector passes (176/204); the rest are listed in `tools/conformance/expected_failures.txt`, and the script fails on any other failure or on a listed vector passing
+- **Compare against FFmpeg:** `python3 tools/verify_vs_ffmpeg.py testdata/*.h264` (byte-for-byte, in the stream's own chroma format; every 4:2:0, 4:2:2 and monochrome test and bench stream should match, only the `unsupported_*` streams fail)
+- **Conformance:** `tools/conformance/run.sh` (JVT-AVC_V1 and JVT-FR-EXT through Fluster, cloned into `target/fluster` with ~1 GB of suites downloaded on first run; extra args go to `fluster run`, e.g. `-tv CAPAMA3_Sand_F`). Every 8-bit 4:2:0, 4:2:2 and 4:0:0 vector passes (186/204); the rest are listed in `tools/conformance/expected_failures.txt`, and the script fails on any other failure or on a listed vector passing
 - **Profile:** `cargo run --release --features profile --example bench_decode -- <iterations>` (pprof flamegraph at `target/profile-1080p-complex.svg`, per-phase timers, top self-time functions; the `profile` feature implies `std` and `dev-internals`)
 
 ## Milestones
@@ -41,9 +41,10 @@ The decoder logic is split across several files:
 
 | File | Content |
 |------|---------|
-| `src/decoder.rs` | `Decoder` (raw decode order), `OrderedDecoder` (display-order wrapper). Slice decoding is split into `prepare_slice` (header, POC, reference lists, weights, geometry; produces a `SlicePlan`) and `run_slice` (PictureState creation/continuation and the MB loop). Finalization helpers: `deblock_picture`, `apply_reference_marking`, `finish_output`. `check_supported` rejects non-8-bit-4:2:0 streams. `RowSync` is the frame-threading hook in the MB loop |
+| `src/decoder.rs` | `Decoder` (raw decode order), `OrderedDecoder` (display-order wrapper). Slice decoding is split into `prepare_slice` (header, POC, reference lists, weights, geometry; produces a `SlicePlan`) and `run_slice` (PictureState creation/continuation and the MB loop). Finalization helpers: `deblock_picture`, `apply_reference_marking`, `finish_output`. `check_supported` rejects streams other than 8-bit 4:2:0, 4:2:2 and 4:0:0. `RowSync` is the frame-threading hook in the MB loop |
 | `src/decode_cabac.rs` | CABAC MB decode: skip detection, mb_type dispatch, residual decode |
 | `src/decode_cavlc.rs` | CAVLC MB decode: P/B inter, intra, residual decode |
+| `src/chroma.rs` | Chroma MB decoding shared by CAVLC and CABAC: `predict_chroma_part` (inter prediction of one partition, both planes, weights), `decode_chroma_residual_cavlc`/`_cabac`, `add_chroma_residual` (DC transform, dequant, IDCT onto the prediction in the frame); 4:2:0 and 4:2:2 |
 | `src/slice_context.rs` | `SliceContext`/`SliceParams` structs + shared methods (skip, direct, reconstruct, `finalize_mb_info_range`) |
 | `src/mv_pred.rs` | MV prediction, spatial/temporal direct mode derivation |
 | `src/neighbor.rs` | CABAC neighbor context helpers, nC computation, dequant helpers |
@@ -61,7 +62,7 @@ The crate exposes a minimal surface area:
 - `decoder::Decoder` — low-level streaming decoder; `decode_nal` returns one frame at a time in **decode order**.
 - `decoder::OrderedDecoder` — wraps `Decoder` with a built-in reorder buffer; `decode_nal` returns 0+ frames in **display order** (sorted by `(gop_id, pic_order_cnt)`). Recommended for most users — handles GOP tracking and the IDR-count timing pitfall internally. It is generic as `OrderedDecoder<M = ()>`; `decode_nal_with_meta`/`flush_with_meta` return `(Frame, M)` pairs so callers can carry per-picture metadata such as PTS timestamps through B-frame reordering; `OrderedDecoder<()>` has plain `decode_nal`/`flush`.
 - `threading::ThreadedDecoder` (`std` feature) — same `decode_nal`/`flush` surface as `OrderedDecoder<()>`, decodes pictures on worker threads, output byte-identical to `OrderedDecoder`. Reference reads wait per row: luma/chroma MC (`luma_mc_stride`, `chroma_mc` taking a `ChromaRef`) wait for the rows they read, direct mode waits for the whole co-located picture via `DecodedPicture::motion()`. New reference-plane reads must go through these accessors (`luma()`, `chroma()` return only published rows).
-- `decoder::Frame` — decoded YUV 4:2:0 frame with `y`/`u`/`v` planes, `width`, `height`, `pic_order_cnt`.
+- `decoder::Frame` — decoded YUV frame with `y`/`u`/`v` planes, `width`, `height`, `pic_order_cnt`, `chroma_format` (`ChromaFormat::Yuv420` or `Yuv422`; `chroma_width()`/`chroma_height()` give the U/V plane size).
 - `nal::parse_annex_b` — parser for start-code delimited bitstreams.
 - `nal::parse_avcc` + `nal::parse_avcc_config` + `nal::AvccConfig` — parser for length-prefixed bitstreams from MP4/MKV containers.
 - `nal::NalUnit`, `nal::NalUnitType` — parsed NAL unit types.
@@ -79,7 +80,7 @@ attached by the first slice of that picture.
 
 ## Status
 
-Baseline, Main and High profile 8-bit 4:2:0 and 4:0:0 decoding is complete: I/P/B slices with CAVLC and CABAC, 4x4 and 8x8 transforms with scaling matrices, all partition types, spatial and temporal direct mode, multiple and long-term references with list modification and MMCO, explicit and implicit weighted prediction, multi-slice pictures with per-slice deblocking, and interlaced content (MBAFF and field pictures). Output is byte-identical to FFmpeg on every 4:2:0 test and bench stream (check with `tools/verify_vs_ffmpeg.py`); unit tests pin this with SHA-256 or YUV comparisons against FFmpeg output. Monochrome (4:0:0) streams skip all chroma syntax (`SliceParams::monochrome`) and keep mid-grey chroma planes, so the 4:2:0 pipeline runs unchanged and outputs 4:2:0 like FFmpeg. Every 8-bit 4:2:0 and 4:0:0 vector of the JVT conformance suites decodes to the reference output (`tools/conformance/run.sh`). Other formats are rejected with `DecodeError::Unsupported`. Motion compensation has NEON and x86 SIMD backends, and `ThreadedDecoder` adds frame threading with row-level reference sync. Current performance numbers live in BENCHMARK.md.
+Baseline, Main, High and High 4:2:2 profile 8-bit 4:2:0, 4:2:2 and 4:0:0 decoding is complete: I/P/B slices with CAVLC and CABAC, 4x4 and 8x8 transforms with scaling matrices, all partition types, spatial and temporal direct mode, multiple and long-term references with list modification and MMCO, explicit and implicit weighted prediction, multi-slice pictures with per-slice deblocking, and interlaced content (MBAFF and field pictures). Output is byte-identical to FFmpeg on every 4:2:0 test and bench stream (check with `tools/verify_vs_ffmpeg.py`); unit tests pin this with SHA-256 or YUV comparisons against FFmpeg output. Monochrome (4:0:0) streams skip all chroma syntax (`SliceParams::monochrome`) and keep mid-grey chroma planes, so the 4:2:0 pipeline runs unchanged and outputs 4:2:0 like FFmpeg. 4:2:2 chroma (8x16 per MB: 2x4 DC transform at QP'c + 3, 8 AC blocks, quarter-sample vertical chroma MVs, chroma deblocking edges every 4 lines) is handled in `src/chroma.rs` (partition MC, residual parse and reconstruction shared by CAVLC and CABAC), `intra_pred::predict_chroma` and the deblocking filter. Every 8-bit 4:2:0, 4:2:2 and 4:0:0 vector of the JVT conformance suites decodes to the reference output (`tools/conformance/run.sh`). Other formats are rejected with `DecodeError::Unsupported`. Motion compensation has NEON and x86 SIMD backends, and `ThreadedDecoder` adds frame threading with row-level reference sync. Current performance numbers live in BENCHMARK.md.
 
 ### Completed
 
@@ -281,6 +282,6 @@ Baseline, Main and High profile 8-bit 4:2:0 and 4:0:0 decoding is complete: I/P/
 
 ### Not Yet Implemented
 
-- Anything but 8-bit 4:2:0 and 4:0:0: 4:2:2, 4:4:4, High 10 and higher bit depths, and lossless transform bypass. `check_supported` in `decoder.rs` rejects these with `DecodeError::Unsupported` when a slice activates the SPS, so they never decode into wrong pictures (`testdata/unsupported_*.h264` cover each case)
+- Anything but 8-bit 4:2:0, 4:2:2 and 4:0:0: 4:4:4, High 10 and higher bit depths, and lossless transform bypass. `check_supported` in `decoder.rs` rejects these with `DecodeError::Unsupported` when a slice activates the SPS, so they never decode into wrong pictures (`testdata/unsupported_*.h264` cover each case)
 - SP/SI slice types (parsed but not decoded)
 - Slice groups / FMO (returns error)

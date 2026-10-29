@@ -271,163 +271,107 @@ pub fn predict_intra_4x4(
     }
 }
 
-/// Chroma 8x8 intra prediction (H.264 spec 8.3.4).
-/// `mode`: 0=DC, 1=horizontal, 2=vertical, 3=plane.
-/// Chroma intra prediction when only part of the left column may be
-/// available (MBAFF with constrained intra prediction, where the left
-/// samples of the upper and lower halves come from different MBs):
-/// `left_avail` covers rows 0-3 and 4-7. DC then follows spec 8.3.4.1-3
-/// per 4x4 block; other modes need the whole column.
-pub fn predict_chroma_8x8_halves(
+/// Intra chroma prediction (spec 8.3.4) of an 8-wide block of `h` rows: 8
+/// for 4:2:0, 16 for 4:2:2. `above` holds the 8 samples above, `left` the
+/// `h` samples to the left, `left_avail` whether the left samples of the
+/// upper and lower half of the macroblock may be used (they can differ in
+/// an MBAFF frame with constrained intra prediction). DC is predicted per
+/// 4x4 block (spec 8.3.4.1-3); the other modes need whole columns.
+pub fn predict_chroma(
     mode: u8,
     above: Option<&[u8]>,
     left: Option<&[u8]>,
     left_avail: [bool; 2],
     above_left: Option<u8>,
-    output: &mut [u8; 64],
+    h: usize,
+    output: &mut [u8],
 ) {
-    let left = left.filter(|_| left_avail[0] || left_avail[1]);
-    let (Some(l), true) = (left, mode == 0 && left_avail[0] != left_avail[1]) else {
-        let left = left.filter(|_| left_avail[0] && left_avail[1]);
-        predict_chroma_8x8(mode, above, left, above_left, output);
-        return;
-    };
-    let mean = |v: &[u8]| -> u32 { v.iter().map(|&x| x as u32).sum() };
-    let l_half = |h: usize| left_avail[h].then(|| &l[4 * h..4 * h + 4]);
-    let a_half = |h: usize| above.map(|a| &a[4 * h..4 * h + 4]);
-    // (xO, yO) = (0,0) and (4,4): both, else left, else above;
-    // (4,0): above, else left; (0,4): left, else above
-    let both = |a: Option<&[u8]>, l: Option<&[u8]>| -> u8 {
-        match (a, l) {
-            (Some(a), Some(l)) => ((mean(a) + mean(l) + 4) >> 3) as u8,
-            (None, Some(l)) => ((mean(l) + 2) >> 2) as u8,
-            (Some(a), None) => ((mean(a) + 2) >> 2) as u8,
-            (None, None) => 128,
-        }
-    };
-    let first = |x: Option<&[u8]>, y: Option<&[u8]>| -> u8 {
-        x.or(y).map_or(128, |v| ((mean(v) + 2) >> 2) as u8)
-    };
-    let blocks = [
-        both(a_half(0), l_half(0)),
-        first(a_half(1), l_half(0)),
-        first(l_half(1), a_half(0)),
-        both(a_half(1), l_half(1)),
-    ];
-    for row in 0..8 {
-        for col in 0..8 {
-            output[row * 8 + col] = blocks[(row / 4) * 2 + col / 4];
-        }
-    }
-}
-
-pub fn predict_chroma_8x8(
-    mode: u8,
-    above: Option<&[u8]>, // 8 pixels from row above
-    left: Option<&[u8]>,  // 8 pixels from column to left
-    above_left: Option<u8>,
-    output: &mut [u8; 64],
-) {
+    let output = &mut output[..8 * h];
+    let left_all = left.filter(|_| left_avail[0] && left_avail[1]);
     match mode {
         0 => {
-            // DC: per-4x4-sub-block DC prediction (spec 8.3.4.1)
-            // 4 quadrants: TL(rows 0-3, cols 0-3), TR(rows 0-3, cols 4-7),
-            //              BL(rows 4-7, cols 0-3), BR(rows 4-7, cols 4-7)
-            let (dc_tl, dc_tr, dc_bl, dc_br) = match (above, left) {
-                (Some(a), Some(l)) => {
-                    let sum_a_l: u32 = a[..4].iter().map(|&x| x as u32).sum::<u32>()
-                        + l[..4].iter().map(|&x| x as u32).sum::<u32>();
-                    let sum_a_r: u32 = a[4..8].iter().map(|&x| x as u32).sum();
-                    let sum_l_b: u32 = l[4..8].iter().map(|&x| x as u32).sum();
-                    (
-                        ((sum_a_l + 4) >> 3) as u8,
-                        ((sum_a_r + 2) >> 2) as u8,
-                        ((sum_l_b + 2) >> 2) as u8,
-                        ((sum_a_r + sum_l_b + 4) >> 3) as u8,
-                    )
-                }
-                (Some(a), None) => {
-                    let sum_l: u32 = a[..4].iter().map(|&x| x as u32).sum();
-                    let sum_r: u32 = a[4..8].iter().map(|&x| x as u32).sum();
-                    let dc_l = ((sum_l + 2) >> 2) as u8;
-                    let dc_r = ((sum_r + 2) >> 2) as u8;
-                    (dc_l, dc_r, dc_l, dc_r)
-                }
-                (None, Some(l)) => {
-                    let sum_t: u32 = l[..4].iter().map(|&x| x as u32).sum();
-                    let sum_b: u32 = l[4..8].iter().map(|&x| x as u32).sum();
-                    let dc_t = ((sum_t + 2) >> 2) as u8;
-                    let dc_b = ((sum_b + 2) >> 2) as u8;
-                    (dc_t, dc_t, dc_b, dc_b)
-                }
-                (None, None) => (128, 128, 128, 128),
-            };
-            for row in 0..4 {
-                for col in 0..4 {
-                    output[row * 8 + col] = dc_tl;
-                }
-                for col in 4..8 {
-                    output[row * 8 + col] = dc_tr;
-                }
-            }
-            for row in 4..8 {
-                for col in 0..4 {
-                    output[row * 8 + col] = dc_bl;
-                }
-                for col in 4..8 {
-                    output[row * 8 + col] = dc_br;
+            let sum = |v: &[u8]| -> u32 { v.iter().map(|&x| x as u32).sum() };
+            for yo in (0..h).step_by(4) {
+                let l = left
+                    .filter(|_| left_avail[yo * 2 / h])
+                    .map(|l| sum(&l[yo..yo + 4]));
+                for xo in [0, 4] {
+                    let a = above.map(|a| sum(&a[xo..xo + 4]));
+                    let dc = if (xo == 0) == (yo == 0) {
+                        // Both, else either
+                        match (a, l) {
+                            (Some(a), Some(l)) => (a + l + 4) >> 3,
+                            (None, Some(v)) | (Some(v), None) => (v + 2) >> 2,
+                            (None, None) => 128,
+                        }
+                    } else if xo > 0 {
+                        // Above first
+                        a.or(l).map_or(128, |v| (v + 2) >> 2)
+                    } else {
+                        // Left first
+                        l.or(a).map_or(128, |v| (v + 2) >> 2)
+                    };
+                    for r in yo..yo + 4 {
+                        output[r * 8 + xo..r * 8 + xo + 4].fill(dc as u8);
+                    }
                 }
             }
         }
         1 => {
             // Horizontal
-            let left = left.unwrap_or(&[128; 16]);
-            for row in 0..8 {
-                for col in 0..8 {
-                    output[row * 8 + col] = left[row];
-                }
+            for (r, row) in output.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                row.fill(left_all.map_or(128, |l| l[r]));
             }
         }
         2 => {
             // Vertical
-            let above = above.unwrap_or(&[128; 16]);
-            for row in 0..8 {
-                output[row * 8..row * 8 + 8].copy_from_slice(&above[..8]);
-            }
-        }
-        3 => {
-            // Plane
-            let above = above.unwrap_or(&[128; 16]);
-            let left = left.unwrap_or(&[128; 16]);
-            let _p = above_left.unwrap_or(128);
-
-            let mut h: i32 = 0;
-            let mut v: i32 = 0;
-            for i in 0..4 {
-                // p[2-i, -1] and p[-1, 2-i]: when i==3, index -1 = above_left pixel
-                let above_neg = if i < 3 {
-                    above[2 - i] as i32
-                } else {
-                    _p as i32
-                };
-                let left_neg = if i < 3 { left[2 - i] as i32 } else { _p as i32 };
-                h += (i as i32 + 1) * (above[4 + i] as i32 - above_neg);
-                v += (i as i32 + 1) * (left[4 + i] as i32 - left_neg);
-            }
-            let a_val = 16 * (above[7] as i32 + left[7] as i32);
-            let b_val = (17 * h + 16) >> 5;
-            let c_val = (17 * v + 16) >> 5;
-
-            for y in 0..8 {
-                for x in 0..8 {
-                    let val = (a_val + b_val * (x as i32 - 3) + c_val * (y as i32 - 3) + 16) >> 5;
-                    output[y * 8 + x] = val.clamp(0, 255) as u8;
+            for row in output.as_chunks_mut::<8>().0 {
+                match above {
+                    Some(a) => row.copy_from_slice(&a[..8]),
+                    None => row.fill(128),
                 }
             }
         }
-        _ => {
-            output.fill(128);
+        3 => {
+            // Plane; p[-1, -1] is the above-left sample
+            let above = above.unwrap_or(&[128; 8]);
+            let left = left_all.unwrap_or(&[128; 16]);
+            let corner = above_left.unwrap_or(128) as i32;
+            let at = |x: i32| {
+                if x < 0 {
+                    corner
+                } else {
+                    above[x as usize] as i32
+                }
+            };
+            let lt = |y: i32| {
+                if y < 0 {
+                    corner
+                } else {
+                    left[y as usize] as i32
+                }
+            };
+            // yCF: 4 for 4:2:2 (16 rows), 0 for 4:2:0
+            let ycf = (h as i32 - 8) / 2;
+            let mut hh = 0;
+            for x in 0..4 {
+                hh += (x + 1) * (at(4 + x) - at(2 - x));
+            }
+            let mut vv = 0;
+            for y in 0..4 + ycf {
+                vv += (y + 1) * (lt(4 + ycf + y) - lt(2 + ycf - y));
+            }
+            let a = 16 * (lt(h as i32 - 1) + at(7));
+            let b = (34 * hh + 32) >> 6;
+            let c = ((if h == 16 { 5 } else { 34 }) * vv + 32) >> 6;
+            for (y, row) in output.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                for (x, px) in row.iter_mut().enumerate() {
+                    let v = (a + b * (x as i32 - 3) + c * (y as i32 - 3 - ycf) + 16) >> 5;
+                    *px = v.clamp(0, 255) as u8;
+                }
+            }
         }
+        _ => output.fill(128),
     }
 }
 
