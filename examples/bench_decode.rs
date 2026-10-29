@@ -51,10 +51,11 @@ struct DecodeResult {
     allocs: usize,
 }
 
+/// Parse and decode a stream; the digest of the output is left to the caller.
 #[cfg(not(feature = "profile"))]
-fn decode_once(data: &[u8]) -> DecodeResult {
+fn decode_once(data: &[u8]) -> (DecodeResult, Vec<Frame>) {
     let nals = parse_annex_b(data);
-    decode_nals(&nals, true)
+    decode_frames(&nals)
 }
 
 /// Worker count from `BENCH_THREADS` (unset or 0: serial `Decoder`).
@@ -65,7 +66,17 @@ fn bench_threads() -> usize {
         .unwrap_or(0)
 }
 
+#[cfg(feature = "profile")]
 fn decode_nals(nals: &[NalUnit], compute_digest: bool) -> DecodeResult {
+    let (mut result, frames) = decode_frames(nals);
+    if compute_digest {
+        result.digest = digest_frames(&frames);
+    }
+    result
+}
+
+/// Decode `nals` into display-order frames (no digest).
+fn decode_frames(nals: &[NalUnit]) -> (DecodeResult, Vec<Frame>) {
     let before_allocs = ALLOCATIONS.load(Ordering::Relaxed);
     let mut frames = Vec::new();
     let threads = bench_threads();
@@ -89,16 +100,12 @@ fn decode_nals(nals: &[NalUnit], compute_digest: bool) -> DecodeResult {
     let allocs = ALLOCATIONS.load(Ordering::Relaxed) - before_allocs;
 
     frames.sort_by_key(|frame| frame.pic_order_cnt);
-    let digest = if compute_digest {
-        digest_frames(&frames)
-    } else {
-        String::new()
-    };
-    DecodeResult {
+    let result = DecodeResult {
         frames: frames.len(),
-        digest,
+        digest: String::new(),
         allocs,
-    }
+    };
+    (result, frames)
 }
 
 fn digest_frames(frames: &[Frame]) -> String {
@@ -112,10 +119,14 @@ fn digest_frames(frames: &[Frame]) -> String {
 }
 
 #[cfg(not(feature = "profile"))]
+/// Time parsing and decoding only: hashing the output (several hundred MB
+/// for the 1080p streams) would otherwise take about as long as decoding.
 fn decode_timed(data: &[u8]) -> (DecodeResult, Duration) {
     let start = Instant::now();
-    let result = decode_once(data);
-    (result, start.elapsed())
+    let (mut result, frames) = decode_once(data);
+    let elapsed = start.elapsed();
+    result.digest = digest_frames(&frames);
+    (result, elapsed)
 }
 
 #[cfg(not(feature = "profile"))]
