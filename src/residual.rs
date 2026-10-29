@@ -341,19 +341,21 @@ const RASTER_TO_ZIGZAG_8X8: [u8; 64] = {
 /// `scale` is the 8x8 scaling matrix in zigzag scan order.
 pub fn dequant_8x8(block: &mut [i32; 64], qp: i32, scale: &[u8; 64]) {
     let qp_per = qp / 6;
-    let qp_rem = (qp % 6) as usize;
-
-    for (idx, coeff) in block.iter_mut().enumerate() {
-        if *coeff != 0 {
-            let r = idx / 8;
-            let c = idx % 8;
-            let cat = DEQUANT_8X8_POS_CAT[(r % 4) * 4 + (c % 4)];
-            let v = LEVEL_SCALE_8X8[qp_rem][cat] * scale[RASTER_TO_ZIGZAG_8X8[idx] as usize] as i32;
-            if qp_per >= 6 {
-                *coeff = coeff.wrapping_mul(v).wrapping_shl((qp_per - 6) as u32);
-            } else {
-                *coeff = (coeff.wrapping_mul(v).wrapping_add(1 << (5 - qp_per))) >> (6 - qp_per);
-            }
+    let ls = LEVEL_SCALE_8X8[(qp % 6) as usize];
+    // Branch-free over all 64 positions (a zero coefficient stays zero)
+    let v = |idx: usize| {
+        let cat = DEQUANT_8X8_POS_CAT[((idx >> 3) & 3) * 4 + (idx & 3)];
+        ls[cat] * scale[RASTER_TO_ZIGZAG_8X8[idx] as usize] as i32
+    };
+    if qp_per >= 6 {
+        let sh = (qp_per - 6) as u32;
+        for (idx, b) in block.iter_mut().enumerate() {
+            *b = b.wrapping_mul(v(idx)).wrapping_shl(sh);
+        }
+    } else {
+        let (round, sh) = (1 << (5 - qp_per), (6 - qp_per) as u32);
+        for (idx, b) in block.iter_mut().enumerate() {
+            *b = b.wrapping_mul(v(idx)).wrapping_add(round) >> sh;
         }
     }
 }
@@ -536,22 +538,21 @@ pub(crate) const RASTER_TO_ZIGZAG_4X4: [u8; 16] = {
 
 pub fn dequant_4x4_full(block: &mut [i32; 16], qp: i32, scale: &[u8; 16]) {
     let qp_per = qp / 6;
-    let qp_rem = (qp % 6) as usize;
-
-    for r in 0..4 {
-        for c in 0..4 {
-            let idx = r * 4 + c;
-            if block[idx] != 0 {
-                let pc = position_category(r, c);
-                // Scaling lists are in (frame) zigzag order
-                let v = LEVEL_SCALE[qp_rem][pc] * scale[RASTER_TO_ZIGZAG_4X4[idx] as usize] as i32;
-                if qp_per >= 4 {
-                    block[idx] = block[idx].wrapping_mul(v).wrapping_shl((qp_per - 4) as u32);
-                } else {
-                    block[idx] = (block[idx].wrapping_mul(v).wrapping_add(1 << (3 - qp_per)))
-                        >> (4 - qp_per);
-                }
-            }
+    let ls = LEVEL_SCALE[(qp % 6) as usize];
+    // Branch-free over all 16 positions (a zero coefficient stays zero), so
+    // the loop vectorizes
+    let v = |idx: usize| {
+        ls[((idx >> 2) & 1) + (idx & 1)] * scale[RASTER_TO_ZIGZAG_4X4[idx] as usize] as i32
+    };
+    if qp_per >= 4 {
+        let sh = (qp_per - 4) as u32;
+        for (idx, b) in block.iter_mut().enumerate() {
+            *b = b.wrapping_mul(v(idx)).wrapping_shl(sh);
+        }
+    } else {
+        let (round, sh) = (1 << (3 - qp_per), (4 - qp_per) as u32);
+        for (idx, b) in block.iter_mut().enumerate() {
+            *b = b.wrapping_mul(v(idx)).wrapping_add(round) >> sh;
         }
     }
 }
