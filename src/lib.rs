@@ -52,8 +52,9 @@
 //!
 //! # Not supported
 //!
-//! Only 8-bit 4:2:0 video is decoded. Streams using monochrome, 4:2:2 or
-//! 4:4:4 chroma, bit depths above 8 (High 10 and up) or lossless transform
+//! Only 8-bit 4:2:0 and monochrome (4:0:0, output as 4:2:0 with mid-grey
+//! chroma) video is decoded. Streams using 4:2:2 or 4:4:4 chroma, bit
+//! depths above 8 (High 10 and up) or lossless transform
 //! bypass are rejected with [`DecodeError::Unsupported`](error::DecodeError::Unsupported)
 //! on every slice, rather than decoded into wrong pictures.
 //!

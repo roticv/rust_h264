@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Monochrome (4:0:0) streams** now decode instead of being rejected. Frames
+  keep the 4:2:0 layout with U and V filled with 128, matching FFmpeg's
+  output. Both JVT monochrome conformance vectors pass (176 of 204).
 - `tools/conformance/run.sh` runs the JVT conformance suites (JVT-AVC_V1,
   JVT-FR-EXT) through Fluster with a new `conformance_decode` example, and
   fails on any result other than the expected unsupported-format vectors.

@@ -20,7 +20,9 @@ use crate::sps::{parse_sps, Sps};
 ///
 /// The Y plane is `width × height` bytes; the U and V planes are each
 /// `(width/2) × (height/2)` bytes (4:2:0 chroma subsampling). Pixels are
-/// stored row-major with no inter-row padding (stride == width).
+/// stored row-major with no inter-row padding (stride == width). Monochrome
+/// (4:0:0) streams decode to the same layout with U and V filled with 128,
+/// as FFmpeg outputs them.
 ///
 /// Frames returned by [`Decoder::decode_nal`] are emitted in **decode order**,
 /// not display order. To present them in the intended order, sort by
@@ -326,15 +328,14 @@ impl Decoder {
 }
 
 /// Reject sequences this decoder cannot decode correctly. Only 8-bit 4:2:0
-/// with the normal transform path is implemented; anything else would decode
+/// and 4:0:0 with the normal transform path are implemented; anything else would decode
 /// to wrong pictures instead of failing. Checked when a slice activates its
 /// SPS (not when the SPS is parsed), so streams that merely carry such an
 /// SPS still decode, and [`parse_sps_info`](crate::nal::parse_sps_info)
 /// can still describe it.
 pub(crate) fn check_supported(sps: &Sps) -> Result<(), DecodeError> {
     match sps.chroma_format_idc {
-        1 => {}
-        0 => return Err(DecodeError::Unsupported("monochrome (4:0:0) video")),
+        0 | 1 => {}
         2 => return Err(DecodeError::Unsupported("4:2:2 chroma")),
         3 => return Err(DecodeError::Unsupported("4:4:4 chroma")),
         _ => return Err(DecodeError::InvalidSyntax("chroma_format_idc out of range")),
@@ -1003,6 +1004,7 @@ pub(crate) fn run_slice(
         constrained_intra_pred_flag: pps.constrained_intra_pred_flag,
         chroma_qp_index_offset: pps.chroma_qp_index_offset,
         second_chroma_qp_index_offset: pps.second_chroma_qp_index_offset,
+        monochrome: sps.chroma_format_idc == 0,
         ref_pic_list,
         ref_pic_list_l0: _ref_pic_list_l0,
         ref_pic_list_l1: _ref_pic_list_l1,
@@ -3007,6 +3009,34 @@ mod tests {
         );
     }
 
+    // Monochrome (4:0:0) streams from x264 (--output-csp i400), SHA-256 of
+    // ffmpeg's decode: no chroma syntax, chroma planes mid-grey
+
+    #[test]
+    fn test_mono_x264_cavlc() {
+        // CAVLC with B-pyramid, explicit weighted P (no chroma weights in
+        // the table), 8x8 transform and the 4:0:0 CBP mapping
+        decode_and_compare_hash(
+            "mono_x264_cavlc",
+            24,
+            176,
+            144,
+            "726f959f217c4991af53594e60ebdfa066448761720761d53426d2e4582d13ef",
+        );
+    }
+
+    #[test]
+    fn test_mono_x264_cabac_mbaff() {
+        // CABAC MBAFF with temporal direct and two slices per picture
+        decode_and_compare_hash(
+            "mono_x264_cabac_mbaff",
+            24,
+            176,
+            144,
+            "41c13cd124b65362a24a5fd3d60a19415ef703fb4db5bedfafa62e70afebb68d",
+        );
+    }
+
     // x264 --interlaced (MBAFF) streams, SHA-256 of ffmpeg's decode. Mixed
     // frame/field pairs exercise the spec Table 6-4 neighbours throughout.
 
@@ -3442,7 +3472,6 @@ mod tests {
     #[test]
     fn test_unsupported_formats_are_rejected() {
         for (name, what) in [
-            ("unsupported_mono", "monochrome (4:0:0) video"),
             ("unsupported_422", "4:2:2 chroma"),
             ("unsupported_444", "4:4:4 chroma"),
             ("unsupported_420_10bit", "bit depth above 8"),

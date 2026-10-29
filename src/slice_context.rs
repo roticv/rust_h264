@@ -30,6 +30,10 @@ pub(crate) struct SliceParams<'a> {
     pub chroma_qp_index_offset: i32,
     /// Chroma QP offset of Cr (spec 7.4.2.2)
     pub second_chroma_qp_index_offset: i32,
+    /// Monochrome stream (chroma_format_idc 0): no chroma syntax; chroma
+    /// planes stay mid-grey (intra chroma prediction is DC, CBP has no
+    /// chroma bits)
+    pub monochrome: bool,
     pub ref_pic_list: &'a [Arc<DecodedPicture>],
     pub ref_pic_list_l0: &'a [Arc<DecodedPicture>],
     pub ref_pic_list_l1: &'a [Arc<DecodedPicture>],

@@ -12,8 +12,8 @@ use crate::neighbor::{compute_nc, dequant_4x4_ac_raster, predict_i4x4_mode};
 use crate::residual::{
     chroma_qp, dequant_4x4_full, dequant_8x8, dequant_chroma_dc, dequant_luma_dc_i16x16,
     inverse_dct_4x4, inverse_dct_8x8, inverse_hadamard_2x2, inverse_hadamard_4x4,
-    BLOCK_INDEX_TO_OFFSET, CBP_INTER_TABLE, CBP_INTRA_TABLE, OFFSET_TO_BLOCK, ZIGZAG_4X4,
-    ZIGZAG_4X4_FIELD, ZIGZAG_8X8_CAVLC, ZIGZAG_8X8_CAVLC_FIELD,
+    BLOCK_INDEX_TO_OFFSET, OFFSET_TO_BLOCK, ZIGZAG_4X4, ZIGZAG_4X4_FIELD, ZIGZAG_8X8_CAVLC,
+    ZIGZAG_8X8_CAVLC_FIELD,
 };
 use crate::slice_context::{SliceContext, SliceParams};
 
@@ -777,10 +777,8 @@ impl SliceContext<'_> {
 
             // Parse CBP using inter table
             let cbp_code = reader.read_ue()? as usize;
-            if cbp_code >= 48 {
-                return Err(DecodeError::from("invalid coded_block_pattern"));
-            }
-            let cbp = CBP_INTER_TABLE[cbp_code];
+            let cbp = crate::residual::map_cbp(cbp_code, false, sp.monochrome)
+                .ok_or(DecodeError::from("invalid coded_block_pattern"))?;
             let cbp_luma = cbp & 0x0F;
             let cbp_chroma = cbp >> 4;
 
@@ -1480,10 +1478,8 @@ impl SliceContext<'_> {
 
             // Parse CBP using inter table
             let cbp_code = reader.read_ue()? as usize;
-            if cbp_code >= 48 {
-                return Err(DecodeError::from("invalid coded_block_pattern"));
-            }
-            let cbp = CBP_INTER_TABLE[cbp_code];
+            let cbp = crate::residual::map_cbp(cbp_code, false, sp.monochrome)
+                .ok_or(DecodeError::from("invalid coded_block_pattern"))?;
             let cbp_luma = cbp & 0x0F;
             let cbp_chroma = cbp >> 4;
             // 8x8 transform flag (High profile inter MBs, spec 7.3.5).
@@ -1906,13 +1902,15 @@ impl SliceContext<'_> {
                     self.i4x4_modes[mb_idx * 16 + blk] = mode;
                 }
             }
-            intra_chroma_pred_mode = reader.read_ue()? as u8;
+            intra_chroma_pred_mode = if sp.monochrome {
+                0
+            } else {
+                reader.read_ue()? as u8
+            };
 
             let cbp_code = reader.read_ue()? as usize;
-            if cbp_code >= 48 {
-                return Err(DecodeError::from("invalid coded_block_pattern"));
-            }
-            let cbp = CBP_INTRA_TABLE[cbp_code];
+            let cbp = crate::residual::map_cbp(cbp_code, true, sp.monochrome)
+                .ok_or(DecodeError::from("invalid coded_block_pattern"))?;
             let cbp_luma = cbp & 0x0F;
             cbp_chroma = cbp >> 4;
 
@@ -2039,7 +2037,11 @@ impl SliceContext<'_> {
             cbp_chroma = ((mt / 4) % 3) as u8;
             let cbp_luma = if mt >= 12 { 15u8 } else { 0u8 };
 
-            intra_chroma_pred_mode = reader.read_ue()? as u8;
+            intra_chroma_pred_mode = if sp.monochrome {
+                0
+            } else {
+                reader.read_ue()? as u8
+            };
 
             let mb_qp_delta = reader.read_se()?;
             qp_y = ((self.prev_mb_qp + mb_qp_delta + 52) % 52 + 52) % 52;
@@ -2141,7 +2143,11 @@ impl SliceContext<'_> {
             let cx = mb_x / 2;
             for r in 0..8 {
                 for c in 0..8 {
-                    let val = reader.read_bits(8)? as u8;
+                    let val = if sp.monochrome {
+                        128
+                    } else {
+                        reader.read_bits(8)? as u8
+                    };
                     let idx = self.lc_offset + r * self.lc_stride + cx + c;
                     if idx < self.frame.u.len() {
                         self.frame.u[idx] = val;
@@ -2150,7 +2156,11 @@ impl SliceContext<'_> {
             }
             for r in 0..8 {
                 for c in 0..8 {
-                    let val = reader.read_bits(8)? as u8;
+                    let val = if sp.monochrome {
+                        128
+                    } else {
+                        reader.read_bits(8)? as u8
+                    };
                     let idx = self.lc_offset + r * self.lc_stride + cx + c;
                     if idx < self.frame.v.len() {
                         self.frame.v[idx] = val;

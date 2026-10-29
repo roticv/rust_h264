@@ -11,10 +11,6 @@ FM2_SVA_C
 SP1_BT_A
 sp2_bt_b
 
-# Monochrome (4:0:0)
-HPCAMOLQ_BRCM_B
-HPCVMOLQ_BRCM_B
-
 # High 10
 FREH10-1
 FREH10-2

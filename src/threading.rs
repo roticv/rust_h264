@@ -598,7 +598,6 @@ mod tests {
     #[test]
     fn threaded_rejects_unsupported_formats() {
         for name in [
-            "unsupported_mono",
             "unsupported_422",
             "unsupported_444",
             "unsupported_420_10bit",

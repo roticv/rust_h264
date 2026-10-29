@@ -27,8 +27,12 @@ fi
 cp "$here/rust_h264.py" "$fluster_dir/fluster/decoders/rust_h264.py"
 
 cd "$fluster_dir"
+# A marker per suite, so an interrupted download is resumed on the next run
 for suite in "${SUITES[@]}"; do
-    [ -d "resources/$suite" ] || python3 fluster.py download "$suite"
+    if [ ! -f "resources/.$suite.done" ]; then
+        python3 fluster.py download "$suite"
+        touch "resources/.$suite.done"
+    fi
 done
 
 summary=$(mktemp)

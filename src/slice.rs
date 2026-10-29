@@ -213,7 +213,9 @@ pub fn parse_slice_header(
         || (slice_type == SliceType::B && pps.weighted_bipred_idc == 1);
     let weight_table = if needs_weight_table {
         let luma_log2_weight_denom = r.read_ue()?;
-        let chroma_log2_weight_denom = r.read_ue()?;
+        // ChromaArrayType 0 (monochrome) has no chroma weights
+        let has_chroma = sps.chroma_format_idc != 0;
+        let chroma_log2_weight_denom = if has_chroma { r.read_ue()? } else { 0 };
         // Spec constrains these to [0, 7]. Clamp to prevent shift overflow.
         if luma_log2_weight_denom > 7 || chroma_log2_weight_denom > 7 {
             return Err("log2_weight_denom out of range");
@@ -234,7 +236,7 @@ pub fn parse_slice_header(
                 rw.luma_weight = r.read_se()?;
                 rw.luma_offset = r.read_se()?;
             }
-            let chroma_weight_flag = r.read_bit()? != 0;
+            let chroma_weight_flag = has_chroma && r.read_bit()? != 0;
             if chroma_weight_flag {
                 for j in 0..2 {
                     rw.chroma_weight[j] = r.read_se()?;
@@ -258,7 +260,7 @@ pub fn parse_slice_header(
                     rw.luma_weight = r.read_se()?;
                     rw.luma_offset = r.read_se()?;
                 }
-                let chroma_weight_flag = r.read_bit()? != 0;
+                let chroma_weight_flag = has_chroma && r.read_bit()? != 0;
                 if chroma_weight_flag {
                     for j in 0..2 {
                         rw.chroma_weight[j] = r.read_se()?;

@@ -464,6 +464,25 @@ pub const CBP_INTER_TABLE: [u8; 48] = [
     17, 18, 20, 24, 19, 21, 26, 28, 23, 27, 29, 30, 22, 25, 38, 41,
 ];
 
+/// coded_block_pattern mapping for monochrome streams (ChromaArrayType 0,
+/// Table 9-4 second column): luma bits only, codeNum 0-15.
+#[rustfmt::skip]
+const CBP_INTRA_TABLE_GRAY: [u8; 16] = [15, 0, 7, 11, 13, 14, 3, 5, 10, 12, 1, 2, 4, 8, 6, 9];
+#[rustfmt::skip]
+const CBP_INTER_TABLE_GRAY: [u8; 16] = [0, 1, 2, 4, 8, 3, 5, 10, 12, 15, 7, 11, 13, 14, 6, 9];
+
+/// The coded_block_pattern of me(v) codeNum `code` (spec 9.1.2), or `None`
+/// when out of range.
+pub fn map_cbp(code: usize, intra: bool, monochrome: bool) -> Option<u8> {
+    match (intra, monochrome) {
+        (true, false) => CBP_INTRA_TABLE.get(code),
+        (false, false) => CBP_INTER_TABLE.get(code),
+        (true, true) => CBP_INTRA_TABLE_GRAY.get(code),
+        (false, true) => CBP_INTER_TABLE_GRAY.get(code),
+    }
+    .copied()
+}
+
 /// Dequantize a full 4x4 block (including DC at position [0][0]) in raster order.
 /// `scale` is the scaling matrix in scan order; mapped to raster via ZIGZAG_4X4.
 pub fn dequant_4x4_full(block: &mut [i32; 16], qp: i32, scale: &[u8; 16]) {
