@@ -42,6 +42,122 @@ mod tests {
     use alloc::string::String;
     use alloc::vec::Vec;
 
+    /// xorshift64 bytes, biased to the extremes so clipping is exercised.
+    fn random_bytes(seed: &mut u64, n: usize) -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 7;
+                *seed ^= *seed << 17;
+                match *seed % 8 {
+                    0 => 0,
+                    1 => 255,
+                    _ => (*seed >> 24) as u8,
+                }
+            })
+            .collect()
+    }
+
+    /// Every kernel of the active backend matches the scalar reference for
+    /// all widths up to 16 (SIMD bodies and scalar tails) on random rows.
+    #[test]
+    fn kernels_match_scalar() {
+        use super::scalar as s;
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for round in 0..200 {
+            for w in 1..=16usize {
+                let rows_buf: Vec<Vec<u8>> =
+                    (0..6).map(|_| random_bytes(&mut seed, w + 5)).collect();
+                let rows: [&[u8]; 6] = core::array::from_fn(|k| &rows_buf[k][..]);
+                let rows2_buf: Vec<Vec<u8>> =
+                    (0..6).map(|_| random_bytes(&mut seed, w + 5)).collect();
+                let rows2: [&[u8]; 6] = core::array::from_fn(|k| &rows2_buf[k][..]);
+                let src = random_bytes(&mut seed, w + 5);
+                let int_row = random_bytes(&mut seed, w);
+                let check = |name: &str, f: &dyn Fn(&mut [u8]), g: &dyn Fn(&mut [u8])| {
+                    let (mut a, mut b) = (alloc::vec![0u8; w], alloc::vec![0u8; w]);
+                    f(&mut a);
+                    g(&mut b);
+                    assert_eq!(a, b, "{name} w={w} round={round}");
+                };
+                check(
+                    "row_half_pel_h",
+                    &|o| super::row_half_pel_h(&src, o, w),
+                    &|o| s::row_half_pel_h(&src, o, w),
+                );
+                check(
+                    "row_half_pel_v",
+                    &|o| super::row_half_pel_v(rows, o, w),
+                    &|o| s::row_half_pel_v(rows, o, w),
+                );
+                check(
+                    "row_half_pel_hv",
+                    &|o| super::row_half_pel_hv(rows, o, w),
+                    &|o| s::row_half_pel_hv(rows, o, w),
+                );
+                check(
+                    "row_avg_int_v",
+                    &|o| super::row_avg_int_v(&int_row, rows, o, w),
+                    &|o| s::row_avg_int_v(&int_row, rows, o, w),
+                );
+                check(
+                    "row_avg_h_v",
+                    &|o| super::row_avg_h_v(&src, rows, o, w),
+                    &|o| s::row_avg_h_v(&src, rows, o, w),
+                );
+                check(
+                    "row_avg_int_h",
+                    &|o| super::row_avg_int_h(&int_row, &src, o, w),
+                    &|o| s::row_avg_int_h(&int_row, &src, o, w),
+                );
+                check(
+                    "row_avg_h_int",
+                    &|o| super::row_avg_h_int(&src, &int_row, o, w),
+                    &|o| s::row_avg_h_int(&src, &int_row, o, w),
+                );
+                check(
+                    "row_avg_h_hv",
+                    &|o| super::row_avg_h_hv(&src, rows2, o, w),
+                    &|o| s::row_avg_h_hv(&src, rows2, o, w),
+                );
+                check(
+                    "row_avg_v_hv",
+                    &|o| super::row_avg_v_hv(rows, rows2, o, w),
+                    &|o| s::row_avg_v_hv(rows, rows2, o, w),
+                );
+                let (a, b) = (random_bytes(&mut seed, w), random_bytes(&mut seed, w));
+                check("bi_pred_avg", &|o| super::bi_pred_avg(&a, &b, o), &|o| {
+                    s::bi_pred_avg(&a, &b, o)
+                });
+            }
+            // Chroma bilinear: every block size, fractions, a plane whose
+            // last row ends exactly where the block's reads do
+            for &(bw, bh) in &[
+                (2usize, 2usize),
+                (2, 4),
+                (4, 2),
+                (4, 4),
+                (4, 8),
+                (8, 4),
+                (8, 8),
+                (8, 16),
+                (4, 16),
+            ] {
+                let stride = bw + 1 + (seed % 5) as usize;
+                let plane = random_bytes(&mut seed, bh * stride + bw + 1);
+                let fx = (seed % 8) as u8;
+                let fy = ((seed >> 8) % 8) as u8;
+                let c = [(8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy];
+                let (mut a, mut b) = (alloc::vec![0u8; bw * bh], alloc::vec![0u8; bw * bh]);
+                super::chroma_bilinear_block(
+                    &plane, 0, stride, bw, bh, &mut a, c[0], c[1], c[2], c[3],
+                );
+                s::chroma_bilinear_block(&plane, 0, stride, bw, bh, &mut b, c[0], c[1], c[2], c[3]);
+                assert_eq!(a, b, "chroma_bilinear_block {bw}x{bh} round={round}");
+            }
+        }
+    }
+
     use crate::decoder::OrderedDecoder;
     use crate::nal::parse_annex_b;
     use crate::sha256::sha256_hex;
