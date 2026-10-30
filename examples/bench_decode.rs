@@ -39,6 +39,7 @@ const STREAMS: &[&str] = &[
     "bench_1080p_100f.h264",
     "bench_1080p_100f_complex.h264",
     "bench_1080p_100f_ponly.h264",
+    "bench_1080p_100f_deblock.h264",
 ];
 
 #[cfg(feature = "profile")]
@@ -201,7 +202,9 @@ fn bench_main() {
     println!("stream | frames | decode_ms | fps | allocs | sha256(prefix)");
     println!("--- | ---: | ---: | ---: | ---: | ---");
 
-    for stream in STREAMS {
+    // BENCH_STREAM=<substring> runs only the matching streams
+    let filter = std::env::var("BENCH_STREAM").unwrap_or_default();
+    for stream in STREAMS.iter().filter(|s| s.contains(filter.as_str())) {
         let path = format!("{testdata}/{stream}");
         let Ok(data) = std::fs::read(&path) else {
             println!("{stream} | MISSING | - | - | - | -");
