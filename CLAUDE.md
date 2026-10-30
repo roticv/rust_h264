@@ -52,7 +52,7 @@ The decoder logic is split across several files:
 | `src/threading.rs` | `ThreadedDecoder`: frame threading with row-level reference sync. Coordinator plans slices (`prepare_slice`) in coded order and inserts each picture into the DPB as an in-progress `DecodedPicture`; workers run `run_slice` with a `RowSync` hook that deblocks (one unit behind decoding, since intra prediction needs unfiltered samples) and publishes final MB rows; output is committed in coded order; reorder buffer mirrors `OrderedDecoder` |
 | `src/pixel.rs` | `Pixel` sample-type trait: `u8` (8-bit) and `u16` (10-bit). Planes stay `Vec<u8>` (10-bit samples 2 bytes LE); everything that touches samples (`SliceContext<P>`, chroma, intra cores via `i32`, residual add, deblocking, weighted prediction) is generic and compiled per type, `run_slice` and `filter_frame_inner` dispatch on bit depth. The `u8` methods forward to the SIMD kernels, `u16` to generic scalar code (`inter_pred::*_px`, `simd::scalar` deblock kernels), so the 8-bit path is unchanged. Thresholds and QP ranges use `P::QP_BD_OFFSET`/`P::BIT_DEPTH` |
 | `src/picture_sync.rs` | `SharedPlane` (single-writer plane, readers see only the published prefix; the only unsafe code for threading) and `RowProgress` (published MB-row count with blocking waits) |
-| `src/simd/` | Motion-compensation and deblocking kernel backends: `scalar.rs` (reference), `neon.rs` (aarch64 default; also the 16-line luma/chroma deblocking filters and the vertical-edge transposes), `x86.rs` (x86_64 default, SSE2 + runtime SSSE3/AVX2/AVX-512 for MC; scalar deblocking), `portable.rs` (`core::simd`, nightly `portable-simd` feature). `mod.rs` selects one at compile time; all must be bit-exact with scalar (`kernels_match_scalar` checks them on random input) |
+| `src/simd/` | Motion-compensation and deblocking kernel backends: `scalar.rs` (reference), `neon.rs` (aarch64 default; also the 16-line luma/chroma deblocking filters and the vertical-edge transposes), `x86.rs` (x86_64 default, SSE2 + runtime SSSE3/AVX2/AVX-512 for MC; scalar deblocking), `portable.rs` (`core::simd`, nightly `portable-simd` feature). These kernels are 8-bit (`u8`); 10-bit uses the generic scalar code via `Pixel`. `mod.rs` selects one at compile time; all must be bit-exact with scalar (`kernels_match_scalar` checks them on random input) |
 
 `SliceContext` bundles ~25 mutable per-MB arrays; `SliceParams` bundles read-only slice-level parameters. The `make_ctx!()` macro in `decoder.rs` constructs a `SliceContext` from local variables at each call site for zero-cost method dispatch.
 
@@ -63,7 +63,7 @@ The crate exposes a minimal surface area:
 - `decoder::Decoder` — low-level streaming decoder; `decode_nal` returns one frame at a time in **decode order**.
 - `decoder::OrderedDecoder` — wraps `Decoder` with a built-in reorder buffer; `decode_nal` returns 0+ frames in **display order** (sorted by `(gop_id, pic_order_cnt)`). Recommended for most users — handles GOP tracking and the IDR-count timing pitfall internally. It is generic as `OrderedDecoder<M = ()>`; `decode_nal_with_meta`/`flush_with_meta` return `(Frame, M)` pairs so callers can carry per-picture metadata such as PTS timestamps through B-frame reordering; `OrderedDecoder<()>` has plain `decode_nal`/`flush`.
 - `threading::ThreadedDecoder` (`std` feature) — same `decode_nal`/`flush` surface as `OrderedDecoder<()>`, decodes pictures on worker threads, output byte-identical to `OrderedDecoder`. Reference reads wait per row: luma/chroma MC (`luma_mc_stride`, `chroma_mc` taking a `ChromaRef`) wait for the rows they read, direct mode waits for the whole co-located picture via `DecodedPicture::motion()`. New reference-plane reads must go through these accessors (`luma()`, `chroma()` return only published rows).
-- `decoder::Frame` — decoded YUV frame with `y`/`u`/`v` planes, `width`, `height`, `pic_order_cnt`, `chroma_format` (`ChromaFormat::Yuv420` or `Yuv422`; `chroma_width()`/`chroma_height()` give the U/V plane size).
+- `decoder::Frame` — decoded YUV frame with `y`/`u`/`v` planes, `width`, `height`, `pic_order_cnt`, `chroma_format` (`ChromaFormat::Yuv420` or `Yuv422`; `chroma_width()`/`chroma_height()` give the U/V plane size), `bit_depth` (8 or 10; at 10 bits the planes hold 2 bytes per sample, little-endian; `bytes_per_sample()`/`sample()` read either).
 - `nal::parse_annex_b` — parser for start-code delimited bitstreams.
 - `nal::parse_avcc` + `nal::parse_avcc_config` + `nal::AvccConfig` — parser for length-prefixed bitstreams from MP4/MKV containers.
 - `nal::NalUnit`, `nal::NalUnitType` — parsed NAL unit types.
@@ -274,7 +274,8 @@ Baseline, Main, High, High 10 and High 4:2:2 profile 8- and 10-bit 4:2:0, 4:2:2 
   presets with and without deblocking, High profile, multi-slice, weighted prediction,
   long-term references and POC types from the JM encoder, MBAFF and field pictures
   (including `mbaff_x264_*`: x264 --interlaced streams mixing frame and field pairs),
-  non-16-aligned sizes, up to 1080p
+  non-16-aligned sizes, up to 1080p, and 10-bit (`high10_*`: x264 High 10 / High 4:2:2
+  CAVLC, CABAC, MBAFF, monochrome, cropped low QP; SHA-256 of FFmpeg's `yuv4xxp10le`)
 - `testdata/unsupported_*.h264`: one tiny stream per rejected format
 - `testdata/fuzz_regressions/`: crash inputs replayed to check they don't panic
 - Frame threading: every test stream decoded serially and at 1, 2 and 4 threads must match

@@ -17,7 +17,9 @@ Decodes Baseline, Main, High, High 10 and High 4:2:2 profile H.264 (8- and 10-bi
 - Optional frame-threaded decoding, and a `no_std` + `alloc` build
 
 Output is byte-identical to FFmpeg on the test and benchmark streams, from
-tiny synthetic clips up to 1080p x264 and JM reference-encoder streams.
+tiny synthetic clips up to 1080p x264 and JM reference-encoder streams, 8-
+and 10-bit. Every 8- and 10-bit 4:2:0, 4:2:2 and monochrome JVT conformance
+vector passes (199 of 204, the same as FFmpeg; the rest use FMO or SP/SI).
 
 ## Design
 
@@ -65,7 +67,8 @@ for nal in &nals {
     // decode_nal returns 0 or more frames in display order
     for frame in decoder.decode_nal(nal).unwrap() {
         // `frame` is a decoded YUV420 picture:
-        //   frame.y, frame.u, frame.v  — pixel planes
+        //   frame.y, frame.u, frame.v  — pixel planes (2 bytes/sample LE
+        //                                when frame.bit_depth is 10)
         //   frame.width, frame.height  — dimensions
         //   frame.pic_order_cnt        — POC (already display-ordered)
     }
