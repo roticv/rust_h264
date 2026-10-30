@@ -202,11 +202,21 @@ fn bench_main() {
     println!("stream | frames | decode_ms | fps | allocs | sha256(prefix)");
     println!("--- | ---: | ---: | ---: | ---: | ---");
 
-    // BENCH_STREAM=<substring> runs only the matching streams
+    // BENCH_STREAM=<substring> runs only the matching streams;
+    // BENCH_FILE=<path> runs that one file instead of the corpus
     let filter = std::env::var("BENCH_STREAM").unwrap_or_default();
-    for stream in STREAMS.iter().filter(|s| s.contains(filter.as_str())) {
-        let path = format!("{testdata}/{stream}");
-        let Ok(data) = std::fs::read(&path) else {
+    let file = std::env::var("BENCH_FILE").ok();
+    let streams: Vec<String> = match &file {
+        Some(f) => vec![f.clone()],
+        None => STREAMS
+            .iter()
+            .filter(|s| s.contains(filter.as_str()))
+            .map(|s| format!("{testdata}/{s}"))
+            .collect(),
+    };
+    for path in &streams {
+        let stream = path.rsplit('/').next().unwrap_or(path);
+        let Ok(data) = std::fs::read(path) else {
             println!("{stream} | MISSING | - | - | - | -");
             continue;
         };
