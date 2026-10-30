@@ -110,6 +110,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picture through the last slice's reference list.
 
 ### Changed
+- **Minimum supported Rust version is 1.89**, now declared as
+  `rust-version` in Cargo.toml and tested in CI.
 - **`Frame` has new public fields, `chroma_format` and `bit_depth`** (see
   4:2:2 and 10-bit above), so code that constructs `Frame` values must set
   them.

@@ -39,6 +39,10 @@ every slice, rather than decoded into wrong pictures:
 Also not implemented: SP/SI slices, and slice groups (FMO) or arbitrary
 slice order (ASO).
 
+## Minimum Rust version
+
+Rust 1.89 or newer (`rust-version` in Cargo.toml, tested in CI).
+
 ## Cargo features
 
 - `std` (default): standard library support. Without it the crate is

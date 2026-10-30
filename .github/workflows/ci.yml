@@ -51,6 +51,20 @@ jobs:
         if: matrix.name == 'std'
         run: cargo test --release -- --ignored golden_corpus_digests threaded_matches_serial_bench_corpus
 
+  msrv:
+    # The oldest Rust in Cargo.toml's rust-version must keep building
+    name: Test on the minimum Rust version (1.89)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.89
+        uses: dtolnay/rust-toolchain@1.89
+
+      - name: Test
+        run: cargo test --release
+
   no_std_target:
     # Cross-check the library on a real no_std target (no std available at
     # all), which the host no_std test run above cannot prove.
