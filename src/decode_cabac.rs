@@ -824,15 +824,14 @@ impl SliceContext<'_> {
                                     .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
                                     .apply_uni(&mut luma_pred, 0, ref_idx as usize, false, 0);
                             }
-                            for r in 0..sph {
-                                for c in 0..spw {
-                                    self.frame.y[self.ly_offset
-                                        + (py + r) * self.ly_stride
-                                        + mb_x
-                                        + px
-                                        + c] = luma_pred[r * spw + c];
-                                }
-                            }
+                            crate::residual::put_block(
+                                &mut self.frame.y,
+                                self.ly_offset + py * self.ly_stride + mb_x + px,
+                                self.ly_stride,
+                                &luma_pred,
+                                spw,
+                                (spw, sph),
+                            );
                         }
                     }
                     // Chroma MC for P_8x8 (per sub-partition)
@@ -998,15 +997,14 @@ impl SliceContext<'_> {
                                 .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
                                 .apply_uni(&mut luma_pred, 0, part_ref[p] as usize, false, 0);
                         }
-                        for r in 0..part_h {
-                            for c in 0..part_w {
-                                self.frame.y[self.ly_offset
-                                    + (py_off + r) * self.ly_stride
-                                    + mb_x
-                                    + px_off
-                                    + c] = luma_pred[r * part_w + c];
-                            }
-                        }
+                        crate::residual::put_block(
+                            &mut self.frame.y,
+                            self.ly_offset + py_off * self.ly_stride + mb_x + px_off,
+                            self.ly_stride,
+                            &luma_pred,
+                            part_w,
+                            (part_w, part_h),
+                        );
 
                         self.predict_chroma_part(
                             mb_idx,
@@ -1165,15 +1163,14 @@ impl SliceContext<'_> {
                         }
                     } // close if use_8x8_inter else
                       // Add residual to prediction
-                    for r in 0..16 {
-                        for c in 0..16 {
-                            let val = (self.frame.y[self.ly_offset + r * self.ly_stride + mb_x + c]
-                                as i32
-                                + luma_residual[r * 16 + c])
-                                .clamp(0, 255) as u8;
-                            self.frame.y[self.ly_offset + r * self.ly_stride + mb_x + c] = val;
-                        }
-                    }
+                    crate::residual::add_residual(
+                        &mut self.frame.y,
+                        self.ly_offset + mb_x,
+                        self.ly_stride,
+                        &luma_residual,
+                        16,
+                        (16, 16),
+                    );
                 }
 
                 // Chroma residual
@@ -2311,13 +2308,14 @@ impl SliceContext<'_> {
                         }
                     }
 
-                    for r in 0..sub_part.h {
-                        for c in 0..sub_part.w {
-                            self.frame.y
-                                [self.ly_offset + (sub_part.y + r) * self.ly_stride + abs_x + c] =
-                                luma_pred[r * sub_part.w + c];
-                        }
-                    }
+                    crate::residual::put_block(
+                        &mut self.frame.y,
+                        self.ly_offset + sub_part.y * self.ly_stride + abs_x,
+                        self.ly_stride,
+                        &luma_pred,
+                        sub_part.w,
+                        (sub_part.w, sub_part.h),
+                    );
                     // Chroma MC
                     let m0 = if sub_part.pred_l0 {
                         let pic = ref_pic_safe(
@@ -2486,15 +2484,14 @@ impl SliceContext<'_> {
                             }
                         }
                     } // close if use_8x8_b_inter else
-                    for r in 0..16 {
-                        for c in 0..16 {
-                            let val = (self.frame.y[self.ly_offset + r * self.ly_stride + mb_x + c]
-                                as i32
-                                + luma_residual[r * 16 + c])
-                                .clamp(0, 255) as u8;
-                            self.frame.y[self.ly_offset + r * self.ly_stride + mb_x + c] = val;
-                        }
-                    }
+                    crate::residual::add_residual(
+                        &mut self.frame.y,
+                        self.ly_offset + mb_x,
+                        self.ly_stride,
+                        &luma_residual,
+                        16,
+                        (16, 16),
+                    );
                 }
 
                 // Chroma residual

@@ -988,18 +988,16 @@ impl SliceContext<'_> {
                     }
                 }
 
-                for r in 0..sub_part.h {
-                    for c in 0..sub_part.w {
-                        let val = (luma_pred[r * sub_part.w + c] as i32
-                            + luma_residual[(sub_part.y + r) * 16 + sub_part.x + c])
-                            .clamp(0, 255) as u8;
-                        self.frame.y[self.ly_offset
-                            + (sub_part.y + r) * self.ly_stride
-                            + mb_x
-                            + sub_part.x
-                            + c] = val;
-                    }
-                }
+                crate::residual::put_pred_residual(
+                    &mut self.frame.y,
+                    self.ly_offset + sub_part.y * self.ly_stride + mb_x + sub_part.x,
+                    self.ly_stride,
+                    &luma_pred,
+                    sub_part.w,
+                    &luma_residual[sub_part.y * 16 + sub_part.x..],
+                    16,
+                    (sub_part.w, sub_part.h),
+                );
             }
 
             // Chroma
@@ -1357,18 +1355,16 @@ impl SliceContext<'_> {
                         .mb(self.mbaff && self.mb_field_decoding[mb_idx / 2], mb_idx)
                         .apply_uni(&mut luma_pred, 0, sub_part.ref_idx as usize, false, 0);
                 }
-                for r in 0..sub_part.h {
-                    for c in 0..sub_part.w {
-                        let val = (luma_pred[r * sub_part.w + c] as i32
-                            + luma_residual[(sub_part.y + r) * 16 + sub_part.x + c])
-                            .clamp(0, 255) as u8;
-                        self.frame.y[self.ly_offset
-                            + (sub_part.y + r) * self.ly_stride
-                            + mb_x
-                            + sub_part.x
-                            + c] = val;
-                    }
-                }
+                crate::residual::put_pred_residual(
+                    &mut self.frame.y,
+                    self.ly_offset + sub_part.y * self.ly_stride + mb_x + sub_part.x,
+                    self.ly_stride,
+                    &luma_pred,
+                    sub_part.w,
+                    &luma_residual[sub_part.y * 16 + sub_part.x..],
+                    16,
+                    (sub_part.w, sub_part.h),
+                );
             }
 
             // Chroma (P-slice inter)

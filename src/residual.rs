@@ -523,6 +523,68 @@ pub fn map_cbp(code: usize, intra: bool, monochrome: bool) -> Option<u8> {
 
 /// Dequantize a full 4x4 block (including DC at position [0][0]) in raster order.
 /// `scale` is the scaling matrix in scan order; mapped to raster via ZIGZAG_4X4.
+/// Copy a `w` x `h` block (rows `src_stride` apart) into a plane at `off`
+/// (rows `stride` apart), a row at a time.
+#[inline]
+pub(crate) fn put_block(
+    dst: &mut [u8],
+    off: usize,
+    stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    (w, h): (usize, usize),
+) {
+    for r in 0..h {
+        let d = off + r * stride;
+        crate::inter_pred::copy_row(&mut dst[d..d + w], &src[r * src_stride..r * src_stride + w]);
+    }
+}
+
+/// `dst = clip(dst + res)` over a `w` x `h` block of a plane at `off` (rows
+/// `stride` apart; residual rows `res_stride` apart), a row at a time.
+#[inline]
+pub(crate) fn add_residual(
+    dst: &mut [u8],
+    off: usize,
+    stride: usize,
+    res: &[i32],
+    res_stride: usize,
+    (w, h): (usize, usize),
+) {
+    for r in 0..h {
+        let d = &mut dst[off + r * stride..][..w];
+        let q = &res[r * res_stride..][..w];
+        for (px, &v) in d.iter_mut().zip(q) {
+            *px = (*px as i32 + v).clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// `dst = clip(pred + res)` over a `w` x `h` block of a plane at `off` (rows
+/// `stride` apart; prediction rows `pred_stride` apart, residual rows
+/// `res_stride` apart), a row at a time.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn put_pred_residual(
+    dst: &mut [u8],
+    off: usize,
+    stride: usize,
+    pred: &[u8],
+    pred_stride: usize,
+    res: &[i32],
+    res_stride: usize,
+    (w, h): (usize, usize),
+) {
+    for r in 0..h {
+        let d = &mut dst[off + r * stride..][..w];
+        let p = &pred[r * pred_stride..][..w];
+        let q = &res[r * res_stride..][..w];
+        for ((px, &a), &v) in d.iter_mut().zip(p).zip(q) {
+            *px = (a as i32 + v).clamp(0, 255) as u8;
+        }
+    }
+}
+
 /// Zigzag scan index of each raster position of a 4x4 block (the inverse
 /// of `ZIGZAG_4X4`), for looking up scaling lists.
 pub(crate) const RASTER_TO_ZIGZAG_4X4: [u8; 16] = {

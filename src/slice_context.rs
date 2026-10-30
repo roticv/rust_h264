@@ -1218,13 +1218,16 @@ impl SliceContext<'_> {
             has_topright,
             &mut pred,
         );
-        for r in 0..8 {
-            for c in 0..8 {
-                let val = (pred[r * 8 + c] as i32 + luma_residual[(row_off + r) * 16 + col_off + c])
-                    .clamp(0, 255) as u8;
-                self.frame.y[self.ly_offset + (row_off + r) * self.ly_stride + px + c] = val;
-            }
-        }
+        crate::residual::put_pred_residual(
+            &mut self.frame.y,
+            self.ly_offset + row_off * self.ly_stride + px,
+            self.ly_stride,
+            &pred,
+            8,
+            &luma_residual[row_off * 16 + col_off..],
+            16,
+            (8, 8),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1313,12 +1316,16 @@ impl SliceContext<'_> {
             above_left_val,
             &mut pred,
         );
-        for r in 0..4 {
-            for c in 0..4 {
-                let val = (pred[r * 4 + c] as i32 + block_coeffs[r * 4 + c]).clamp(0, 255) as u8;
-                self.frame.y[self.ly_offset + (local_row + r) * self.ly_stride + px + c] = val;
-            }
-        }
+        crate::residual::put_pred_residual(
+            &mut self.frame.y,
+            self.ly_offset + local_row * self.ly_stride + px,
+            self.ly_stride,
+            &pred,
+            4,
+            block_coeffs,
+            4,
+            (4, 4),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1362,13 +1369,16 @@ impl SliceContext<'_> {
             above_left,
             &mut luma_pred,
         );
-        for r in 0..16 {
-            for c in 0..16 {
-                let val =
-                    (luma_pred[r * 16 + c] as i32 + luma_residual[r * 16 + c]).clamp(0, 255) as u8;
-                self.frame.y[self.ly_offset + r * self.ly_stride + mb_x + c] = val;
-            }
-        }
+        crate::residual::put_pred_residual(
+            &mut self.frame.y,
+            self.ly_offset + mb_x,
+            self.ly_stride,
+            &luma_pred,
+            16,
+            luma_residual,
+            16,
+            (16, 16),
+        );
     }
 
     /// Compute intra chroma prediction for both U and V planes.

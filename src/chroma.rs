@@ -186,12 +186,8 @@ impl SliceContext<'_> {
             &mut self.frame.v
         };
         let (by, bx) = ((blk / 2) * 4, (blk % 2) * 4);
-        for r in 0..4 {
-            let o = self.lc_offset + (by + r) * self.lc_stride + mb_x / 2 + bx;
-            for (k, px) in dst[o..o + 4].iter_mut().enumerate() {
-                *px = (*px as i32 + block[r * 4 + k]).clamp(0, 255) as u8;
-            }
-        }
+        let o = self.lc_offset + by * self.lc_stride + mb_x / 2 + bx;
+        crate::residual::add_residual(dst, o, self.lc_stride, &block, 4, (4, 4));
     }
 
     /// Parse the chroma residual of a CAVLC macroblock (spec 7.3.5.3) and
