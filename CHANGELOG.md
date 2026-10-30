@@ -13,16 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Frame` has a new `chroma_format` field (`ChromaFormat::Yuv420` or
   `Yuv422`; code that builds `Frame` values must set it) and
   `chroma_width()`/`chroma_height()`; 4:2:2 frames have full-height U and V
-  planes. Output matches FFmpeg's yuv422p on every
-  8-bit 4:2:2 JVT conformance vector (10 more pass: 186 of 204; the other
-  4:2:2 vectors are 10-bit) and on x264 test streams.
+  planes. Output matches FFmpeg's yuv422p on every 8-bit 4:2:2 JVT
+  conformance vector (the other 4:2:2 vectors are 10-bit) and on x264 test
+  streams.
 - **Monochrome (4:0:0) streams** now decode instead of being rejected. Frames
   keep the 4:2:0 layout with U and V filled with 128, matching FFmpeg's
-  output. Both JVT monochrome conformance vectors pass (176 of 204).
+  output. Both JVT monochrome conformance vectors pass.
 - `tools/conformance/run.sh` runs the JVT conformance suites (JVT-AVC_V1,
   JVT-FR-EXT) through Fluster with a new `conformance_decode` example, and
   fails on any result other than the expected unsupported-format vectors.
-  Every 8-bit 4:2:0 vector passes: 174 of 204.
+  Every 8-bit 4:2:0, 4:2:2 and monochrome vector passes: 186 of 204 (up
+  from 81 before this release's conformance fixes). The other 18 are
+  10-bit, slice groups (FMO) and SP/SI slices, all rejected with
+  `DecodeError::Unsupported`.
 
 ### Fixed
 - **MBAFF streams from x264 (`--interlaced`)**, which failed with "invalid
@@ -96,6 +99,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Temporal direct mode used no motion when the co-located block predicted from
   list 1 only, and identified the co-located references of a multi-slice
   picture through the last slice's reference list.
+
+### Changed
+- **`Frame` has a new public field, `chroma_format`** (see 4:2:2 above), so
+  code that constructs `Frame` values must set it.
+- Monochrome and 4:2:2 streams are no longer rejected with
+  `DecodeError::Unsupported`; 4:4:4, bit depths above 8 and lossless still
+  are.
+- `bench_decode` times parsing and decoding only. It used to include
+  hashing the output, about as long as decoding itself on the 1080p
+  streams, so its fps figures were roughly half the decoder's.
+  `BENCH_STREAM=<substring>` runs only matching streams, and a new
+  `bench_1080p_100f_deblock` stream has the deblocking filter on (the
+  others are encoded without it).
+
+### Performance
+Decoding is 1.5-2x faster than before this release's speed work, measured
+single-threaded on Apple Silicon (decode-only fps, bench streams):
+
+| Stream | Before | After |
+|---|---|---|
+| 720p P-only | 171 | 337 |
+| 720p P-only complex | 355 | 556 |
+| 720p B-frames | 188 | 351 |
+| 720p B-frames complex | 327 | 489 |
+| 1080p | 96 | 184 |
+| 1080p complex | 146 | 218 |
+| 1080p P-only | 163 | 258 |
+
+The deblocked 1080p stream went from 159 to 192 fps with the deblocking
+changes alone. Output is byte-identical throughout.
+
+- NEON (aarch64) kernels for the quarter-pel and 2D half-pel luma filters,
+  chroma bilinear interpolation and bi-prediction averaging, which had
+  fallen back to scalar code (+36-43% on motion-heavy streams).
+- NEON deblocking: each edge is filtered in one call over its 16 lines with
+  per-line strength, vertical edges through 8x8 transposes. bS is worked
+  out before the filter thresholds, all-zero edges are skipped, and
+  internal edges of macroblocks with one motion skip the motion comparison
+  (deblocking went from ~26% to ~10% of decode time).
+- Predictions and residuals are written into the frame a row at a time
+  instead of one bounds-checked sample at a time; P-skip and B-skip copy
+  whole rows, and B-skip motion-compensates per 8x8 instead of per 4x4.
+- Branch-free, vectorizable 4x4 and 8x8 dequantization.
+- CABAC: no bounds checks on each decoded bin, table-driven significance
+  map contexts, and residual coefficients decoded into a reused buffer
+  instead of a zeroed 1 KB struct per block.
+- Short motion-compensation row copies no longer call `memmove`.
+- Every SIMD kernel is checked against the scalar reference on random
+  input (`kernels_match_scalar`).
 
 ## [0.5.0] - 2026-10-28
 
