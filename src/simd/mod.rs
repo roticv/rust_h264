@@ -135,7 +135,7 @@ mod tests {
             let stride = 8 + (seed % 24) as usize;
             let plane = random_bytes(&mut seed, 15 * stride + 8 + 3);
             let base = (seed % 4) as usize;
-            let lanes = super::load_edge_lines_v(&plane, base, stride);
+            let lanes: [[u8; 16]; 8] = super::load_edge_lines_v(&plane, base, stride);
             assert_eq!(
                 lanes,
                 s::load_edge_lines_v(&plane, base, stride),
