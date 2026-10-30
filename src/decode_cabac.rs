@@ -4,12 +4,12 @@
 use crate::cabac::CabacReader;
 use crate::deblock::{MbInfo, MbType};
 use crate::error::DecodeError;
-use crate::inter_pred;
 use crate::mv_pred::{predict_mv, predict_mv_sub, ref_pic_safe, MbaffCtx};
 use crate::neighbor::{
     cabac_amvd, cabac_neighbor_nz_luma, cabac_neighbor_ref, dequant_4x4_ac_raster,
     predict_i4x4_mode,
 };
+use crate::pixel::Pixel;
 use crate::residual::{
     dequant_4x4_full, dequant_8x8, dequant_luma_dc_i16x16, inverse_dct_4x4, inverse_dct_8x8,
     inverse_hadamard_4x4, BLOCK_INDEX_TO_OFFSET, OFFSET_TO_BLOCK, ZIGZAG_4X4, ZIGZAG_4X4_FIELD,
@@ -25,7 +25,7 @@ pub(crate) enum CabacMbResult {
     EndOfSlice,
 }
 
-impl SliceContext<'_> {
+impl<P: Pixel> SliceContext<'_, P> {
     /// Decode a single CABAC macroblock (skip, P/B inter, or intra).
     ///
     /// Returns `CabacMbResult::Decoded` on success or `CabacMbResult::EndOfSlice`
@@ -308,7 +308,7 @@ impl SliceContext<'_> {
                     let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
                         let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
                         self.last_qp_delta_nonzero = delta != 0;
-                        ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52
+                        self.next_qp(delta)
                     } else {
                         self.last_qp_delta_nonzero = false;
                         self.prev_mb_qp
@@ -336,7 +336,11 @@ impl SliceContext<'_> {
                                 for &(pos, val) in coeffs {
                                     block_8x8[zigzag_8x8_cabac[pos]] = val;
                                 }
-                                dequant_8x8(&mut block_8x8, qp_y, &sp.scaling_list_8x8[0]);
+                                dequant_8x8(
+                                    &mut block_8x8,
+                                    qp_y + P::QP_BD_OFFSET,
+                                    &sp.scaling_list_8x8[0],
+                                );
                                 inverse_dct_8x8(&mut block_8x8);
                                 let row_off = (i8x8 / 2) * 8;
                                 let col_off = (i8x8 % 2) * 8;
@@ -406,7 +410,7 @@ impl SliceContext<'_> {
                                     }
                                     dequant_4x4_full(
                                         &mut block_coeffs,
-                                        qp_y,
+                                        qp_y + P::QP_BD_OFFSET,
                                         &sp.scaling_list_4x4[0],
                                     );
                                 }
@@ -474,7 +478,7 @@ impl SliceContext<'_> {
 
                     let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
                     self.last_qp_delta_nonzero = delta != 0;
-                    let qp_y = ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52;
+                    let qp_y = self.next_qp(delta);
                     self.prev_mb_qp = qp_y;
 
                     // Luma DC (cat=0, 16 coefficients)
@@ -548,7 +552,11 @@ impl SliceContext<'_> {
                         luma_dc_raster[r * 4 + c] = luma_dc[i];
                     }
                     inverse_hadamard_4x4(&mut luma_dc_raster);
-                    dequant_luma_dc_i16x16(&mut luma_dc_raster, qp_y, sp.scaling_list_4x4[0][0]);
+                    dequant_luma_dc_i16x16(
+                        &mut luma_dc_raster,
+                        qp_y + P::QP_BD_OFFSET,
+                        sp.scaling_list_4x4[0][0],
+                    );
 
                     const DC_RASTER_TO_BLOCK_P: [usize; 16] =
                         [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];
@@ -564,7 +572,11 @@ impl SliceContext<'_> {
                                 let (r, c) = zigzag_4x4[scan_idx + 1];
                                 block_raster[r * 4 + c] = luma_ac[blk][scan_idx];
                             }
-                            dequant_4x4_ac_raster(&mut block_raster, qp_y, &sp.scaling_list_4x4[0]);
+                            dequant_4x4_ac_raster(
+                                &mut block_raster,
+                                qp_y + P::QP_BD_OFFSET,
+                                &sp.scaling_list_4x4[0],
+                            );
                         }
                         inverse_dct_4x4(&mut block_raster);
 
@@ -610,48 +622,26 @@ impl SliceContext<'_> {
                 } else {
                     // I_PCM in P/B via CABAC
                     let pcm_pos = cr.pcm_byte_position();
-                    if pcm_pos
-                        + 256
-                        + if sp.monochrome {
-                            0
-                        } else {
-                            16 * (16 >> self.chroma_shift_y())
-                        }
-                        > rbsp.len()
-                    {
-                        return Err(DecodeError::UnexpectedEof);
-                    }
-                    let pcm_data = &rbsp[pcm_pos..];
-                    let mut off = 0;
-                    for r in 0..16 {
-                        for c in 0..16 {
-                            let idx = self.ly_offset + r * self.ly_stride + mb_x + c;
-                            if idx < self.frame.y.len() {
-                                self.frame.y[idx] = pcm_data[off];
+                    // Samples of BitDepth bits, MSB first, from the byte position
+                    let pcm_bytes = rbsp.get(pcm_pos..).unwrap_or(&[]);
+                    let mut bit = 0usize;
+                    self.write_pcm_samples(
+                        || {
+                            let bd = P::BIT_DEPTH as usize;
+                            if (bit + bd).div_ceil(8) > pcm_bytes.len() {
+                                return None;
                             }
-                            off += 1;
-                        }
-                    }
-                    let cx = mb_x / 2;
-                    let ch = 16 >> self.chroma_shift_y();
-                    for r in 0..ch {
-                        for c in 0..8 {
-                            let idx = self.lc_offset + r * self.lc_stride + cx + c;
-                            if idx < self.frame.u.len() {
-                                self.frame.u[idx] = if sp.monochrome { 128 } else { pcm_data[off] };
+                            let mut v = 0i32;
+                            for _ in 0..bd {
+                                v = (v << 1) | ((pcm_bytes[bit / 8] >> (7 - bit % 8)) & 1) as i32;
+                                bit += 1;
                             }
-                            off += usize::from(!sp.monochrome);
-                        }
-                    }
-                    for r in 0..ch {
-                        for c in 0..8 {
-                            let idx = self.lc_offset + r * self.lc_stride + cx + c;
-                            if idx < self.frame.v.len() {
-                                self.frame.v[idx] = if sp.monochrome { 128 } else { pcm_data[off] };
-                            }
-                            off += usize::from(!sp.monochrome);
-                        }
-                    }
+                            Some(v)
+                        },
+                        mb_x,
+                        sp.monochrome,
+                    )?;
+                    let off = bit / 8;
                     for blk in 0..16 {
                         self.nc_luma[mb_idx * 16 + blk] = 16;
                     }
@@ -806,8 +796,8 @@ impl SliceContext<'_> {
                                 ))?;
                             let (mc_y, ref_stride, ref_y_off, _mc_cy, _c_ref_stride, _c_ref_off) =
                                 self.mc_params(mb_idx, mb_y, ref_pic.width as usize, ref_idx);
-                            let mut luma_pred = [0u8; 256]; // stack: max 16x16
-                            inter_pred::luma_mc_stride(
+                            let mut luma_pred = [P::default(); 256]; // stack: max 16x16
+                            P::luma_mc(
                                 ref_pic,
                                 (mb_x + px) as i32,
                                 mc_y + py as i32,
@@ -979,8 +969,8 @@ impl SliceContext<'_> {
                             ))?;
                         let (mc_y, ref_stride, ref_y_off, _, _, _) =
                             self.mc_params(mb_idx, mb_y, ref_pic.width as usize, part_ref[p]);
-                        let mut luma_pred = [0u8; 256]; // stack: max 16x16
-                        inter_pred::luma_mc_stride(
+                        let mut luma_pred = [P::default(); 256]; // stack: max 16x16
+                        P::luma_mc(
                             ref_pic,
                             (mb_x + px_off) as i32,
                             mc_y + py_off as i32,
@@ -1060,7 +1050,7 @@ impl SliceContext<'_> {
                 let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
                     let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
                     self.last_qp_delta_nonzero = delta != 0;
-                    ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52
+                    self.next_qp(delta)
                 } else {
                     self.last_qp_delta_nonzero = false;
                     self.prev_mb_qp
@@ -1092,7 +1082,7 @@ impl SliceContext<'_> {
                             for &(pos, val) in coeffs {
                                 block_8x8[zigzag_8x8_cabac[pos]] = val;
                             }
-                            dequant_8x8(&mut block_8x8, qp_y, scale_8x8);
+                            dequant_8x8(&mut block_8x8, qp_y + P::QP_BD_OFFSET, scale_8x8);
                             inverse_dct_8x8(&mut block_8x8);
                             let row_off = (i8x8 / 2) * 8;
                             let col_off = (i8x8 % 2) * 8;
@@ -1147,7 +1137,7 @@ impl SliceContext<'_> {
                                     }
                                     dequant_4x4_full(
                                         &mut block_coeffs,
-                                        qp_y,
+                                        qp_y + P::QP_BD_OFFSET,
                                         &sp.scaling_list_4x4[3],
                                     );
                                     inverse_dct_4x4(&mut block_coeffs);
@@ -1163,7 +1153,7 @@ impl SliceContext<'_> {
                         }
                     } // close if use_8x8_inter else
                       // Add residual to prediction
-                    crate::residual::add_residual(
+                    crate::residual::add_residual::<P>(
                         &mut self.frame.y,
                         self.ly_offset + mb_x,
                         self.ly_stride,
@@ -2172,11 +2162,11 @@ impl SliceContext<'_> {
                 for _sp_i in 0..b_sub_count {
                     let sub_part = &b_sub_parts[_sp_i];
                     let abs_x = mb_x + sub_part.x;
-                    let mut luma_pred = [0u8; 256]; // stack: max 16x16
+                    let mut luma_pred = [P::default(); 256]; // stack: max 16x16
 
                     if sub_part.pred_l0 && sub_part.pred_l1 {
-                        let mut p0 = [0u8; 256]; // stack: max 16x16
-                        let mut p1 = [0u8; 256]; // stack: max 16x16
+                        let mut p0 = [P::default(); 256]; // stack: max 16x16
+                        let mut p1 = [P::default(); 256]; // stack: max 16x16
                         let frame_ri_l0 = self.frame_ref_idx(mb_idx, sub_part.ref_idx_l0);
                         let ref_l0 = ref_pic_safe(sp.ref_pic_list_l0, frame_ri_l0)
                             .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
@@ -2193,7 +2183,7 @@ impl SliceContext<'_> {
                             ref_l0.width as usize,
                             sub_part.ref_idx_l0,
                         );
-                        inter_pred::luma_mc_stride(
+                        P::luma_mc(
                             ref_l0,
                             abs_x as i32,
                             mc_y_l0 + sub_part.y as i32,
@@ -2221,7 +2211,7 @@ impl SliceContext<'_> {
                             ref_l1.width as usize,
                             sub_part.ref_idx_l1,
                         );
-                        inter_pred::luma_mc_stride(
+                        P::luma_mc(
                             ref_l1,
                             abs_x as i32,
                             mc_y_l1 + sub_part.y as i32,
@@ -2252,7 +2242,7 @@ impl SliceContext<'_> {
                         .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
                         let (mc_y, ref_stride, ref_y_off, _mc_cy, _c_ref_stride, _c_ref_off) = self
                             .mc_params(mb_idx, mb_y, ref_pic.width as usize, sub_part.ref_idx_l0);
-                        inter_pred::luma_mc_stride(
+                        P::luma_mc(
                             ref_pic,
                             abs_x as i32,
                             mc_y + sub_part.y as i32,
@@ -2283,7 +2273,7 @@ impl SliceContext<'_> {
                         .ok_or(DecodeError::InvalidSyntax("empty ref list"))?;
                         let (mc_y, ref_stride, ref_y_off, _mc_cy, _c_ref_stride, _c_ref_off) = self
                             .mc_params(mb_idx, mb_y, ref_pic.width as usize, sub_part.ref_idx_l1);
-                        inter_pred::luma_mc_stride(
+                        P::luma_mc(
                             ref_pic,
                             abs_x as i32,
                             mc_y + sub_part.y as i32,
@@ -2385,7 +2375,7 @@ impl SliceContext<'_> {
                 let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
                     let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
                     self.last_qp_delta_nonzero = delta != 0;
-                    ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52
+                    self.next_qp(delta)
                 } else {
                     self.last_qp_delta_nonzero = false;
                     self.prev_mb_qp
@@ -2416,7 +2406,7 @@ impl SliceContext<'_> {
                             for &(pos, val) in coeffs {
                                 block_8x8[zigzag_8x8_cabac[pos]] = val;
                             }
-                            dequant_8x8(&mut block_8x8, qp_y, scale_8x8);
+                            dequant_8x8(&mut block_8x8, qp_y + P::QP_BD_OFFSET, scale_8x8);
                             inverse_dct_8x8(&mut block_8x8);
                             let row_off = (i8x8 / 2) * 8;
                             let col_off = (i8x8 % 2) * 8;
@@ -2469,7 +2459,7 @@ impl SliceContext<'_> {
                                     }
                                     dequant_4x4_full(
                                         &mut block_coeffs,
-                                        qp_y,
+                                        qp_y + P::QP_BD_OFFSET,
                                         &sp.scaling_list_4x4[3],
                                     );
                                     inverse_dct_4x4(&mut block_coeffs);
@@ -2484,7 +2474,7 @@ impl SliceContext<'_> {
                             }
                         }
                     } // close if use_8x8_b_inter else
-                    crate::residual::add_residual(
+                    crate::residual::add_residual::<P>(
                         &mut self.frame.y,
                         self.ly_offset + mb_x,
                         self.ly_stride,
@@ -2531,48 +2521,26 @@ impl SliceContext<'_> {
         // I_PCM via CABAC
         if mb_type == 25 {
             let pcm_pos = cr.pcm_byte_position();
-            if pcm_pos
-                + 256
-                + if sp.monochrome {
-                    0
-                } else {
-                    16 * (16 >> self.chroma_shift_y())
-                }
-                > rbsp.len()
-            {
-                return Err(DecodeError::UnexpectedEof);
-            }
-            let pcm_data = &rbsp[pcm_pos..];
-            let mut off = 0;
-            for r in 0..16 {
-                for c in 0..16 {
-                    let idx = self.ly_offset + r * self.ly_stride + mb_x + c;
-                    if idx < self.frame.y.len() {
-                        self.frame.y[idx] = pcm_data[off];
+            // Samples of BitDepth bits, MSB first, from the byte position
+            let pcm_bytes = rbsp.get(pcm_pos..).unwrap_or(&[]);
+            let mut bit = 0usize;
+            self.write_pcm_samples(
+                || {
+                    let bd = P::BIT_DEPTH as usize;
+                    if (bit + bd).div_ceil(8) > pcm_bytes.len() {
+                        return None;
                     }
-                    off += 1;
-                }
-            }
-            let cx = mb_x / 2;
-            let ch = 16 >> self.chroma_shift_y();
-            for r in 0..ch {
-                for c in 0..8 {
-                    let idx = self.lc_offset + r * self.lc_stride + cx + c;
-                    if idx < self.frame.u.len() {
-                        self.frame.u[idx] = if sp.monochrome { 128 } else { pcm_data[off] };
+                    let mut v = 0i32;
+                    for _ in 0..bd {
+                        v = (v << 1) | ((pcm_bytes[bit / 8] >> (7 - bit % 8)) & 1) as i32;
+                        bit += 1;
                     }
-                    off += usize::from(!sp.monochrome);
-                }
-            }
-            for r in 0..ch {
-                for c in 0..8 {
-                    let idx = self.lc_offset + r * self.lc_stride + cx + c;
-                    if idx < self.frame.v.len() {
-                        self.frame.v[idx] = if sp.monochrome { 128 } else { pcm_data[off] };
-                    }
-                    off += usize::from(!sp.monochrome);
-                }
-            }
+                    Some(v)
+                },
+                mb_x,
+                sp.monochrome,
+            )?;
+            let off = bit / 8;
             for blk in 0..16 {
                 self.nc_luma[mb_idx * 16 + blk] = 16;
             }
@@ -2671,7 +2639,7 @@ impl SliceContext<'_> {
             let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
                 let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
                 self.last_qp_delta_nonzero = delta != 0;
-                ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52
+                self.next_qp(delta)
             } else {
                 self.last_qp_delta_nonzero = false;
                 self.prev_mb_qp
@@ -2703,7 +2671,11 @@ impl SliceContext<'_> {
                     for &(pos, val) in coeffs {
                         block_8x8[zigzag_8x8_cabac[pos]] = val;
                     }
-                    dequant_8x8(&mut block_8x8, qp_y, &sp.scaling_list_8x8[0]);
+                    dequant_8x8(
+                        &mut block_8x8,
+                        qp_y + P::QP_BD_OFFSET,
+                        &sp.scaling_list_8x8[0],
+                    );
                     inverse_dct_8x8(&mut block_8x8);
                     let row_off = (i8x8 / 2) * 8;
                     let col_off = (i8x8 % 2) * 8;
@@ -2773,7 +2745,11 @@ impl SliceContext<'_> {
                                 let (r, c) = zigzag_4x4[pos];
                                 block_coeffs[r * 4 + c] = val;
                             }
-                            dequant_4x4_full(&mut block_coeffs, qp_y, &sp.scaling_list_4x4[0]);
+                            dequant_4x4_full(
+                                &mut block_coeffs,
+                                qp_y + P::QP_BD_OFFSET,
+                                &sp.scaling_list_4x4[0],
+                            );
                         }
                     }
                     inverse_dct_4x4(&mut block_coeffs);
@@ -2842,7 +2818,7 @@ impl SliceContext<'_> {
             self.mb_chroma_pred[mb_idx] = intra_chroma_pred_mode;
             let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
             self.last_qp_delta_nonzero = delta != 0;
-            let qp_y = ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52;
+            let qp_y = self.next_qp(delta);
             self.prev_mb_qp = qp_y;
             // Luma DC: cat=0, 16 coefficients
             // CBF context uses bit 8 of neighbor cbp_table (luma DC coded flag)
@@ -2912,7 +2888,11 @@ impl SliceContext<'_> {
                 luma_dc_raster[r * 4 + c] = luma_dc[i];
             }
             inverse_hadamard_4x4(&mut luma_dc_raster);
-            dequant_luma_dc_i16x16(&mut luma_dc_raster, qp_y, sp.scaling_list_4x4[0][0]);
+            dequant_luma_dc_i16x16(
+                &mut luma_dc_raster,
+                qp_y + P::QP_BD_OFFSET,
+                sp.scaling_list_4x4[0][0],
+            );
 
             const DC_RASTER_TO_BLOCK: [usize; 16] =
                 [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];
@@ -2929,7 +2909,11 @@ impl SliceContext<'_> {
                         let (r, c) = zigzag_4x4[scan_idx + 1];
                         block_raster[r * 4 + c] = luma_ac_scan[blk][scan_idx];
                     }
-                    dequant_4x4_ac_raster(&mut block_raster, qp_y, &sp.scaling_list_4x4[0]);
+                    dequant_4x4_ac_raster(
+                        &mut block_raster,
+                        qp_y + P::QP_BD_OFFSET,
+                        &sp.scaling_list_4x4[0],
+                    );
                 }
 
                 inverse_dct_4x4(&mut block_raster);
@@ -2974,48 +2958,26 @@ impl SliceContext<'_> {
         } else {
             // I_PCM via CABAC (mb_type == 25)
             let pcm_pos = cr.pcm_byte_position();
-            if pcm_pos
-                + 256
-                + if sp.monochrome {
-                    0
-                } else {
-                    16 * (16 >> self.chroma_shift_y())
-                }
-                > rbsp.len()
-            {
-                return Err(DecodeError::UnexpectedEof);
-            }
-            let pcm_data = &rbsp[pcm_pos..];
-            let mut off = 0;
-            for r in 0..16 {
-                for c in 0..16 {
-                    let idx = self.ly_offset + r * self.ly_stride + mb_x + c;
-                    if idx < self.frame.y.len() {
-                        self.frame.y[idx] = pcm_data[off];
+            // Samples of BitDepth bits, MSB first, from the byte position
+            let pcm_bytes = rbsp.get(pcm_pos..).unwrap_or(&[]);
+            let mut bit = 0usize;
+            self.write_pcm_samples(
+                || {
+                    let bd = P::BIT_DEPTH as usize;
+                    if (bit + bd).div_ceil(8) > pcm_bytes.len() {
+                        return None;
                     }
-                    off += 1;
-                }
-            }
-            let cx = mb_x / 2;
-            let ch = 16 >> self.chroma_shift_y();
-            for r in 0..ch {
-                for c in 0..8 {
-                    let idx = self.lc_offset + r * self.lc_stride + cx + c;
-                    if idx < self.frame.u.len() {
-                        self.frame.u[idx] = if sp.monochrome { 128 } else { pcm_data[off] };
+                    let mut v = 0i32;
+                    for _ in 0..bd {
+                        v = (v << 1) | ((pcm_bytes[bit / 8] >> (7 - bit % 8)) & 1) as i32;
+                        bit += 1;
                     }
-                    off += usize::from(!sp.monochrome);
-                }
-            }
-            for r in 0..ch {
-                for c in 0..8 {
-                    let idx = self.lc_offset + r * self.lc_stride + cx + c;
-                    if idx < self.frame.v.len() {
-                        self.frame.v[idx] = if sp.monochrome { 128 } else { pcm_data[off] };
-                    }
-                    off += usize::from(!sp.monochrome);
-                }
-            }
+                    Some(v)
+                },
+                mb_x,
+                sp.monochrome,
+            )?;
+            let off = bit / 8;
             for blk in 0..16 {
                 self.nc_luma[mb_idx * 16 + blk] = 16;
             }

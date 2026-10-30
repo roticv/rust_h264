@@ -1,3 +1,5 @@
+use crate::pixel::Pixel;
+
 /// 4x4 zigzag scan order: maps linear index to (row, col) within a 4x4 block.
 pub const ZIGZAG_4X4: [(usize, usize); 16] = [
     (0, 0),
@@ -228,8 +230,19 @@ pub const QPC_TABLE: [i32; 52] = [
 
 /// Compute chroma QP from luma QP and chroma_qp_index_offset.
 pub fn chroma_qp(qp_y: i32, chroma_qp_index_offset: i32) -> i32 {
-    let qpi = (qp_y + chroma_qp_index_offset).clamp(0, 51);
-    QPC_TABLE[qpi as usize]
+    chroma_qp_bd(qp_y, chroma_qp_index_offset, 0)
+}
+
+/// QP_C for a bit depth with offset QpBdOffsetC (spec 8.5.8): qPI is clipped
+/// to -QpBdOffsetC..=51, and below 30 QP_C equals qPI (negative included).
+#[inline]
+pub fn chroma_qp_bd(qp_y: i32, chroma_qp_index_offset: i32, qp_bd_offset: i32) -> i32 {
+    let qpi = (qp_y + chroma_qp_index_offset).clamp(-qp_bd_offset, 51);
+    if qpi < 0 {
+        qpi
+    } else {
+        QPC_TABLE[qpi as usize]
+    }
 }
 
 /// 4x4 field zigzag scan order (spec Table 8-13): used for field pictures and
@@ -524,26 +537,29 @@ pub fn map_cbp(code: usize, intra: bool, monochrome: bool) -> Option<u8> {
 /// Dequantize a full 4x4 block (including DC at position [0][0]) in raster order.
 /// `scale` is the scaling matrix in scan order; mapped to raster via ZIGZAG_4X4.
 /// Copy a `w` x `h` block (rows `src_stride` apart) into a plane at `off`
-/// (rows `stride` apart), a row at a time.
+/// (rows `stride` apart), a row at a time. Offsets and strides in samples.
 #[inline]
-pub(crate) fn put_block(
+pub(crate) fn put_block<P: Pixel>(
     dst: &mut [u8],
     off: usize,
     stride: usize,
-    src: &[u8],
+    src: &[P],
     src_stride: usize,
     (w, h): (usize, usize),
 ) {
     for r in 0..h {
-        let d = off + r * stride;
-        crate::inter_pred::copy_row(&mut dst[d..d + w], &src[r * src_stride..r * src_stride + w]);
+        P::store_row(
+            dst,
+            off + r * stride,
+            &src[r * src_stride..r * src_stride + w],
+        );
     }
 }
 
 /// `dst = clip(dst + res)` over a `w` x `h` block of a plane at `off` (rows
 /// `stride` apart; residual rows `res_stride` apart), a row at a time.
 #[inline]
-pub(crate) fn add_residual(
+pub(crate) fn add_residual<P: Pixel>(
     dst: &mut [u8],
     off: usize,
     stride: usize,
@@ -552,11 +568,7 @@ pub(crate) fn add_residual(
     (w, h): (usize, usize),
 ) {
     for r in 0..h {
-        let d = &mut dst[off + r * stride..][..w];
-        let q = &res[r * res_stride..][..w];
-        for (px, &v) in d.iter_mut().zip(q) {
-            *px = (*px as i32 + v).clamp(0, 255) as u8;
-        }
+        P::add_residual_row(dst, off + r * stride, &res[r * res_stride..][..w]);
     }
 }
 
@@ -565,23 +577,23 @@ pub(crate) fn add_residual(
 /// `res_stride` apart), a row at a time.
 #[allow(clippy::too_many_arguments)]
 #[inline]
-pub(crate) fn put_pred_residual(
+pub(crate) fn put_pred_residual<P: Pixel>(
     dst: &mut [u8],
     off: usize,
     stride: usize,
-    pred: &[u8],
+    pred: &[P],
     pred_stride: usize,
     res: &[i32],
     res_stride: usize,
     (w, h): (usize, usize),
 ) {
     for r in 0..h {
-        let d = &mut dst[off + r * stride..][..w];
-        let p = &pred[r * pred_stride..][..w];
-        let q = &res[r * res_stride..][..w];
-        for ((px, &a), &v) in d.iter_mut().zip(p).zip(q) {
-            *px = (a as i32 + v).clamp(0, 255) as u8;
-        }
+        P::put_pred_residual_row(
+            dst,
+            off + r * stride,
+            &pred[r * pred_stride..][..w],
+            &res[r * res_stride..][..w],
+        );
     }
 }
 

@@ -16,12 +16,15 @@ fn yuv_to_argb(f: &rust_h264::decoder::Frame, width: usize, height: usize) -> Ve
     let cw = width / 2;
     // Chroma rows per luma row: 1 for 4:2:2, 1/2 for 4:2:0
     let c_row = |row: usize| row * f.chroma_height() as usize / f.height.max(1) as usize;
+    // Samples scaled to 8 bits for display
+    let shift = f.bit_depth - 8;
+    let s = |plane: &[u8], i: usize| (f.sample(plane, i) >> shift) as i32;
     let mut argb = vec![0u32; width * height];
     for row in 0..height {
         for col in 0..width {
-            let y_val = y[row * width + col] as i32;
-            let u_val = u[c_row(row) * cw + col / 2] as i32 - 128;
-            let v_val = v[c_row(row) * cw + col / 2] as i32 - 128;
+            let y_val = s(y, row * width + col);
+            let u_val = s(u, c_row(row) * cw + col / 2) - 128;
+            let v_val = s(v, c_row(row) * cw + col / 2) - 128;
 
             let r = (y_val + ((v_val * 359 + 128) >> 8)).clamp(0, 255) as u32;
             let g = (y_val - ((u_val * 88 + v_val * 183 + 128) >> 8)).clamp(0, 255) as u32;

@@ -6,11 +6,11 @@ use crate::cabac::CabacReader;
 use crate::cavlc::parse_residual_block_cavlc;
 use crate::dpb::DecodedPicture;
 use crate::error::DecodeError;
-use crate::inter_pred;
 use crate::neighbor::{cabac_neighbor_nz_chroma, compute_nc_chroma, dequant_4x4_ac_raster};
+use crate::pixel::Pixel;
 use crate::residual::{
-    chroma_dc_422, chroma_qp, dequant_chroma_dc, inverse_dct_4x4, inverse_hadamard_2x2, ZIGZAG_4X4,
-    ZIGZAG_4X4_FIELD,
+    chroma_dc_422, chroma_qp_bd, dequant_chroma_dc, inverse_dct_4x4, inverse_hadamard_2x2,
+    ZIGZAG_4X4, ZIGZAG_4X4_FIELD,
 };
 use crate::slice_context::{SliceContext, SliceParams};
 
@@ -19,7 +19,7 @@ use crate::slice_context::{SliceContext, SliceParams};
 /// and the motion vector.
 pub(crate) type PartMotion<'r> = (&'r DecodedPicture, i8, [i16; 2]);
 
-impl SliceContext<'_> {
+impl<P: Pixel> SliceContext<'_, P> {
     /// Chroma inter prediction of the partition at luma offset `(x, y)`,
     /// size `w` x `h`, of the current MB, written to both chroma planes:
     /// motion compensation from each list used, then weighted (explicit
@@ -68,8 +68,8 @@ impl SliceContext<'_> {
         let ref_h = (self.height >> sy) as usize;
         type McSetup<'r> = (&'r DecodedPicture, (usize, usize, usize, i32, i32));
         let mc =
-            |(pic, (c_stride, c_off, y0, mvx, mvy)): McSetup<'_>, plane: usize, out: &mut [u8]| {
-                inter_pred::chroma_mc(
+            |(pic, (c_stride, c_off, y0, mvx, mvy)): McSetup<'_>, plane: usize, out: &mut [P]| {
+                P::chroma_mc(
                     pic.chroma_ref(plane, c_off),
                     c_stride,
                     ref_h,
@@ -82,12 +82,12 @@ impl SliceContext<'_> {
                     out,
                 );
             };
-        let mut pred = [0u8; 128];
+        let mut pred = [P::default(); 128];
         for plane in 0..2 {
             match (m0, m1) {
                 (Some(a), Some(b)) => {
-                    let mut p0 = [0u8; 128];
-                    let mut p1 = [0u8; 128];
+                    let mut p0 = [P::default(); 128];
+                    let mut p1 = [P::default(); 128];
                     mc(a, plane, &mut p0[..n]);
                     mc(b, plane, &mut p1[..n]);
                     weights.apply_bi(
@@ -119,7 +119,7 @@ impl SliceContext<'_> {
             };
             for r in 0..ch {
                 let o = self.lc_offset + (cy + r) * self.lc_stride + cx;
-                inter_pred::copy_row(&mut dst[o..o + cw], &pred[r * cw..(r + 1) * cw]);
+                P::store_row(dst, o, &pred[r * cw..(r + 1) * cw]);
             }
         }
     }
@@ -146,7 +146,9 @@ impl SliceContext<'_> {
         } else {
             &ZIGZAG_4X4
         };
-        (chroma_qp(qp_y, offset), scale, zigzag)
+        // QP'C = QP_C + QpBdOffsetC
+        let qp_c = chroma_qp_bd(qp_y, offset, P::QP_BD_OFFSET) + P::QP_BD_OFFSET;
+        (qp_c, scale, zigzag)
     }
 
     /// Inverse transform and scaling of a plane's chroma DC (spec 8.5.11):
@@ -187,7 +189,7 @@ impl SliceContext<'_> {
         };
         let (by, bx) = ((blk / 2) * 4, (blk % 2) * 4);
         let o = self.lc_offset + by * self.lc_stride + mb_x / 2 + bx;
-        crate::residual::add_residual(dst, o, self.lc_stride, &block, 4, (4, 4));
+        crate::residual::add_residual::<P>(dst, o, self.lc_stride, &block, 4, (4, 4));
     }
 
     /// Parse the chroma residual of a CAVLC macroblock (spec 7.3.5.3) and

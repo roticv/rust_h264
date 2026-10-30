@@ -1,8 +1,8 @@
 //! Pure Rust H.264/AVC video decoder.
 //!
 //! A standalone, portable software H.264 decoder. Supports Baseline, Main,
-//! High and High 4:2:2 profile (8-bit 4:2:0, 4:2:2 and monochrome,
-//! progressive and interlaced), with both CAVLC and CABAC entropy coding,
+//! High, High 10 and High 4:2:2 profile (8- and 10-bit 4:2:0, 4:2:2 and
+//! monochrome, progressive and interlaced), with both CAVLC and CABAC entropy coding,
 //! B-frames, multi-reference, weighted prediction, long-term references, and
 //! multi-slice frames. NEON SIMD acceleration on aarch64,
 //! with an optional `core::simd` backend behind the nightly-only
@@ -53,10 +53,12 @@
 //!
 //! # Not supported
 //!
-//! Only 8-bit 4:2:0, 4:2:2 and monochrome (4:0:0, output as 4:2:0 with
-//! mid-grey chroma) video is decoded; [`Frame::chroma_format`](decoder::Frame::chroma_format)
-//! says which layout the chroma planes have. Streams using 4:4:4 chroma, bit
-//! depths above 8 (High 10 and up) or lossless transform
+//! Only 8- and 10-bit 4:2:0, 4:2:2 and monochrome (4:0:0, output as 4:2:0
+//! with mid-grey chroma) video is decoded; [`Frame::chroma_format`](decoder::Frame::chroma_format)
+//! says which layout the chroma planes have, and [`Frame::bit_depth`](decoder::Frame::bit_depth)
+//! whether samples are bytes or 2-byte little-endian. Streams using 4:4:4
+//! chroma, other bit depths (9, 12 and up, or chroma at a different depth
+//! from luma) or lossless transform
 //! bypass are rejected with [`DecodeError::Unsupported`](error::DecodeError::Unsupported)
 //! on every slice, rather than decoded into wrong pictures.
 //!
@@ -95,6 +97,7 @@ pub mod nal;
 mod neighbor;
 mod once;
 mod picture_sync;
+mod pixel;
 #[cfg(feature = "dev-internals")]
 #[allow(dead_code)]
 pub mod pps;

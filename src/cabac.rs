@@ -999,7 +999,9 @@ impl CabacReader<'_> {
         while self.get_cabac(&mut state[uctx]) != 0 {
             uctx = 63;
             val += 1;
-            if val > 52 {
+            // |mb_qp_delta| <= 26 + QpBdOffset / 2: 64 bins at 10 bits.
+            // The cap only stops a corrupt stream from looping forever.
+            if val > 128 {
                 break;
             }
         }

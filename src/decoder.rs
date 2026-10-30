@@ -11,6 +11,7 @@ use crate::dpb::{
 use crate::error::DecodeError;
 use crate::mv_pred::WeightContext;
 use crate::nal::{NalUnit, NalUnitType};
+use crate::pixel::Pixel;
 use crate::pps::{parse_pps, Pps};
 use crate::slice::{parse_slice_header, SliceHeader, SliceType};
 use crate::slice_context::{SliceContext, SliceParams};
@@ -66,20 +67,43 @@ pub struct Frame {
     pub width: u32,
     /// Display height in luma samples.
     pub height: u32,
-    /// Luma plane, `width * height` bytes, row-major.
+    /// Luma plane, `width * height` samples, row-major.
     pub y: Vec<u8>,
-    /// Cb chroma plane, `chroma_width() * chroma_height()` bytes, row-major.
+    /// Cb chroma plane, `chroma_width() * chroma_height()` samples, row-major.
     pub u: Vec<u8>,
-    /// Cr chroma plane, `chroma_width() * chroma_height()` bytes, row-major.
+    /// Cr chroma plane, `chroma_width() * chroma_height()` samples, row-major.
     pub v: Vec<u8>,
     /// Picture order count — the H.264 spec's display ordering value.
     /// Use this to sort frames into display order within a GOP.
     pub pic_order_cnt: i32,
     /// Chroma sampling of `u` and `v`.
     pub chroma_format: ChromaFormat,
+    /// Bits per sample, luma and chroma: 8, or 10. At 10 bits each
+    /// sample takes two bytes of `y`/`u`/`v`, little-endian (FFmpeg's
+    /// `yuv420p10le` / `yuv422p10le` layout); see [`Frame::sample`].
+    pub bit_depth: u8,
 }
 
 impl Frame {
+    /// Bytes per sample in `y`, `u` and `v`: 1, or 2 above 8 bits.
+    pub fn bytes_per_sample(&self) -> usize {
+        if self.bit_depth > 8 {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Sample `i` (in samples, row-major) of a plane, whatever the bit
+    /// depth.
+    pub fn sample(&self, plane: &[u8], i: usize) -> u16 {
+        if self.bit_depth > 8 {
+            u16::from_le_bytes([plane[2 * i], plane[2 * i + 1]])
+        } else {
+            plane[i] as u16
+        }
+    }
+
     /// Width of the U and V planes.
     pub fn chroma_width(&self) -> u32 {
         self.width / 2
@@ -373,8 +397,9 @@ impl Decoder {
     }
 }
 
-/// Reject sequences this decoder cannot decode correctly. Only 8-bit 4:2:0,
-/// 4:2:2 and 4:0:0 with the normal transform path are implemented; anything else would decode
+/// Reject sequences this decoder cannot decode correctly. Only 8- and
+/// 10-bit 4:2:0, 4:2:2 and 4:0:0 with the normal transform path are
+/// implemented; anything else would decode
 /// to wrong pictures instead of failing. Checked when a slice activates its
 /// SPS (not when the SPS is parsed), so streams that merely carry such an
 /// SPS still decode, and [`parse_sps_info`](crate::nal::parse_sps_info)
@@ -385,8 +410,14 @@ pub(crate) fn check_supported(sps: &Sps) -> Result<(), DecodeError> {
         3 => return Err(DecodeError::Unsupported("4:4:4 chroma")),
         _ => return Err(DecodeError::InvalidSyntax("chroma_format_idc out of range")),
     }
-    if sps.bit_depth_luma_minus8 != 0 || sps.bit_depth_chroma_minus8 != 0 {
-        return Err(DecodeError::Unsupported("bit depth above 8"));
+    // 8 and 10 bits; chroma (when present) at the luma depth, as FFmpeg
+    if !matches!(sps.bit_depth_luma_minus8, 0 | 2) {
+        return Err(DecodeError::Unsupported("bit depth other than 8 or 10"));
+    }
+    if sps.chroma_format_idc != 0 && sps.bit_depth_chroma_minus8 != sps.bit_depth_luma_minus8 {
+        return Err(DecodeError::Unsupported(
+            "different luma and chroma bit depths",
+        ));
     }
     if sps.qpprime_y_zero_transform_bypass_flag {
         return Err(DecodeError::Unsupported(
@@ -783,6 +814,20 @@ pub(crate) fn prepare_slice(
 /// picture is finalized.
 pub(crate) fn run_slice(
     plan: &SlicePlan,
+    pending: Option<PictureState>,
+    sync: Option<&mut RowSync>,
+) -> Result<PictureState, DecodeError> {
+    // The slice decoder is compiled once per sample type
+    if plan.sps.bit_depth_luma_minus8 == 2 {
+        run_slice_px::<u16>(plan, pending, sync)
+    } else {
+        run_slice_px::<u8>(plan, pending, sync)
+    }
+}
+
+/// [`run_slice`] for samples of type `P`.
+fn run_slice_px<P: Pixel>(
+    plan: &SlicePlan,
     mut pending: Option<PictureState>,
     mut sync: Option<&mut RowSync>,
 ) -> Result<PictureState, DecodeError> {
@@ -829,16 +874,18 @@ pub(crate) fn run_slice(
         pending.take().unwrap()
     } else {
         let chroma_format = ChromaFormat::from_idc(sps.chroma_format_idc);
-        let chroma_len = ((coded_width / 2) * (coded_height >> chroma_format.shift_y())) as usize;
+        let chroma_len =
+            ((coded_width / 2) * (coded_height >> chroma_format.shift_y())) as usize * P::BYTES;
         PictureState {
             frame: Frame {
                 width,
                 height,
-                y: vec![0u8; (coded_width * coded_height) as usize],
+                y: vec![0u8; (coded_width * coded_height) as usize * P::BYTES],
                 u: vec![0u8; chroma_len],
                 v: vec![0u8; chroma_len],
                 pic_order_cnt: current_poc,
                 chroma_format,
+                bit_depth: P::BIT_DEPTH as u8,
             },
             frame_num: header.frame_num,
             poc: current_poc,
@@ -996,6 +1043,7 @@ pub(crate) fn run_slice(
     macro_rules! make_ctx {
         () => {
             SliceContext {
+                _pixel: core::marker::PhantomData::<P>,
                 frame: &mut frame,
                 stride,
                 width: coded_width,
@@ -1393,6 +1441,7 @@ pub(crate) fn picture_meta(ps: &PictureState) -> PictureMeta {
             crate::dpb::PictureStructure::Frame
         },
         chroma_422: ps.frame.chroma_format == ChromaFormat::Yuv422,
+        sample_bytes: if ps.frame.bit_depth > 8 { 2 } else { 1 },
     }
 }
 
@@ -1700,7 +1749,8 @@ pub(crate) fn finish_output(
     if coded_w == 0 {
         return None;
     }
-    let coded_h = ps.frame.y.len() / coded_w;
+    let bps = ps.frame.bytes_per_sample();
+    let coded_h = ps.frame.y.len() / (coded_w * bps);
     let display_w = ps.frame.width as usize;
     let display_h = ps.frame.height as usize;
     let (x0, y0) = (ps.crop_x as usize, ps.crop_y as usize);
@@ -1708,7 +1758,7 @@ pub(crate) fn finish_output(
         // The window must lie inside the coded picture and the frame buffer
         if x0 + display_w > coded_w
             || y0 + display_h > coded_h
-            || coded_w * coded_h > ps.frame.y.len()
+            || coded_w * coded_h * bps > ps.frame.y.len()
         {
             return None;
         }
@@ -1720,11 +1770,13 @@ pub(crate) fn finish_output(
 
         if x0 == 0 && y0 == 0 && coded_w == display_w {
             // Bottom crop only: the display rows are a prefix of the planes
-            ps.frame.y.truncate(display_w * display_h);
-            ps.frame.u.truncate(chroma_w * chroma_h);
-            ps.frame.v.truncate(chroma_w * chroma_h);
+            ps.frame.y.truncate(display_w * display_h * bps);
+            ps.frame.u.truncate(chroma_w * chroma_h * bps);
+            ps.frame.v.truncate(chroma_w * chroma_h * bps);
         } else {
+            // In bytes: stride, x and w scaled by the sample size
             let crop = |plane: &[u8], stride: usize, x: usize, y: usize, w: usize, h: usize| {
+                let (stride, x, w) = (stride * bps, x * bps, w * bps);
                 let mut out = vec![0u8; w * h];
                 for r in 0..h {
                     let src = (y + r) * stride + x;
@@ -1742,8 +1794,11 @@ pub(crate) fn finish_output(
     if ps.field_pic_flag {
         let field_frame = ps.frame;
         if let Some(first_field) = pending_field.take() {
-            // Second field arrived — combine into a full frame
-            let w = field_frame.width as usize;
+            // Second field arrived — combine into a full frame. Rows are
+            // copied as bytes: `w` and `cw` are row lengths in bytes.
+            let width = field_frame.width as usize;
+            let bit_depth = field_frame.bit_depth;
+            let w = width * field_frame.bytes_per_sample();
             let full_h = ps.frame_height as usize;
             let field_h = full_h / 2;
             let mut y = vec![0u8; w * full_h];
@@ -1757,7 +1812,8 @@ pub(crate) fn finish_output(
             // a corrupt stream can change SPS dimensions between fields.
             let ch = field_h >> sy;
             let field_ok = |f: &Frame| {
-                f.width as usize == w
+                f.width as usize == width
+                    && f.bit_depth == bit_depth
                     && f.y.len() >= field_h * w
                     && f.u.len() >= ch * cw
                     && f.v.len() >= ch * cw
@@ -1797,10 +1853,11 @@ pub(crate) fn finish_output(
                 y,
                 u,
                 v,
-                width: w as u32,
+                width: width as u32,
                 height: full_h as u32,
                 pic_order_cnt: field_frame.pic_order_cnt.min(first_field.pic_order_cnt),
                 chroma_format,
+                bit_depth,
             });
         } else {
             // First field — hold it, return None
@@ -3172,6 +3229,97 @@ mod tests {
         );
     }
 
+    // 10-bit streams (High 10, High 4:2:2), SHA-256 of ffmpeg's yuv420p10le
+    // (yuv422p10le) decode
+
+    #[test]
+    fn test_high10_420_32x32() {
+        // 32x32 High 10 (x264): the smallest 10-bit stream, 2 bytes per sample
+        // little-endian like FFmpeg's yuv420p10le
+        decode_and_compare_hash(
+            "high10_420_32x32",
+            2,
+            32,
+            32,
+            "1ec93bac92dc9198cd6459e4a702d43dc0c40d717b9f43ea1bda8d6222aa186c",
+        );
+    }
+
+    #[test]
+    fn test_high10_x264_cavlc() {
+        // CAVLC with B-pyramid, explicit weighted P (offsets scaled by
+        // 1 << (BitDepth - 8)) and 8x8 transform
+        decode_and_compare_hash(
+            "high10_x264_cavlc",
+            24,
+            176,
+            144,
+            "4d2fb330d92cd2a71c8cc35d04293629e9f401f9369ef5ec01a51d71af3894b0",
+        );
+    }
+
+    #[test]
+    fn test_high10_x264_cabac() {
+        // CABAC, weighted P and B, 4 refs, two slices, rate control: mb_qp_delta
+        // beyond the 8-bit range (QP_Y down to -12) and deblocking thresholds
+        // scaled to 10 bits
+        decode_and_compare_hash(
+            "high10_x264_cabac",
+            24,
+            176,
+            144,
+            "95da8fa5e43627a7257f3d3410a7ebea409c7f831eda193679117f63d63680cd",
+        );
+    }
+
+    #[test]
+    fn test_high10_x264_cabac_mbaff() {
+        // CABAC MBAFF with temporal direct: field MBs and mixed-edge deblocking
+        decode_and_compare_hash(
+            "high10_x264_cabac_mbaff",
+            24,
+            176,
+            144,
+            "9ecacbcb883b9a6c5e2462f6365bf886fa77159c1d331a4ec60d663696683af0",
+        );
+    }
+
+    #[test]
+    fn test_high10_yuv422_x264_cabac() {
+        // High 4:2:2 at 10 bits: chroma QP'c with QpBdOffsetC
+        decode_and_compare_hash(
+            "high10_yuv422_x264_cabac",
+            24,
+            176,
+            144,
+            "d37fde80af657525c8c9bcfb941c3325f19f03bff5078335f230950c1f99b1c5",
+        );
+    }
+
+    #[test]
+    fn test_high10_mono_x264() {
+        // Monochrome at 10 bits: chroma planes at 512
+        decode_and_compare_hash(
+            "high10_mono_x264",
+            24,
+            176,
+            144,
+            "660e8b7eff8fe11fcda860f2f2b49ee370620684877b6986f2424a67f5eef3e2",
+        );
+    }
+
+    #[test]
+    fn test_high10_x264_crop_low_qp() {
+        // 168x136 (cropped) at QP 4: cropping in 2-byte samples, large levels
+        decode_and_compare_hash(
+            "high10_x264_crop_low_qp",
+            16,
+            168,
+            136,
+            "45f6189eacb56850e766168dfbb02ab64bd6351a00920216fe3d582f805ce392",
+        );
+    }
+
     // x264 --interlaced (MBAFF) streams, SHA-256 of ffmpeg's decode. Mixed
     // frame/field pairs exercise the spec Table 6-4 neighbours throughout.
 
@@ -3608,7 +3756,7 @@ mod tests {
     fn test_unsupported_formats_are_rejected() {
         for (name, what) in [
             ("unsupported_444", "4:4:4 chroma"),
-            ("unsupported_420_10bit", "bit depth above 8"),
+            ("unsupported_420_9bit", "bit depth other than 8 or 10"),
             ("unsupported_lossless", "lossless (transform bypass) coding"),
         ] {
             let path = format!("{}/testdata/{}.h264", env!("CARGO_MANIFEST_DIR"), name);

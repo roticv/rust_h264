@@ -7,7 +7,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::dpb::{DecodedPicture, Motion, PictureStructure, ViewSource};
-use crate::inter_pred;
+use crate::pixel::Pixel;
 use crate::residual::OFFSET_TO_BLOCK;
 use crate::slice::PredWeightTable;
 
@@ -179,9 +179,9 @@ impl MbWeights<'_> {
 
     /// Apply weighted uni-prediction in place. No-op if use_weight != 1.
     #[inline]
-    pub(crate) fn apply_uni(
+    pub(crate) fn apply_uni<P: Pixel>(
         &self,
-        pred: &mut [u8],
+        pred: &mut [P],
         list: usize,
         ref_idx: usize,
         is_chroma: bool,
@@ -194,11 +194,11 @@ impl MbWeights<'_> {
     /// Weighted bi-prediction of this MB (plain average when unweighted).
     #[allow(clippy::too_many_arguments)]
     #[inline]
-    pub(crate) fn apply_bi(
+    pub(crate) fn apply_bi<P: Pixel>(
         &self,
-        pred_l0: &[u8],
-        pred_l1: &[u8],
-        output: &mut [u8],
+        pred_l0: &[P],
+        pred_l1: &[P],
+        output: &mut [P],
         ref_idx_l0: usize,
         ref_idx_l1: usize,
         is_chroma: bool,
@@ -210,10 +210,8 @@ impl MbWeights<'_> {
                     .get(ref_idx_l0)
                     .and_then(|row| row.get(ref_idx_l1));
                 match w0 {
-                    Some(&w0) => {
-                        inter_pred::weighted_bi_implicit(pred_l0, pred_l1, output, w0, 64 - w0)
-                    }
-                    None => inter_pred::bi_pred_avg(pred_l0, pred_l1, output),
+                    Some(&w0) => P::weighted_bi_implicit(pred_l0, pred_l1, output, w0, 64 - w0),
+                    None => P::bi_pred_avg(pred_l0, pred_l1, output),
                 }
             }
             _ => self.ctx.apply_bi(
@@ -230,9 +228,9 @@ impl MbWeights<'_> {
 }
 
 impl WeightContext<'_> {
-    fn apply_uni(
+    fn apply_uni<P: Pixel>(
         &self,
-        pred: &mut [u8],
+        pred: &mut [P],
         list: usize,
         ref_idx: usize,
         is_chroma: bool,
@@ -251,14 +249,14 @@ impl WeightContext<'_> {
         }
         let rw = &refs[ref_idx];
         if is_chroma {
-            inter_pred::weighted_uni(
+            P::weighted_uni(
                 pred,
                 wt.chroma_log2_weight_denom,
                 rw.chroma_weight[chroma_comp],
                 rw.chroma_offset[chroma_comp],
             );
         } else {
-            inter_pred::weighted_uni(
+            P::weighted_uni(
                 pred,
                 wt.luma_log2_weight_denom,
                 rw.luma_weight,
@@ -268,11 +266,11 @@ impl WeightContext<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn apply_bi(
+    fn apply_bi<P: Pixel>(
         &self,
-        pred_l0: &[u8],
-        pred_l1: &[u8],
-        output: &mut [u8],
+        pred_l0: &[P],
+        pred_l1: &[P],
+        output: &mut [P],
         ref_idx_l0: usize,
         ref_idx_l1: usize,
         is_chroma: bool,
@@ -283,7 +281,7 @@ impl WeightContext<'_> {
                 let wt = match self.wt {
                     Some(w) => w,
                     None => {
-                        inter_pred::bi_pred_avg(pred_l0, pred_l1, output);
+                        P::bi_pred_avg(pred_l0, pred_l1, output);
                         return;
                     }
                 };
@@ -291,7 +289,7 @@ impl WeightContext<'_> {
                 let rw1 = wt.l1.get(ref_idx_l1);
                 match (rw0, rw1) {
                     (Some(w0), Some(w1)) if is_chroma => {
-                        inter_pred::weighted_bi(
+                        P::weighted_bi(
                             pred_l0,
                             pred_l1,
                             output,
@@ -303,7 +301,7 @@ impl WeightContext<'_> {
                         );
                     }
                     (Some(w0), Some(w1)) => {
-                        inter_pred::weighted_bi(
+                        P::weighted_bi(
                             pred_l0,
                             pred_l1,
                             output,
@@ -314,7 +312,7 @@ impl WeightContext<'_> {
                             w1.luma_offset,
                         );
                     }
-                    _ => inter_pred::bi_pred_avg(pred_l0, pred_l1, output),
+                    _ => P::bi_pred_avg(pred_l0, pred_l1, output),
                 }
             }
             2 => {
@@ -322,12 +320,12 @@ impl WeightContext<'_> {
                     && ref_idx_l1 < self.implicit_weights[ref_idx_l0].len()
                 {
                     let w0 = self.implicit_weights[ref_idx_l0][ref_idx_l1];
-                    inter_pred::weighted_bi_implicit(pred_l0, pred_l1, output, w0, 64 - w0);
+                    P::weighted_bi_implicit(pred_l0, pred_l1, output, w0, 64 - w0);
                 } else {
-                    inter_pred::bi_pred_avg(pred_l0, pred_l1, output);
+                    P::bi_pred_avg(pred_l0, pred_l1, output);
                 }
             }
-            _ => inter_pred::bi_pred_avg(pred_l0, pred_l1, output),
+            _ => P::bi_pred_avg(pred_l0, pred_l1, output),
         }
     }
 }

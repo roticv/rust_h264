@@ -5,7 +5,7 @@
 //! top-to-bottom. Each edge consists of 4-sample segments filtered independently.
 
 use crate::decoder::Frame;
-use crate::residual::chroma_qp;
+use crate::pixel::Pixel;
 use crate::slice::SliceHeader;
 
 /// Macroblock type for boundary strength derivation.
@@ -191,8 +191,48 @@ pub(crate) fn filter_mb_range(
     );
 }
 
-#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn filter_frame_inner(
+    frame: &mut Frame,
+    mb_info: &[MbInfo],
+    mb_width: usize,
+    mb_slice_id: &[u16],
+    slices: &[SliceDeblock],
+    chroma_qp_index_offset: i32,
+    second_chroma_qp_index_offset: i32,
+    interlace: Interlace,
+    mbs: core::ops::Range<usize>,
+) {
+    // Sample type by bit depth: the 8-bit filter is its own instantiation
+    if frame.bit_depth > 8 {
+        filter_frame_inner_px::<u16>(
+            frame,
+            mb_info,
+            mb_width,
+            mb_slice_id,
+            slices,
+            chroma_qp_index_offset,
+            second_chroma_qp_index_offset,
+            interlace,
+            mbs,
+        )
+    } else {
+        filter_frame_inner_px::<u8>(
+            frame,
+            mb_info,
+            mb_width,
+            mb_slice_id,
+            slices,
+            chroma_qp_index_offset,
+            second_chroma_qp_index_offset,
+            interlace,
+            mbs,
+        )
+    }
+}
+
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+fn filter_frame_inner_px<P: Pixel>(
     frame: &mut Frame,
     mb_info: &[MbInfo],
     mb_width: usize,
@@ -205,7 +245,7 @@ fn filter_frame_inner(
 ) {
     if let Some(mb_field) = interlace.mbaff_field {
         for m in mbs.start..mbs.end.min(mb_info.len()) {
-            filter_mb_mbaff(
+            filter_mb_mbaff::<P>(
                 frame,
                 mb_info,
                 mb_width,
@@ -309,24 +349,31 @@ fn filter_frame_inner(
             let qp_avg = (qp_p.wrapping_add(qp_q).wrapping_add(1)) >> 1;
             let index_a = (qp_avg + filter_offset_a).clamp(0, 51) as usize;
             let index_b = (qp_avg + filter_offset_b).clamp(0, 51) as usize;
-            let alpha = ALPHA_TABLE[index_a];
-            let beta = BETA_TABLE[index_b];
+            let alpha = scaled_alpha::<P>(index_a);
+            let beta = scaled_beta::<P>(index_b);
 
             // Chroma QP (computed once per edge, used for chroma segments).
             // Cb and Cr each take their own QP offset.
             let chroma_params = |offset: i32| {
-                let qp_c_avg = (chroma_qp(qp_p, offset) + chroma_qp(qp_q, offset) + 1) >> 1;
+                let qp_c_avg = (crate::residual::chroma_qp_bd(qp_p, offset, P::QP_BD_OFFSET)
+                    + crate::residual::chroma_qp_bd(qp_q, offset, P::QP_BD_OFFSET)
+                    + 1)
+                    >> 1;
                 let c_index_a = (qp_c_avg + filter_offset_a).clamp(0, 51) as usize;
                 let c_index_b = (qp_c_avg + filter_offset_b).clamp(0, 51) as usize;
-                (c_index_a, ALPHA_TABLE[c_index_a], BETA_TABLE[c_index_b])
+                (
+                    c_index_a,
+                    scaled_alpha::<P>(c_index_a),
+                    scaled_beta::<P>(c_index_b),
+                )
             };
             let cb = chroma_params(chroma_qp_index_offset);
             let cr = chroma_params(second_chroma_qp_index_offset);
 
             // Luma: the 16 lines of the edge at once, line i taking the bS
             // of its segment
-            let lp = LineParams::new(16, index_a, |i| seg_bs[i / 4]);
-            filter_v_lines(
+            let lp = LineParams::new::<P>(16, index_a, |i| seg_bs[i / 4]);
+            filter_v_lines::<P>(
                 &mut frame.y,
                 stride_y,
                 edge_x,
@@ -344,8 +391,8 @@ fn filter_frame_inner(
                 for (plane, (c_index_a, c_alpha, c_beta)) in
                     [(&mut frame.u, cb), (&mut frame.v, cr)]
                 {
-                    let lp = LineParams::new(rows, c_index_a, |i| seg_bs[(i << sy) / 4]);
-                    filter_v_lines(
+                    let lp = LineParams::new::<P>(rows, c_index_a, |i| seg_bs[(i << sy) / 4]);
+                    filter_v_lines::<P>(
                         plane,
                         stride_c,
                         c_edge_x,
@@ -418,15 +465,22 @@ fn filter_frame_inner(
             let qp_avg = (qp_p.wrapping_add(qp_q).wrapping_add(1)) >> 1;
             let index_a = (qp_avg + filter_offset_a).clamp(0, 51) as usize;
             let index_b = (qp_avg + filter_offset_b).clamp(0, 51) as usize;
-            let alpha = ALPHA_TABLE[index_a];
-            let beta = BETA_TABLE[index_b];
+            let alpha = scaled_alpha::<P>(index_a);
+            let beta = scaled_beta::<P>(index_b);
 
             // Cb and Cr each take their own QP offset
             let chroma_params = |offset: i32| {
-                let qp_c_avg = (chroma_qp(qp_p, offset) + chroma_qp(qp_q, offset) + 1) >> 1;
+                let qp_c_avg = (crate::residual::chroma_qp_bd(qp_p, offset, P::QP_BD_OFFSET)
+                    + crate::residual::chroma_qp_bd(qp_q, offset, P::QP_BD_OFFSET)
+                    + 1)
+                    >> 1;
                 let c_index_a = (qp_c_avg + filter_offset_a).clamp(0, 51) as usize;
                 let c_index_b = (qp_c_avg + filter_offset_b).clamp(0, 51) as usize;
-                (c_index_a, ALPHA_TABLE[c_index_a], BETA_TABLE[c_index_b])
+                (
+                    c_index_a,
+                    scaled_alpha::<P>(c_index_a),
+                    scaled_beta::<P>(c_index_b),
+                )
             };
             let cb = chroma_params(chroma_qp_index_offset);
             let cr = chroma_params(second_chroma_qp_index_offset);
@@ -434,9 +488,9 @@ fn filter_frame_inner(
             // Luma: the 16 lines (columns) of the edge at once, line i taking
             // the bS of its segment
             if !skip_luma {
-                let lp = LineParams::new(16, index_a, |i| seg_bs[i / 4]);
+                let lp = LineParams::new::<P>(16, index_a, |i| seg_bs[i / 4]);
                 let off = edge_y * stride_y + mb_x;
-                filter_h_lines(&mut frame.y, off, stride_y, 16, &lp, (alpha, beta), true);
+                filter_h_lines::<P>(&mut frame.y, off, stride_y, 16, &lp, (alpha, beta), true);
             }
 
             // Chroma: each column takes the bS of the luma segment above it.
@@ -447,8 +501,8 @@ fn filter_frame_inner(
                 for (plane, (c_index_a, c_alpha, c_beta)) in
                     [(&mut frame.u, cb), (&mut frame.v, cr)]
                 {
-                    let lp = LineParams::new(8, c_index_a, |i| seg_bs[i / 2]);
-                    filter_h_lines(plane, off, stride_c, 8, &lp, (c_alpha, c_beta), false);
+                    let lp = LineParams::new::<P>(8, c_index_a, |i| seg_bs[i / 2]);
+                    filter_h_lines::<P>(plane, off, stride_c, 8, &lp, (c_alpha, c_beta), false);
                 }
             }
         }
@@ -463,6 +517,24 @@ pub(crate) struct Interlace<'a> {
     /// Field picture: horizontal MB edges next to intra MBs get bS 3 and
     /// vertical MV differences count from 2 (field units).
     pub(crate) field_pic: bool,
+}
+
+/// alpha' scaled to the bit depth (spec 8.7.2.2: alpha = alpha' << (BitDepth - 8)).
+#[inline(always)]
+fn scaled_alpha<P: Pixel>(index_a: usize) -> i32 {
+    ALPHA_TABLE[index_a] << (P::BIT_DEPTH - 8)
+}
+
+/// beta' scaled to the bit depth.
+#[inline(always)]
+fn scaled_beta<P: Pixel>(index_b: usize) -> i32 {
+    BETA_TABLE[index_b] << (P::BIT_DEPTH - 8)
+}
+
+/// tC0' scaled to the bit depth, for bS `bs_minus1 + 1`.
+#[inline(always)]
+fn scaled_tc0<P: Pixel>(index_a: usize, bs_minus1: usize) -> i32 {
+    TC0_TABLE[index_a][bs_minus1] << (P::BIT_DEPTH - 8)
 }
 
 #[inline]
@@ -520,13 +592,24 @@ struct EdgeQp {
 }
 
 impl EdgeQp {
-    fn new(qp_p: i32, qp_q: i32, off_a: i32, off_b: i32, cqp_offset: [i32; 2]) -> Self {
+    fn new<P: Pixel>(qp_p: i32, qp_q: i32, off_a: i32, off_b: i32, cqp_offset: [i32; 2]) -> Self {
         let params = |qp: i32| {
             let index_a = (qp + off_a).clamp(0, 51) as usize;
             let index_b = (qp + off_b).clamp(0, 51) as usize;
-            (index_a, ALPHA_TABLE[index_a], BETA_TABLE[index_b])
+            (
+                index_a,
+                scaled_alpha::<P>(index_a),
+                scaled_beta::<P>(index_b),
+            )
         };
-        let chroma = cqp_offset.map(|o| params((chroma_qp(qp_p, o) + chroma_qp(qp_q, o) + 1) >> 1));
+        let chroma = cqp_offset.map(|o| {
+            params(
+                (crate::residual::chroma_qp_bd(qp_p, o, P::QP_BD_OFFSET)
+                    + crate::residual::chroma_qp_bd(qp_q, o, P::QP_BD_OFFSET)
+                    + 1)
+                    >> 1,
+            )
+        });
         EdgeQp {
             luma: params((qp_p.wrapping_add(qp_q).wrapping_add(1)) >> 1),
             chroma,
@@ -535,9 +618,9 @@ impl EdgeQp {
 }
 
 #[inline]
-fn tc0_for(index_a: usize, bs: i32) -> i32 {
+fn tc0_for<P: Pixel>(index_a: usize, bs: i32) -> i32 {
     if bs < 4 {
-        TC0_TABLE[index_a][(bs - 1) as usize]
+        scaled_tc0::<P>(index_a, (bs - 1) as usize)
     } else {
         0
     }
@@ -545,12 +628,12 @@ fn tc0_for(index_a: usize, bs: i32) -> i32 {
 
 /// Filter the vertical edge at luma column `ex` (chroma `ex / 2` when even)
 /// of an MB with geometry `g`; `bs[k]` covers luma rows `4k..4k + 4`.
-fn filter_v_edge(frame: &mut Frame, g: MbGeom, ex: usize, bs: [i32; 4], qp: EdgeQp) {
+fn filter_v_edge<P: Pixel>(frame: &mut Frame, g: MbGeom, ex: usize, bs: [i32; 4], qp: EdgeQp) {
     let (index_a, alpha, beta) = qp.luma;
     for (seg, &b) in bs.iter().enumerate() {
         if b != 0 {
-            let tc0 = tc0_for(index_a, b);
-            filter_edge_v(
+            let tc0 = tc0_for::<P>(index_a, b);
+            filter_edge_v::<P>(
                 &mut frame.y,
                 g.ls,
                 g.x0 + ex,
@@ -571,8 +654,8 @@ fn filter_v_edge(frame: &mut Frame, g: MbGeom, ex: usize, bs: [i32; 4], qp: Edge
             for cy in 0..(16 >> sy) {
                 let b = bs[(cy << sy) / 4];
                 if b != 0 {
-                    let tc0 = tc0_for(c_index_a, b);
-                    filter_edge_v_chroma(
+                    let tc0 = tc0_for::<P>(c_index_a, b);
+                    filter_edge_v_chroma::<P>(
                         plane,
                         g.cls,
                         g.cx0 + ex / 2,
@@ -593,13 +676,20 @@ fn filter_v_edge(frame: &mut Frame, g: MbGeom, ex: usize, bs: [i32; 4], qp: Edge
 /// `bs[k]` covers luma columns `4k..4k + 4`. Chroma has an edge there at
 /// every other luma edge for 4:2:0 and at each for 4:2:2; `luma` false
 /// filters only chroma (4:2:2 edges inside an 8x8 luma transform block).
-fn filter_h_edge(frame: &mut Frame, g: MbGeom, ey: usize, bs: [i32; 4], qp: EdgeQp, luma: bool) {
+fn filter_h_edge<P: Pixel>(
+    frame: &mut Frame,
+    g: MbGeom,
+    ey: usize,
+    bs: [i32; 4],
+    qp: EdgeQp,
+    luma: bool,
+) {
     let (index_a, alpha, beta) = qp.luma;
     let sy = frame.chroma_format.shift_y() as usize;
     for (seg, &b) in bs.iter().enumerate() {
         if b != 0 && luma {
-            let tc0 = tc0_for(index_a, b);
-            filter_edge_h(
+            let tc0 = tc0_for::<P>(index_a, b);
+            filter_edge_h::<P>(
                 &mut frame.y,
                 g.ls,
                 g.x0 + seg * 4,
@@ -619,8 +709,8 @@ fn filter_h_edge(frame: &mut Frame, g: MbGeom, ey: usize, bs: [i32; 4], qp: Edge
             for cx in 0..8 {
                 let b = bs[cx / 2];
                 if b != 0 {
-                    let tc0 = tc0_for(c_index_a, b);
-                    filter_edge_h_chroma(
+                    let tc0 = tc0_for::<P>(c_index_a, b);
+                    filter_edge_h_chroma::<P>(
                         plane,
                         g.cls,
                         g.cx0 + cx,
@@ -675,7 +765,7 @@ fn edge_bs(
 ///   against each field of that pair;
 /// - the top edge of a field MB uses the same-parity lines of the pair above.
 #[allow(clippy::too_many_arguments)]
-fn filter_mb_mbaff(
+fn filter_mb_mbaff<P: Pixel>(
     frame: &mut Frame,
     mb_info: &[MbInfo],
     mb_width: usize,
@@ -725,15 +815,15 @@ fn filter_mb_mbaff(
                 false,
                 mvy_limit,
             );
-            filter_v_edge(
+            filter_v_edge::<P>(
                 frame,
                 g,
                 0,
                 bs,
-                EdgeQp::new(p.qp_y, q.qp_y, off_a, off_b, cqp_offset),
+                EdgeQp::new::<P>(p.qp_y, q.qp_y, off_a, off_b, cqp_offset),
             );
         } else {
-            filter_mixed_left_edge(
+            filter_mixed_left_edge::<P>(
                 frame, mb_info, g, q, lp, field, bottom, off_a, off_b, cqp_offset,
             );
         }
@@ -752,12 +842,12 @@ fn filter_mb_mbaff(
             false,
             mvy_limit,
         );
-        filter_v_edge(
+        filter_v_edge::<P>(
             frame,
             g,
             edge * 4,
             bs,
-            EdgeQp::new(q.qp_y, q.qp_y, off_a, off_b, cqp_offset),
+            EdgeQp::new::<P>(q.qp_y, q.qp_y, off_a, off_b, cqp_offset),
         );
     }
 
@@ -795,12 +885,12 @@ fn filter_mb_mbaff(
                     cy0: g.cy0 / 2,
                     cls: 2 * g.cls,
                 };
-                filter_h_edge(
+                filter_h_edge::<P>(
                     frame,
                     gj,
                     0,
                     bs,
-                    EdgeQp::new(p.qp_y, q.qp_y, off_a, off_b, cqp_offset),
+                    EdgeQp::new::<P>(p.qp_y, q.qp_y, off_a, off_b, cqp_offset),
                     true,
                 );
             }
@@ -817,12 +907,12 @@ fn filter_mb_mbaff(
                 p_field != field,
                 mvy_limit,
             );
-            filter_h_edge(
+            filter_h_edge::<P>(
                 frame,
                 g,
                 0,
                 bs,
-                EdgeQp::new(p.qp_y, q.qp_y, off_a, off_b, cqp_offset),
+                EdgeQp::new::<P>(p.qp_y, q.qp_y, off_a, off_b, cqp_offset),
                 true,
             );
         }
@@ -844,12 +934,12 @@ fn filter_mb_mbaff(
             false,
             mvy_limit,
         );
-        filter_h_edge(
+        filter_h_edge::<P>(
             frame,
             g,
             edge * 4,
             bs,
-            EdgeQp::new(q.qp_y, q.qp_y, off_a, off_b, cqp_offset),
+            EdgeQp::new::<P>(q.qp_y, q.qp_y, off_a, off_b, cqp_offset),
             luma,
         );
     }
@@ -862,7 +952,7 @@ fn filter_mb_mbaff(
 /// MB of the row's parity. bS is 4 next to an intra MB, else 1, or 2 with
 /// coefficients on either side; the QP is that of the row's left MB.
 #[allow(clippy::too_many_arguments)]
-fn filter_mixed_left_edge(
+fn filter_mixed_left_edge<P: Pixel>(
     frame: &mut Frame,
     mb_info: &[MbInfo],
     g: MbGeom,
@@ -888,7 +978,7 @@ fn filter_mixed_left_edge(
         };
         1 + (q.nnz[blk_idx(0, i >> 1)] || l.nnz[blk_idx(3, l_row)]) as i32
     });
-    let qps = left.map(|l| EdgeQp::new(l.qp_y, q.qp_y, off_a, off_b, cqp_offset));
+    let qps = left.map(|l| EdgeQp::new::<P>(l.qp_y, q.qp_y, off_a, off_b, cqp_offset));
     for r in 0..16 {
         let (i, j) = if field {
             (r >> 1, r >> 3)
@@ -897,7 +987,7 @@ fn filter_mixed_left_edge(
         };
         let (index_a, alpha, beta) = qps[j].luma;
         let b = bs8[i];
-        filter_edge_v(
+        filter_edge_v::<P>(
             &mut frame.y,
             g.ls,
             g.x0,
@@ -906,7 +996,7 @@ fn filter_mixed_left_edge(
             b,
             alpha,
             beta,
-            tc0_for(index_a, b),
+            tc0_for::<P>(index_a, b),
         );
     }
     let c422 = frame.chroma_format == crate::decoder::ChromaFormat::Yuv422;
@@ -922,7 +1012,7 @@ fn filter_mixed_left_edge(
             };
             let b = bs8[i];
             let (c_index_a, c_alpha, c_beta) = qps[j].chroma[c];
-            filter_edge_v_chroma(
+            filter_edge_v_chroma::<P>(
                 plane,
                 g.cls,
                 g.cx0,
@@ -931,7 +1021,7 @@ fn filter_mixed_left_edge(
                 b,
                 c_alpha,
                 c_beta,
-                tc0_for(c_index_a, b),
+                tc0_for::<P>(c_index_a, b),
             );
         }
     }
@@ -1103,7 +1193,7 @@ fn mv_differs(mv_a: [i16; 2], mv_b: [i16; 2], mvy_limit: i32) -> bool {
 /// `x` is the column of q0; p samples are at x-1, x-2, x-3. q samples at x, x+1, x+2.
 /// `y` is the row of the first of `count` consecutive rows to filter.
 #[allow(clippy::too_many_arguments)]
-fn filter_edge_v(
+fn filter_edge_v<P: Pixel>(
     plane: &mut [u8],
     stride: usize,
     x: usize,
@@ -1114,11 +1204,11 @@ fn filter_edge_v(
     beta: i32,
     tc0: i32,
 ) {
-    filter_edge_v_inner(plane, stride, x, y, count, bs, alpha, beta, tc0, false);
+    filter_edge_v_inner::<P>(plane, stride, x, y, count, bs, alpha, beta, tc0, false);
 }
 
 #[allow(clippy::too_many_arguments)]
-fn filter_edge_v_chroma(
+fn filter_edge_v_chroma<P: Pixel>(
     plane: &mut [u8],
     stride: usize,
     x: usize,
@@ -1129,11 +1219,11 @@ fn filter_edge_v_chroma(
     beta: i32,
     tc0: i32,
 ) {
-    filter_edge_v_inner(plane, stride, x, y, count, bs, alpha, beta, tc0, true);
+    filter_edge_v_inner::<P>(plane, stride, x, y, count, bs, alpha, beta, tc0, true);
 }
 
 #[allow(clippy::too_many_arguments)]
-fn filter_edge_v_inner(
+fn filter_edge_v_inner<P: Pixel>(
     plane: &mut [u8],
     stride: usize,
     x: usize,
@@ -1149,60 +1239,60 @@ fn filter_edge_v_inner(
         let row = y + i;
         let idx_q0 = row * stride + x;
         // Guard against frame buffer overrun from malformed streams
-        if x < 3 || idx_q0 + 3 >= plane.len() {
+        if x < 3 || idx_q0 + 3 >= plane.len() / P::BYTES {
             continue;
         }
         let idx_p0 = idx_q0 - 1;
 
-        let p0 = plane[idx_p0] as i32;
-        let p1 = plane[idx_p0 - 1] as i32;
-        let q0 = plane[idx_q0] as i32;
-        let q1 = plane[idx_q0 + 1] as i32;
+        let p0 = P::load(plane, idx_p0).to_i32();
+        let p1 = P::load(plane, idx_p0 - 1).to_i32();
+        let q0 = P::load(plane, idx_q0).to_i32();
+        let q1 = P::load(plane, idx_q0 + 1).to_i32();
 
         if !should_filter(p0, p1, q0, q1, alpha, beta) {
             continue;
         }
 
-        let p2 = plane[idx_p0 - 2] as i32;
-        let q2 = plane[idx_q0 + 2] as i32;
+        let p2 = P::load(plane, idx_p0 - 2).to_i32();
+        let q2 = P::load(plane, idx_q0 + 2).to_i32();
 
         if bs == 4 {
             if is_chroma {
                 // Spec 8.7.2.4: chroma strong filter only modifies p0 and q0
-                plane[idx_p0] = ((2 * p1 + p0 + q1 + 2) >> 2) as u8;
-                plane[idx_q0] = ((2 * q1 + q0 + p1 + 2) >> 2) as u8;
+                P::store(plane, idx_p0, P::from_i32((2 * p1 + p0 + q1 + 2) >> 2));
+                P::store(plane, idx_q0, P::from_i32((2 * q1 + q0 + p1 + 2) >> 2));
             } else {
-                let (np0, np1, np2, nq0, nq1, nq2) = strong_filter(
+                let (np0, np1, np2, nq0, nq1, nq2) = strong_filter::<P>(
                     p0,
                     p1,
                     p2,
-                    plane[idx_p0 - 3] as i32,
+                    P::load(plane, idx_p0 - 3).to_i32(),
                     q0,
                     q1,
                     q2,
-                    plane[idx_q0 + 3] as i32,
+                    P::load(plane, idx_q0 + 3).to_i32(),
                     alpha,
                     beta,
                 );
-                plane[idx_p0] = np0 as u8;
-                plane[idx_p0 - 1] = np1 as u8;
-                plane[idx_p0 - 2] = np2 as u8;
-                plane[idx_q0] = nq0 as u8;
-                plane[idx_q0 + 1] = nq1 as u8;
-                plane[idx_q0 + 2] = nq2 as u8;
+                P::store(plane, idx_p0, P::from_i32(np0));
+                P::store(plane, idx_p0 - 1, P::from_i32(np1));
+                P::store(plane, idx_p0 - 2, P::from_i32(np2));
+                P::store(plane, idx_q0, P::from_i32(nq0));
+                P::store(plane, idx_q0 + 1, P::from_i32(nq1));
+                P::store(plane, idx_q0 + 2, P::from_i32(nq2));
             }
         } else if is_chroma {
             // Spec 8.7.2.3: chroma normal filter — tc = tc0 + 1, only p0/q0 modified
             let tc = tc0 + 1;
             let delta = ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
-            plane[idx_p0] = (p0 + delta).clamp(0, 255) as u8;
-            plane[idx_q0] = (q0 - delta).clamp(0, 255) as u8;
+            P::store(plane, idx_p0, P::from_i32((p0 + delta).clamp(0, P::MAX)));
+            P::store(plane, idx_q0, P::from_i32((q0 - delta).clamp(0, P::MAX)));
         } else {
-            let (np0, np1, nq0, nq1) = normal_filter(p0, p1, p2, q0, q1, q2, tc0, beta);
-            plane[idx_p0] = np0 as u8;
-            plane[idx_p0 - 1] = np1 as u8;
-            plane[idx_q0] = nq0 as u8;
-            plane[idx_q0 + 1] = nq1 as u8;
+            let (np0, np1, nq0, nq1) = normal_filter::<P>(p0, p1, p2, q0, q1, q2, tc0, beta);
+            P::store(plane, idx_p0, P::from_i32(np0));
+            P::store(plane, idx_p0 - 1, P::from_i32(np1));
+            P::store(plane, idx_q0, P::from_i32(nq0));
+            P::store(plane, idx_q0 + 1, P::from_i32(nq1));
         }
     }
 }
@@ -1210,7 +1300,7 @@ fn filter_edge_v_inner(
 /// Filter one 4-sample segment of a horizontal edge.
 /// `y` is the row of q0; p samples are at y-1, y-2, y-3. q samples at y, y+1, y+2.
 #[allow(clippy::too_many_arguments)]
-fn filter_edge_h(
+fn filter_edge_h<P: Pixel>(
     plane: &mut [u8],
     stride: usize,
     x: usize,
@@ -1221,11 +1311,11 @@ fn filter_edge_h(
     beta: i32,
     tc0: i32,
 ) {
-    filter_edge_h_inner(plane, stride, x, y, count, bs, alpha, beta, tc0, false);
+    filter_edge_h_inner::<P>(plane, stride, x, y, count, bs, alpha, beta, tc0, false);
 }
 
 #[allow(clippy::too_many_arguments)]
-fn filter_edge_h_chroma(
+fn filter_edge_h_chroma<P: Pixel>(
     plane: &mut [u8],
     stride: usize,
     x: usize,
@@ -1236,11 +1326,11 @@ fn filter_edge_h_chroma(
     beta: i32,
     tc0: i32,
 ) {
-    filter_edge_h_inner(plane, stride, x, y, count, bs, alpha, beta, tc0, true);
+    filter_edge_h_inner::<P>(plane, stride, x, y, count, bs, alpha, beta, tc0, true);
 }
 
 #[allow(clippy::too_many_arguments)]
-fn filter_edge_h_inner(
+fn filter_edge_h_inner<P: Pixel>(
     plane: &mut [u8],
     stride: usize,
     x: usize,
@@ -1256,61 +1346,61 @@ fn filter_edge_h_inner(
         let col = x + i;
         let idx_q0 = y * stride + col;
         // Guard against frame buffer overrun from malformed streams
-        if y < 3 || idx_q0 + 3 * stride >= plane.len() {
+        if y < 3 || idx_q0 + 3 * stride >= plane.len() / P::BYTES {
             continue;
         }
         let idx_p0 = idx_q0 - stride;
 
-        let p0 = plane[idx_p0] as i32;
-        let p1 = plane[idx_p0 - stride] as i32;
-        let q0 = plane[idx_q0] as i32;
-        let q1 = plane[idx_q0 + stride] as i32;
+        let p0 = P::load(plane, idx_p0).to_i32();
+        let p1 = P::load(plane, idx_p0 - stride).to_i32();
+        let q0 = P::load(plane, idx_q0).to_i32();
+        let q1 = P::load(plane, idx_q0 + stride).to_i32();
 
         if !should_filter(p0, p1, q0, q1, alpha, beta) {
             continue;
         }
 
-        let p2 = plane[idx_p0 - 2 * stride] as i32;
-        let q2 = plane[idx_q0 + 2 * stride] as i32;
+        let p2 = P::load(plane, idx_p0 - 2 * stride).to_i32();
+        let q2 = P::load(plane, idx_q0 + 2 * stride).to_i32();
 
         if bs == 4 {
             if is_chroma {
                 // Spec 8.7.2.4: chroma strong filter only modifies p0 and q0
-                plane[idx_p0] = ((2 * p1 + p0 + q1 + 2) >> 2) as u8;
-                plane[idx_q0] = ((2 * q1 + q0 + p1 + 2) >> 2) as u8;
+                P::store(plane, idx_p0, P::from_i32((2 * p1 + p0 + q1 + 2) >> 2));
+                P::store(plane, idx_q0, P::from_i32((2 * q1 + q0 + p1 + 2) >> 2));
             } else {
-                let (np0, np1, np2, nq0, nq1, nq2) = strong_filter(
+                let (np0, np1, np2, nq0, nq1, nq2) = strong_filter::<P>(
                     p0,
                     p1,
                     p2,
-                    plane[idx_p0 - 3 * stride] as i32,
+                    P::load(plane, idx_p0 - 3 * stride).to_i32(),
                     q0,
                     q1,
                     q2,
-                    plane[idx_q0 + 3 * stride] as i32,
+                    P::load(plane, idx_q0 + 3 * stride).to_i32(),
                     alpha,
                     beta,
                 );
-                plane[idx_p0] = np0 as u8;
-                plane[idx_p0 - stride] = np1 as u8;
-                plane[idx_p0 - 2 * stride] = np2 as u8;
-                plane[idx_q0] = nq0 as u8;
-                plane[idx_q0 + stride] = nq1 as u8;
-                plane[idx_q0 + 2 * stride] = nq2 as u8;
+                P::store(plane, idx_p0, P::from_i32(np0));
+                P::store(plane, idx_p0 - stride, P::from_i32(np1));
+                P::store(plane, idx_p0 - 2 * stride, P::from_i32(np2));
+                P::store(plane, idx_q0, P::from_i32(nq0));
+                P::store(plane, idx_q0 + stride, P::from_i32(nq1));
+                P::store(plane, idx_q0 + 2 * stride, P::from_i32(nq2));
             }
         } else if is_chroma {
             // Spec 8.7.2.3: chroma normal filter modifies only p0 and q0
             // with tc = tc0 + 1 (no ap/aq adjustment)
             let tc = tc0 + 1;
             let delta = ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
-            plane[idx_p0] = (p0 + delta).clamp(0, 255) as u8;
-            plane[idx_q0] = (q0 - delta).clamp(0, 255) as u8;
+            P::store(plane, idx_p0, P::from_i32((p0 + delta).clamp(0, P::MAX)));
+            P::store(plane, idx_q0, P::from_i32((q0 - delta).clamp(0, P::MAX)));
         } else {
-            let (np0, np1, nq0, nq1) = normal_filter(p0, p1, p2, q0, q1, q2, tc0, beta);
-            plane[idx_p0] = np0 as u8;
-            plane[idx_p0 - stride] = np1 as u8;
-            plane[idx_q0] = nq0 as u8;
-            plane[idx_q0 + stride] = nq1 as u8;
+            let (np0, np1, nq0, nq1) = normal_filter::<P>(p0, p1, p2, q0, q1, q2, tc0, beta);
+            P::store(plane, idx_p0, P::from_i32(np0));
+            P::store(plane, idx_p0 - stride, P::from_i32(np1));
+            P::store(plane, idx_q0, P::from_i32(nq0));
+            P::store(plane, idx_q0 + stride, P::from_i32(nq1));
         }
     }
 }
@@ -1322,13 +1412,13 @@ fn should_filter(p0: i32, p1: i32, q0: i32, q1: i32, alpha: i32, beta: i32) -> b
 }
 
 #[inline]
-fn clip(v: i32) -> i32 {
-    v.clamp(0, 255)
+fn clip<P: Pixel>(v: i32) -> i32 {
+    v.clamp(0, P::MAX)
 }
 
 /// Samples of up to 16 lines across one edge, by position: `s[k][i]` is
 /// p3, p2, p1, p0, q0, q1, q2, q3 for k = 0..8 of line i.
-type EdgeLines = [[u8; 16]; 8];
+type EdgeLines<P> = [[P; 16]; 8];
 
 /// Per-line filter parameters of an edge: bS (0 leaves the line alone, 4
 /// is the strong filter) and tC0 for bS 1..3.
@@ -1340,7 +1430,7 @@ struct LineParams {
 
 impl LineParams {
     /// `n` lines, line i taking bS `bs(i)`; tC0 from `index_a`.
-    fn new(n: usize, index_a: usize, bs: impl Fn(usize) -> i32) -> Self {
+    fn new<P: Pixel>(n: usize, index_a: usize, bs: impl Fn(usize) -> i32) -> Self {
         let mut p = LineParams {
             bs: [0; 16],
             tc0: [0; 16],
@@ -1349,7 +1439,7 @@ impl LineParams {
             let b = bs(i);
             p.bs[i] = b as i8;
             if (1..4).contains(&b) {
-                p.tc0[i] = TC0_TABLE[index_a][(b - 1) as usize] as i8;
+                p.tc0[i] = scaled_tc0::<P>(index_a, (b - 1) as usize) as i8;
             }
         }
         p
@@ -1361,15 +1451,15 @@ impl LineParams {
 /// vectorizes. Line i is filtered when its bS is non-zero and the sample
 /// test passes, with the strong filter for bS 4. Bit-exact with
 /// `normal_filter`/`strong_filter`.
-fn luma_edge_lines(s: &mut EdgeLines, lp: &LineParams, alpha: i32, beta: i32) {
-    crate::simd::deblock_luma_lines(s, &lp.bs, &lp.tc0, alpha, beta);
+fn luma_edge_lines<P: Pixel>(s: &mut EdgeLines<P>, lp: &LineParams, alpha: i32, beta: i32) {
+    P::deblock_luma_lines(s, &lp.bs, &lp.tc0, alpha, beta);
 }
 
 /// Chroma deblocking of up to 16 lines across one edge (spec 8.7.2.3-4):
 /// only p0 and q0 change. Line i is filtered when its bS is non-zero and
 /// the sample test passes: bS 4 strong, else tC = tC0 + 1.
-fn chroma_edge_lines(s: &mut EdgeLines, lp: &LineParams, alpha: i32, beta: i32) {
-    crate::simd::deblock_chroma_lines(s, &lp.bs, &lp.tc0, alpha, beta);
+fn chroma_edge_lines<P: Pixel>(s: &mut EdgeLines<P>, lp: &LineParams, alpha: i32, beta: i32) {
+    P::deblock_chroma_lines(s, &lp.bs, &lp.tc0, alpha, beta);
 }
 
 /// Filter `n` lines across a horizontal edge whose q0 row starts at `off`
@@ -1377,7 +1467,7 @@ fn chroma_edge_lines(s: &mut EdgeLines, lp: &LineParams, alpha: i32, beta: i32) 
 /// the lanes. `luma` filters p2..q2 (and reads p3/q3), chroma p0/q0.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::needless_range_loop)]
-fn filter_h_lines(
+fn filter_h_lines<P: Pixel>(
     plane: &mut [u8],
     off: usize,
     stride: usize,
@@ -1392,23 +1482,23 @@ fn filter_h_lines(
     let Some(top) = off.checked_sub(4 * stride) else {
         return;
     };
-    if top + 7 * stride + n > plane.len() {
+    if top + 7 * stride + n > plane.len() / P::BYTES {
         return;
     }
-    let mut s: EdgeLines = [[0; 16]; 8];
+    let mut s: EdgeLines<P> = [[P::default(); 16]; 8];
     for k in first..last {
         let o = top + k * stride;
-        s[k][..n].copy_from_slice(&plane[o..o + n]);
+        P::load_row(plane, o, &mut s[k][..n]);
     }
     if luma {
-        luma_edge_lines(&mut s, lp, alpha, beta);
+        luma_edge_lines::<P>(&mut s, lp, alpha, beta);
     } else {
-        chroma_edge_lines(&mut s, lp, alpha, beta);
+        chroma_edge_lines::<P>(&mut s, lp, alpha, beta);
     }
     let (first, last) = if luma { (1, 7) } else { (3, 5) };
     for k in first..last {
         let o = top + k * stride;
-        plane[o..o + n].copy_from_slice(&s[k][..n]);
+        P::store_row(plane, o, &s[k][..n]);
     }
 }
 
@@ -1416,7 +1506,7 @@ fn filter_h_lines(
 /// at row `y`: line i is row y + i, its samples gathered into the lanes.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::needless_range_loop)]
-fn filter_v_lines(
+fn filter_v_lines<P: Pixel>(
     plane: &mut [u8],
     stride: usize,
     x: usize,
@@ -1427,38 +1517,38 @@ fn filter_v_lines(
     luma: bool,
 ) {
     let (reach, first, last) = if luma { (4, 0, 8) } else { (2, 2, 6) };
-    if x < reach || (y + n - 1) * stride + x + reach > plane.len() {
+    if x < reach || (y + n - 1) * stride + x + reach > plane.len() / P::BYTES {
         return;
     }
-    if n == 16 && x >= 4 && (y + 15) * stride + x + 4 <= plane.len() {
+    if n == 16 && x >= 4 && (y + 15) * stride + x + 4 <= plane.len() / P::BYTES {
         // A whole luma MB edge (or 4:2:2 chroma): transposed loads
         let base = y * stride + x - 4;
-        let mut s = crate::simd::load_edge_lines_v(plane, base, stride);
+        let mut s = P::load_edge_lines_v(plane, base, stride);
         if luma {
-            luma_edge_lines(&mut s, lp, alpha, beta);
+            luma_edge_lines::<P>(&mut s, lp, alpha, beta);
         } else {
-            chroma_edge_lines(&mut s, lp, alpha, beta);
+            chroma_edge_lines::<P>(&mut s, lp, alpha, beta);
         }
-        crate::simd::store_edge_lines_v(plane, base, stride, &s);
+        P::store_edge_lines_v(plane, base, stride, &s);
         return;
     }
-    let mut s: EdgeLines = [[0; 16]; 8];
+    let mut s: EdgeLines<P> = [[P::default(); 16]; 8];
     for i in 0..n {
         let o = (y + i) * stride + x - 4;
         for k in first..last {
-            s[k][i] = plane[o + k];
+            s[k][i] = P::load(plane, o + k);
         }
     }
     if luma {
-        luma_edge_lines(&mut s, lp, alpha, beta);
+        luma_edge_lines::<P>(&mut s, lp, alpha, beta);
     } else {
-        chroma_edge_lines(&mut s, lp, alpha, beta);
+        chroma_edge_lines::<P>(&mut s, lp, alpha, beta);
     }
     let (first, last) = if luma { (1, 7) } else { (3, 5) };
     for i in 0..n {
         let o = (y + i) * stride + x - 4;
         for k in first..last {
-            plane[o + k] = s[k][i];
+            P::store(plane, o + k, s[k][i]);
         }
     }
 }
@@ -1466,7 +1556,7 @@ fn filter_v_lines(
 /// Normal filter for bS=1..3 (H.264 spec 8.7.2.3).
 /// Returns (p0', p1', q0', q1').
 #[allow(clippy::too_many_arguments)]
-fn normal_filter(
+fn normal_filter<P: Pixel>(
     p0: i32,
     p1: i32,
     p2: i32,
@@ -1507,8 +1597,8 @@ fn normal_filter(
 
     // p0' and q0' use the final tc (after increments)
     let delta = ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
-    let new_p0 = clip(p0 + delta);
-    let new_q0 = clip(q0 - delta);
+    let new_p0 = clip::<P>(p0 + delta);
+    let new_q0 = clip::<P>(q0 - delta);
 
     (new_p0, new_p1, new_q0, new_q1)
 }
@@ -1516,7 +1606,7 @@ fn normal_filter(
 /// Strong filter for bS=4 (spec 8.7.2.4).
 /// Returns (p0', p1', p2', q0', q1', q2').
 #[allow(clippy::too_many_arguments)]
-fn strong_filter(
+fn strong_filter<P: Pixel>(
     p0: i32,
     p1: i32,
     p2: i32,
@@ -1565,6 +1655,62 @@ mod tests {
     /// random lines of every bS, including samples near the thresholds.
     #[test]
     #[allow(clippy::needless_range_loop)]
+    /// The 10-bit line kernels against the per-segment filters, with
+    /// thresholds scaled to the bit depth.
+    fn edge_line_kernels_match_scalar_filters_10bit() {
+        let mut seed = 0x1234_5678_9ABC_DEF1u64;
+        let mut next = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for round in 0..20_000 {
+            let index_a = next(52) as usize;
+            let alpha = scaled_alpha::<u16>(index_a);
+            let beta = scaled_beta::<u16>(next(52) as usize);
+            let mut s: EdgeLines<u16> = [[0; 16]; 8];
+            for i in 0..16 {
+                let mut v = next(1024) as i32;
+                for k in 0..8 {
+                    v = (v + next(33) as i32 - 16).clamp(0, 1023);
+                    s[k][i] = v as u16;
+                }
+            }
+            let bss: [i32; 16] = core::array::from_fn(|_| next(5) as i32);
+            let lp = LineParams::new::<u16>(16, index_a, |i| bss[i]);
+            for luma in [true, false] {
+                let mut got = s;
+                if luma {
+                    luma_edge_lines::<u16>(&mut got, &lp, alpha, beta);
+                } else {
+                    chroma_edge_lines::<u16>(&mut got, &lp, alpha, beta);
+                }
+                for i in 0..16 {
+                    let mut row = [0u8; 16];
+                    for k in 0..8 {
+                        u16::store(&mut row, k, s[k][i]);
+                    }
+                    let bs = lp.bs[i] as i32;
+                    if bs > 0 {
+                        let tc0 = if bs < 4 { lp.tc0[i] as i32 } else { 0 };
+                        filter_edge_v_inner::<u16>(
+                            &mut row, 8, 4, 0, 1, bs, alpha, beta, tc0, !luma,
+                        );
+                    }
+                    let want: [u16; 8] = core::array::from_fn(|k| u16::load(&row, k));
+                    let got_line: [u16; 8] = core::array::from_fn(|k| got[k][i]);
+                    assert_eq!(
+                        got_line, want,
+                        "round {round} line {i} luma {luma} bs {bs} a {alpha} b {beta}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)]
     fn edge_line_kernels_match_scalar_filters() {
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
         let mut next = |m: u64| {
@@ -1578,7 +1724,7 @@ mod tests {
             let alpha = ALPHA_TABLE[index_a];
             let beta = BETA_TABLE[next(52) as usize];
             // Smooth lines so the filters' conditions are often met
-            let mut s: EdgeLines = [[0; 16]; 8];
+            let mut s: EdgeLines<u8> = [[0; 16]; 8];
             for i in 0..16 {
                 let mut v = next(256) as i32;
                 for k in 0..8 {
@@ -1587,13 +1733,13 @@ mod tests {
                 }
             }
             let bss: [i32; 16] = core::array::from_fn(|_| next(5) as i32);
-            let lp = LineParams::new(16, index_a, |i| bss[i]);
+            let lp = LineParams::new::<u8>(16, index_a, |i| bss[i]);
             for luma in [true, false] {
                 let mut got = s;
                 if luma {
-                    luma_edge_lines(&mut got, &lp, alpha, beta);
+                    luma_edge_lines::<u8>(&mut got, &lp, alpha, beta);
                 } else {
-                    chroma_edge_lines(&mut got, &lp, alpha, beta);
+                    chroma_edge_lines::<u8>(&mut got, &lp, alpha, beta);
                 }
                 for i in 0..16 {
                     // The scalar filter on one line laid out as a row
@@ -1601,7 +1747,9 @@ mod tests {
                     let bs = lp.bs[i] as i32;
                     if bs > 0 {
                         let tc0 = if bs < 4 { lp.tc0[i] as i32 } else { 0 };
-                        filter_edge_v_inner(&mut row, 8, 4, 0, 1, bs, alpha, beta, tc0, !luma);
+                        filter_edge_v_inner::<u8>(
+                            &mut row, 8, 4, 0, 1, bs, alpha, beta, tc0, !luma,
+                        );
                     }
                     let want: [u8; 8] = row;
                     let got_line: [u8; 8] = core::array::from_fn(|k| got[k][i]);
@@ -1625,14 +1773,15 @@ mod tests {
     fn test_strong_filter_uniform() {
         // Uniform block: all 128. Filter should not change anything meaningful.
         let (p0, p1, p2, q0, q1, q2) =
-            strong_filter(128, 128, 128, 128, 128, 128, 128, 128, 255, 18);
+            strong_filter::<u8>(128, 128, 128, 128, 128, 128, 128, 128, 255, 18);
         assert_eq!((p0, p1, p2, q0, q1, q2), (128, 128, 128, 128, 128, 128));
     }
 
     #[test]
     fn test_strong_filter_step_edge() {
         // Sharp step: p-side=0, q-side=255
-        let (p0, _p1, _p2, q0, _q1, _q2) = strong_filter(0, 0, 0, 0, 255, 255, 255, 255, 255, 18);
+        let (p0, _p1, _p2, q0, _q1, _q2) =
+            strong_filter::<u8>(0, 0, 0, 0, 255, 255, 255, 255, 255, 18);
         // small_gap = |0-255| < (255/4 + 2) = 65 → false
         // ap = |0 - 0| = 0 < 18 → true, but small_gap is false
         // So weak path: p0' = (2*0 + 0 + 255 + 2) >> 2 = 64
@@ -1645,7 +1794,7 @@ mod tests {
     #[test]
     fn test_normal_filter() {
         // Small step across edge with bS=3, moderate QP
-        let (p0, _p1, q0, _q1) = normal_filter(120, 120, 120, 130, 130, 130, 1, 18);
+        let (p0, _p1, q0, _q1) = normal_filter::<u8>(120, 120, 120, 130, 130, 130, 1, 18);
         // ap = 0 < 18, aq = 0 < 18 → tc = 1 + 1 + 1 = 3
         // delta = ((10*4 + 120-130 + 4) >> 3) clamped to [-3,3]
         //       = (40 - 10 + 4) >> 3 = 34 >> 3 = 4, clamped to 3
@@ -1668,7 +1817,7 @@ mod tests {
         }
 
         // bS=3, generous thresholds so filtering occurs
-        filter_edge_v(&mut plane, stride, 4, 0, 4, 3, 255, 255, 3);
+        filter_edge_v::<u8>(&mut plane, stride, 4, 0, 4, 3, 255, 255, 3);
 
         // After filtering, the step should be smoothed
         // p0 (col 3) should increase, q0 (col 4) should decrease
@@ -1695,6 +1844,7 @@ mod tests {
             v: vec![128; 16 * 8],
             pic_order_cnt: 0,
             chroma_format: Default::default(),
+            bit_depth: 8,
         }
     }
 
@@ -1822,7 +1972,7 @@ mod tests {
             }
         }
 
-        filter_edge_h(&mut plane, stride, 0, 4, 4, 3, 255, 255, 3);
+        filter_edge_h::<u8>(&mut plane, stride, 0, 4, 4, 3, 255, 255, 3);
 
         for col in 0..4 {
             assert!(plane[3 * stride + col] > 100, "p0 should increase");

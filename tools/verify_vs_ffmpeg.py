@@ -11,8 +11,9 @@ intended check for real content such as PS5 cutscenes pulled from game
 .mp4 files.
 
 Both sides decode to raw planar YUV in display order, 4:2:2 for 4:2:2
-streams and 4:2:0 otherwise (monochrome included):
-  - reference: ffmpeg -pix_fmt yuv420p (or yuv422p) -f rawvideo
+streams and 4:2:0 otherwise (monochrome included), 2 bytes per sample for
+10-bit:
+  - reference: ffmpeg -pix_fmt yuv420p (yuv422p, ...10le) -f rawvideo
   - rust_h264: cargo run --release --example dump_frames
 
 The two files are compared byte-wise; on mismatch the first differing
@@ -54,12 +55,15 @@ def extract_h264(path, out):
 
 
 def output_pix_fmt(path):
-    """yuv422p for 4:2:2 streams, else yuv420p (what rust_h264 outputs)."""
+    """The planar format rust_h264 outputs: yuv422p for 4:2:2 streams, else
+    yuv420p (monochrome included), with a 10le suffix for 10-bit."""
     r = run([
         "ffprobe", "-v", "error", "-select_streams", "v:0",
         "-show_entries", "stream=pix_fmt", "-of", "csv=p=0", path,
     ])
-    return "yuv422p" if r.stdout.strip().startswith("yuv422p") else "yuv420p"
+    fmt = r.stdout.strip()
+    base = "yuv422p" if fmt.startswith("yuv422p") else "yuv420p"
+    return base + "10le" if "10" in fmt else base
 
 
 def ffmpeg_decode(path, out):

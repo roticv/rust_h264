@@ -2,6 +2,7 @@
 
 use crate::inter_pred::avg;
 use crate::inter_pred::{clip_u8, fir6, fir6_i32};
+use crate::pixel::Pixel;
 
 /// Row-based horizontal half-pel filter for in-bounds blocks.
 /// Reads `w` output pixels from row at `src` (which must have `w + 5` accessible bytes).
@@ -224,8 +225,8 @@ pub fn weighted_bi_implicit(pred_l0: &[u8], pred_l1: &[u8], output: &mut [u8], w
 /// filtered when `bs[i] > 0` and the sample test passes, with the strong
 /// filter for bS 4, else tC0 `tc0[i]`.
 #[allow(clippy::needless_range_loop)]
-pub fn deblock_luma_lines(
-    s: &mut [[u8; 16]; 8],
+pub fn deblock_luma_lines<P: Pixel>(
+    s: &mut [[P; 16]; 8],
     bs: &[i8; 16],
     tc0: &[i8; 16],
     alpha: i32,
@@ -233,7 +234,7 @@ pub fn deblock_luma_lines(
 ) {
     for i in 0..16 {
         let [p3, p2, p1, p0, q0, q1, q2, q3] =
-            core::array::from_fn::<i32, 8, _>(|k| s[k][i] as i32);
+            core::array::from_fn::<i32, 8, _>(|k| s[k][i].to_i32());
         let (b, t0) = (bs[i], tc0[i] as i32);
         if b <= 0 || (p0 - q0).abs() >= alpha || (p1 - p0).abs() >= beta || (q1 - q0).abs() >= beta
         {
@@ -244,31 +245,31 @@ pub fn deblock_luma_lines(
         if b == 4 {
             let gap = (p0 - q0).abs() < (alpha >> 2) + 2;
             if gap && ap {
-                s[3][i] = ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3) as u8;
-                s[2][i] = ((p2 + p1 + p0 + q0 + 2) >> 2) as u8;
-                s[1][i] = ((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3) as u8;
+                s[3][i] = P::from_i32((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+                s[2][i] = P::from_i32((p2 + p1 + p0 + q0 + 2) >> 2);
+                s[1][i] = P::from_i32((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
             } else {
-                s[3][i] = ((2 * p1 + p0 + q1 + 2) >> 2) as u8;
+                s[3][i] = P::from_i32((2 * p1 + p0 + q1 + 2) >> 2);
             }
             if gap && aq {
-                s[4][i] = ((q2 + 2 * q1 + 2 * q0 + 2 * p0 + p1 + 4) >> 3) as u8;
-                s[5][i] = ((q2 + q1 + q0 + p0 + 2) >> 2) as u8;
-                s[6][i] = ((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3) as u8;
+                s[4][i] = P::from_i32((q2 + 2 * q1 + 2 * q0 + 2 * p0 + p1 + 4) >> 3);
+                s[5][i] = P::from_i32((q2 + q1 + q0 + p0 + 2) >> 2);
+                s[6][i] = P::from_i32((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3);
             } else {
-                s[4][i] = ((2 * q1 + q0 + p1 + 2) >> 2) as u8;
+                s[4][i] = P::from_i32((2 * q1 + q0 + p1 + 2) >> 2);
             }
         } else {
             let tc = t0 + ap as i32 + aq as i32;
             let avg = (p0 + q0 + 1) >> 1;
             if ap {
-                s[2][i] = (p1 + (((p2 + avg) >> 1) - p1).clamp(-t0, t0)) as u8;
+                s[2][i] = P::from_i32(p1 + (((p2 + avg) >> 1) - p1).clamp(-t0, t0));
             }
             if aq {
-                s[5][i] = (q1 + (((q2 + avg) >> 1) - q1).clamp(-t0, t0)) as u8;
+                s[5][i] = P::from_i32(q1 + (((q2 + avg) >> 1) - q1).clamp(-t0, t0));
             }
             let delta = ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
-            s[3][i] = (p0 + delta).clamp(0, 255) as u8;
-            s[4][i] = (q0 - delta).clamp(0, 255) as u8;
+            s[3][i] = P::clip(p0 + delta);
+            s[4][i] = P::clip(q0 - delta);
         }
     }
 }
@@ -277,8 +278,8 @@ pub fn deblock_luma_lines(
 /// p0 and q0 change. Lines as in `deblock_luma_lines` (p3 and q3 unused);
 /// bS 4 is the strong filter, else tC = tC0 + 1.
 #[allow(clippy::needless_range_loop)]
-pub fn deblock_chroma_lines(
-    s: &mut [[u8; 16]; 8],
+pub fn deblock_chroma_lines<P: Pixel>(
+    s: &mut [[P; 16]; 8],
     bs: &[i8; 16],
     tc0: &[i8; 16],
     alpha: i32,
@@ -286,10 +287,10 @@ pub fn deblock_chroma_lines(
 ) {
     for i in 0..16 {
         let (p1, p0, q0, q1) = (
-            s[2][i] as i32,
-            s[3][i] as i32,
-            s[4][i] as i32,
-            s[5][i] as i32,
+            s[2][i].to_i32(),
+            s[3][i].to_i32(),
+            s[4][i].to_i32(),
+            s[5][i].to_i32(),
         );
         if bs[i] <= 0
             || (p0 - q0).abs() >= alpha
@@ -299,13 +300,13 @@ pub fn deblock_chroma_lines(
             continue;
         }
         if bs[i] == 4 {
-            s[3][i] = ((2 * p1 + p0 + q1 + 2) >> 2) as u8;
-            s[4][i] = ((2 * q1 + q0 + p1 + 2) >> 2) as u8;
+            s[3][i] = P::from_i32((2 * p1 + p0 + q1 + 2) >> 2);
+            s[4][i] = P::from_i32((2 * q1 + q0 + p1 + 2) >> 2);
         } else {
             let tc = tc0[i] as i32 + 1;
             let delta = ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
-            s[3][i] = (p0 + delta).clamp(0, 255) as u8;
-            s[4][i] = (q0 - delta).clamp(0, 255) as u8;
+            s[3][i] = P::clip(p0 + delta);
+            s[4][i] = P::clip(q0 - delta);
         }
     }
 }
@@ -314,12 +315,11 @@ pub fn deblock_chroma_lines(
 /// lanes: `s[k][i]` is sample k of line i (the samples across a vertical
 /// edge, x - 4 .. x + 4, of 16 rows).
 #[allow(clippy::needless_range_loop)]
-pub fn load_edge_lines_v(plane: &[u8], base: usize, stride: usize) -> [[u8; 16]; 8] {
-    let mut s = [[0u8; 16]; 8];
+pub fn load_edge_lines_v<P: Pixel>(plane: &[u8], base: usize, stride: usize) -> [[P; 16]; 8] {
+    let mut s = [[P::default(); 16]; 8];
     for i in 0..16 {
-        let row = &plane[base + i * stride..base + i * stride + 8];
         for k in 0..8 {
-            s[k][i] = row[k];
+            s[k][i] = P::load(plane, base + i * stride + k);
         }
     }
     s
@@ -327,11 +327,15 @@ pub fn load_edge_lines_v(plane: &[u8], base: usize, stride: usize) -> [[u8; 16];
 
 /// Store lanes back as `load_edge_lines_v` read them.
 #[allow(clippy::needless_range_loop)]
-pub fn store_edge_lines_v(plane: &mut [u8], base: usize, stride: usize, s: &[[u8; 16]; 8]) {
+pub fn store_edge_lines_v<P: Pixel>(
+    plane: &mut [u8],
+    base: usize,
+    stride: usize,
+    s: &[[P; 16]; 8],
+) {
     for i in 0..16 {
-        let row = &mut plane[base + i * stride..base + i * stride + 8];
         for k in 0..8 {
-            row[k] = s[k][i];
+            P::store(plane, base + i * stride + k, s[k][i]);
         }
     }
 }

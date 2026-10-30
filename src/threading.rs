@@ -280,6 +280,11 @@ impl ThreadedDecoder {
                 PictureStructure::Frame
             },
             chroma_422: first.sps.chroma_format_idc == 2,
+            sample_bytes: if first.sps.bit_depth_luma_minus8 > 0 {
+                2
+            } else {
+                1
+            },
         };
         let (pic, writer) = DecodedPicture::new_in_progress(meta);
         apply_reference_marking(
@@ -567,6 +572,7 @@ mod tests {
             is_intra: false,
             structure: PictureStructure::Frame,
             chroma_422: false,
+            sample_bytes: 1,
         };
         let (pic, mut writer) = DecodedPicture::new_in_progress(meta);
         assert!(pic.luma().is_empty());
@@ -601,7 +607,7 @@ mod tests {
     fn threaded_rejects_unsupported_formats() {
         for name in [
             "unsupported_444",
-            "unsupported_420_10bit",
+            "unsupported_420_9bit",
             "unsupported_lossless",
         ] {
             let path = format!("{}/testdata/{}.h264", env!("CARGO_MANIFEST_DIR"), name);

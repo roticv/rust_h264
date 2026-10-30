@@ -4,6 +4,7 @@
 //! reference frames at quarter-pel (luma) or eighth-pel (chroma) precision.
 
 use crate::dpb::{ChromaRef, DecodedPicture};
+use crate::pixel::Pixel;
 
 /// Luma samples available to the clamped (per-pixel) interpolation paths:
 /// the published rows of a reference picture, or a temporary field copy.
@@ -682,6 +683,235 @@ pub fn weighted_bi_implicit(pred_l0: &[u8], pred_l1: &[u8], output: &mut [u8], w
     crate::simd::weighted_bi_implicit(pred_l0, pred_l1, output, w0, w1);
 }
 
+/// Luma motion compensation for any sample type (spec 8.4.2.2.1): the
+/// scalar path for high bit depths (8-bit uses [`luma_mc_stride`]). The
+/// (w + 5) x (h + 5) reference window is read once, with coordinates clamped
+/// to the picture, and the half-sample planes are filtered from it.
+/// Arguments as for [`luma_mc_stride`], in samples.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn luma_mc_px<P: Pixel>(
+    ref_pic: &DecodedPicture,
+    x: i32,
+    y: i32,
+    dx: i32,
+    dy: i32,
+    block_w: usize,
+    block_h: usize,
+    output: &mut [P],
+    ref_stride: usize,
+    ref_y_offset: usize,
+) {
+    // Window stride: up to 16 + 5 samples
+    const WN: usize = 21;
+    if block_w == 0 || block_h == 0 || block_w > 16 || block_h > 16 {
+        return;
+    }
+    if block_w * block_h > output.len() {
+        return;
+    }
+    let (fx, fy) = (dx & 3, dy & 3);
+    let (xi, yi) = (x + (dx >> 2), y + (dy >> 2));
+    let pic_w = ref_pic.width as i32;
+    let pic_h = if ref_stride == ref_pic.width as usize {
+        ref_pic.height as i32
+    } else {
+        (ref_pic.height / 2) as i32
+    };
+    let last_row = (yi + block_h as i32 + 3).clamp(0, (pic_h - 1).max(0)) as usize;
+    ref_pic.wait_luma((ref_y_offset + (last_row + 1) * ref_stride) * P::BYTES);
+    let plane = ref_pic.luma();
+    let (ww, wh) = (block_w + 5, block_h + 5);
+    // win[r * WN + c] = sample (xi - 2 + c, yi - 2 + r)
+    let mut win = [0i32; WN * WN];
+    let (x0, y0) = (xi - 2, yi - 2);
+    let inside = x0 >= 0 && y0 >= 0 && x0 + ww as i32 <= pic_w && y0 + wh as i32 <= pic_h;
+    let end = ref_y_offset
+        + (y0 + wh as i32 - 1).max(0) as usize * ref_stride
+        + (x0 + ww as i32).max(0) as usize;
+    if inside && end * P::BYTES <= plane.len() {
+        let mut row = [P::default(); WN];
+        for r in 0..wh {
+            let o = ref_y_offset + (y0 as usize + r) * ref_stride + x0 as usize;
+            P::load_row(plane, o, &mut row[..ww]);
+            for c in 0..ww {
+                win[r * WN + c] = row[c].to_i32();
+            }
+        }
+    } else {
+        for r in 0..wh {
+            let yy = (y0 + r as i32).clamp(0, pic_h - 1) as usize;
+            for c in 0..ww {
+                let xx = (x0 + c as i32).clamp(0, pic_w - 1) as usize;
+                let i = ref_y_offset + yy * ref_stride + xx;
+                win[r * WN + c] = if (i + 1) * P::BYTES <= plane.len() {
+                    P::load(plane, i).to_i32()
+                } else {
+                    0
+                };
+            }
+        }
+    }
+    let tap =
+        |a: i32, b: i32, c: i32, d: i32, e: i32, f: i32| a - 5 * b + 20 * c + 20 * d - 5 * e + f;
+    let clip = |v: i32| v.clamp(0, P::MAX);
+    let avg = |a: i32, b: i32| (a + b + 1) >> 1;
+    // Full sample at block position (c, r), c and r may be one past the block
+    let g = |c: usize, r: usize| win[(r + 2) * WN + c + 2];
+    // Unrounded horizontal half-sample sums, for every window row
+    let mut h1 = [0i32; WN * 16];
+    if fx != 0 {
+        for r in 0..wh {
+            let w = &win[r * WN..];
+            for c in 0..block_w {
+                h1[r * 16 + c] = tap(w[c], w[c + 1], w[c + 2], w[c + 3], w[c + 4], w[c + 5]);
+            }
+        }
+    }
+    // Rounded vertical half samples h, one column past the block
+    let mut hv = [0i32; 16 * 17];
+    if fy != 0 && fx != 2 {
+        for r in 0..block_h {
+            for c in 0..=block_w {
+                let k = |rr: usize| win[(r + rr) * WN + c + 2];
+                hv[r * 17 + c] = clip((tap(k(0), k(1), k(2), k(3), k(4), k(5)) + 16) >> 5);
+            }
+        }
+    }
+    // b (rounded) at (c, r), r up to block_h
+    let b = |c: usize, r: usize| clip((h1[(r + 2) * 16 + c] + 16) >> 5);
+    let h = |c: usize, r: usize| hv[r * 17 + c];
+    let j = |c: usize, r: usize| {
+        let k = |rr: usize| h1[(r + rr) * 16 + c];
+        clip((tap(k(0), k(1), k(2), k(3), k(4), k(5)) + 512) >> 10)
+    };
+    for r in 0..block_h {
+        let out = &mut output[r * block_w..(r + 1) * block_w];
+        for (c, o) in out.iter_mut().enumerate() {
+            // Table 8-12: G, a b c / d e f g / h i j k / n p q r
+            let v = match (fx, fy) {
+                (0, 0) => g(c, r),
+                (1, 0) => avg(g(c, r), b(c, r)),
+                (2, 0) => b(c, r),
+                (3, 0) => avg(g(c + 1, r), b(c, r)),
+                (0, 1) => avg(g(c, r), h(c, r)),
+                (0, 2) => h(c, r),
+                (0, 3) => avg(g(c, r + 1), h(c, r)),
+                (1, 1) => avg(b(c, r), h(c, r)),
+                (3, 1) => avg(b(c, r), h(c + 1, r)),
+                (1, 3) => avg(h(c, r), b(c, r + 1)),
+                (3, 3) => avg(h(c + 1, r), b(c, r + 1)),
+                (2, 1) => avg(b(c, r), j(c, r)),
+                (2, 3) => avg(j(c, r), b(c, r + 1)),
+                (1, 2) => avg(h(c, r), j(c, r)),
+                (3, 2) => avg(j(c, r), h(c + 1, r)),
+                _ => j(c, r),
+            };
+            *o = P::from_i32(v);
+        }
+    }
+}
+
+/// Chroma motion compensation for any sample type (spec 8.4.2.2.2), sample
+/// by sample with clamped coordinates: the scalar path for high bit
+/// depths. Arguments as for [`chroma_mc`], in samples.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn chroma_mc_px<P: Pixel>(
+    ref_plane: ChromaRef<'_>,
+    ref_width: usize,
+    ref_height: usize,
+    x: i32,
+    y: i32,
+    dx: i32,
+    dy: i32,
+    block_w: usize,
+    block_h: usize,
+    output: &mut [P],
+) {
+    let ChromaRef { pic, plane, offset } = ref_plane;
+    if ref_width == 0 || block_w == 0 || block_h == 0 || block_w * block_h > output.len() {
+        return;
+    }
+    let pic_width = (pic.width / 2) as usize;
+    // Rows present from `offset` (an MBAFF bottom field's last row ends
+    // short of a full stride), as chroma_mc
+    let len = pic.chroma_len() / P::BYTES;
+    let avail_rows = (len.saturating_sub(offset) + ref_width.saturating_sub(pic_width)) / ref_width;
+    let eff_h = ref_height.min(avail_rows).max(1) as i32;
+    let (fx, fy) = (dx & 7, dy & 7);
+    let (xi, yi) = (x + (dx >> 3), y + (dy >> 3));
+    let last_row = (yi + block_h as i32 + 2).clamp(0, eff_h - 1) as usize;
+    pic.wait_chroma((offset + (last_row + 1) * ref_width) * P::BYTES);
+    let data = pic.chroma(plane);
+    let g = |xx: i32, yy: i32| -> i32 {
+        let xx = xx.clamp(0, pic_width as i32 - 1) as usize;
+        let yy = yy.clamp(0, eff_h - 1) as usize;
+        let i = offset + yy * ref_width + xx;
+        if (i + 1) * P::BYTES <= data.len() {
+            P::load(data, i).to_i32()
+        } else {
+            0
+        }
+    };
+    let (w00, w01, w10, w11) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
+    for r in 0..block_h {
+        for c in 0..block_w {
+            let (x, y) = (xi + c as i32, yi + r as i32);
+            let v = w00 * g(x, y) + w01 * g(x + 1, y) + w10 * g(x, y + 1) + w11 * g(x + 1, y + 1);
+            output[r * block_w + c] = P::from_i32((v + 32) >> 6);
+        }
+    }
+}
+
+/// Weighted prediction for any sample type (spec 8.4.2.3): `o` offsets are
+/// as coded and scaled by 1 << (BitDepth - 8) here.
+pub(crate) fn weighted_uni_px<P: Pixel>(pred: &mut [P], log2_denom: u32, weight: i32, offset: i32) {
+    let o = offset << (P::BIT_DEPTH - 8);
+    for p in pred.iter_mut() {
+        let v = p.to_i32() * weight;
+        let v = if log2_denom >= 1 {
+            ((v + (1 << (log2_denom - 1))) >> log2_denom) + o
+        } else {
+            v + o
+        };
+        *p = P::clip(v);
+    }
+}
+
+/// Explicit weighted bi-prediction for any sample type (spec 8.4.2.3).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn weighted_bi_px<P: Pixel>(
+    a: &[P],
+    b: &[P],
+    out: &mut [P],
+    log2_denom: u32,
+    w0: i32,
+    o0: i32,
+    w1: i32,
+    o1: i32,
+) {
+    let shift = P::BIT_DEPTH - 8;
+    let o = ((o0 << shift) + (o1 << shift) + 1) >> 1;
+    for (r, (&p, &q)) in out.iter_mut().zip(a.iter().zip(b)) {
+        let v = (p.to_i32() * w0 + q.to_i32() * w1 + (1 << log2_denom)) >> (log2_denom + 1);
+        *r = P::clip(v + o);
+    }
+}
+
+/// Implicit weighted bi-prediction for any sample type (logWD 5, no
+/// offsets).
+pub(crate) fn weighted_bi_implicit_px<P: Pixel>(a: &[P], b: &[P], out: &mut [P], w0: i32, w1: i32) {
+    for (r, (&p, &q)) in out.iter_mut().zip(a.iter().zip(b)) {
+        *r = P::clip((p.to_i32() * w0 + q.to_i32() * w1 + 32) >> 6);
+    }
+}
+
+/// Bi-prediction average for any sample type.
+pub(crate) fn bi_pred_avg_px<P: Pixel>(a: &[P], b: &[P], out: &mut [P]) {
+    for (r, (&p, &q)) in out.iter_mut().zip(a.iter().zip(b)) {
+        *r = P::from_i32((p.to_i32() + q.to_i32() + 1) >> 1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,6 +931,7 @@ mod tests {
                 is_intra: false,
                 structure: crate::dpb::PictureStructure::Frame,
                 chroma_422: false,
+                sample_bytes: 1,
             },
             y_data,
             vec![128; uv_size],

@@ -49,7 +49,6 @@ pub(crate) struct SliceParams<'a> {
     pub cabac_init_idc: u32,
 }
 use crate::dpb::{DecodedPicture, PictureStructure};
-use crate::inter_pred;
 use crate::intra_pred::{
     predict_chroma, predict_intra_16x16, predict_intra_4x4, predict_intra_8x8,
 };
@@ -57,6 +56,7 @@ use crate::mv_pred::{
     apply_spatial_direct_col_zero, derive_spatial_direct_base, derive_spatial_direct_blk,
     derive_temporal_direct_blk, predict_mv_skip, ref_pic_safe, MbaffCtx, WeightContext,
 };
+use crate::pixel::Pixel;
 use crate::residual::BLOCK_INDEX_TO_OFFSET;
 
 /// Mutable per-slice state passed to MB decode routines.
@@ -64,7 +64,9 @@ use crate::residual::BLOCK_INDEX_TO_OFFSET;
 /// All mutable MB-level arrays live here so that individual decode
 /// functions can be extracted as methods on `&mut SliceContext`.
 #[allow(dead_code)] // Fields progressively used as methods are extracted from decode_slice
-pub(crate) struct SliceContext<'a> {
+pub(crate) struct SliceContext<'a, P: Pixel = u8> {
+    /// Sample type: planes hold `P::BYTES` bytes per sample
+    pub _pixel: core::marker::PhantomData<P>,
     // Pixel output
     pub frame: &'a mut Frame,
     pub stride: usize,
@@ -180,7 +182,57 @@ pub(crate) fn chroma_mv_offset_impl(
 
 use crate::deblock::MbType;
 
-impl SliceContext<'_> {
+impl<P: Pixel> SliceContext<'_, P> {
+    /// I_PCM samples (spec 7.3.5): 256 luma, then the Cb and Cr samples
+    /// of the MB, each from `next` (BitDepth bits as coded); monochrome
+    /// chroma is mid-grey and not coded. Fails if `next` runs out.
+    pub(crate) fn write_pcm_samples(
+        &mut self,
+        mut next: impl FnMut() -> Option<i32>,
+        mb_x: usize,
+        monochrome: bool,
+    ) -> Result<(), crate::error::DecodeError> {
+        for r in 0..16 {
+            for c in 0..16 {
+                let v = next().ok_or(crate::error::DecodeError::UnexpectedEof)?;
+                let idx = self.ly_offset + r * self.ly_stride + mb_x + c;
+                if (idx + 1) * P::BYTES <= self.frame.y.len() {
+                    P::store(&mut self.frame.y, idx, P::clip(v));
+                }
+            }
+        }
+        let (cx, ch) = (mb_x / 2, 16 >> self.chroma_shift_y());
+        for plane in 0..2 {
+            for r in 0..ch {
+                for c in 0..8 {
+                    let v = if monochrome {
+                        P::MID
+                    } else {
+                        next().ok_or(crate::error::DecodeError::UnexpectedEof)?
+                    };
+                    let idx = self.lc_offset + r * self.lc_stride + cx + c;
+                    let dst = if plane == 0 {
+                        &mut self.frame.u
+                    } else {
+                        &mut self.frame.v
+                    };
+                    if (idx + 1) * P::BYTES <= dst.len() {
+                        P::store(dst, idx, P::clip(v));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// QP_Y of the current MB from the previous MB's and mb_qp_delta
+    /// (spec 7.4.5): wraps within -QpBdOffsetY..=51.
+    #[inline]
+    pub(crate) fn next_qp(&self, delta: i32) -> i32 {
+        let o = P::QP_BD_OFFSET;
+        (self.prev_mb_qp + delta + 52 + 2 * o).rem_euclid(52 + o) - o
+    }
+
     /// log2 of the luma rows per chroma row: 1 for 4:2:0, 0 for 4:2:2.
     #[inline]
     pub(crate) fn chroma_shift_y(&self) -> usize {
@@ -532,8 +584,8 @@ impl SliceContext<'_> {
             let (mc_y, ref_stride, ref_y_off, _, _, _) =
                 self.mc_params(mb_idx, mb_y, ref_pic.width as usize, 0i8);
             // Luma MC
-            let mut luma_pred = [0u8; 256];
-            inter_pred::luma_mc_stride(
+            let mut luma_pred = [P::default(); 256];
+            P::luma_mc(
                 ref_pic,
                 mb_x as i32,
                 mc_y,
@@ -550,7 +602,7 @@ impl SliceContext<'_> {
             }
             for (r, row) in luma_pred.as_chunks::<16>().0.iter().enumerate() {
                 let o = self.ly_offset + r * self.ly_stride + mb_x;
-                self.frame.y[o..o + 16].copy_from_slice(row);
+                P::store_row(&mut self.frame.y, o, row);
             }
             self.predict_chroma_part(
                 mb_idx,
@@ -817,16 +869,16 @@ impl SliceContext<'_> {
             None
         };
 
-        let mut luma_pred = [0u8; 256];
+        let mut luma_pred = [P::default(); 256];
         match (ref_l0, ref_l1) {
             (Some(ref0), Some(ref1)) => {
-                let mut p0 = [0u8; 256];
-                let mut p1 = [0u8; 256];
+                let mut p0 = [P::default(); 256];
+                let mut p1 = [P::default(); 256];
                 let (mc_y_l0, ref_stride_l0, ref_y_off_l0, _, _, _) =
                     self.mc_params(mb_idx, mb_y, ref0.width as usize, r0);
                 let (mc_y_l1, ref_stride_l1, ref_y_off_l1, _, _, _) =
                     self.mc_params(mb_idx, mb_y, ref1.width as usize, r1);
-                inter_pred::luma_mc_stride(
+                P::luma_mc(
                     ref0,
                     mb_x as i32,
                     mc_y_l0,
@@ -838,7 +890,7 @@ impl SliceContext<'_> {
                     ref_stride_l0,
                     ref_y_off_l0,
                 );
-                inter_pred::luma_mc_stride(
+                P::luma_mc(
                     ref1,
                     mb_x as i32,
                     mc_y_l1,
@@ -857,7 +909,7 @@ impl SliceContext<'_> {
             (Some(ref0), None) => {
                 let (mc_y, ref_stride, ref_y_off, _, _, _) =
                     self.mc_params(mb_idx, mb_y, ref0.width as usize, r0);
-                inter_pred::luma_mc_stride(
+                P::luma_mc(
                     ref0,
                     mb_x as i32,
                     mc_y,
@@ -878,7 +930,7 @@ impl SliceContext<'_> {
             (None, Some(ref1)) => {
                 let (mc_y, ref_stride, ref_y_off, _, _, _) =
                     self.mc_params(mb_idx, mb_y, ref1.width as usize, r1);
-                inter_pred::luma_mc_stride(
+                P::luma_mc(
                     ref1,
                     mb_x as i32,
                     mc_y,
@@ -900,7 +952,7 @@ impl SliceContext<'_> {
         }
         for (r, row) in luma_pred.as_chunks::<16>().0.iter().enumerate() {
             let o = self.ly_offset + r * self.ly_stride + mb_x;
-            self.frame.y[o..o + 16].copy_from_slice(row);
+            P::store_row(&mut self.frame.y, o, row);
         }
 
         self.predict_chroma_part(
@@ -979,15 +1031,15 @@ impl SliceContext<'_> {
             let (mv0, mv1) = (self.mv_store_l0[i], self.mv_store_l1[i]);
             let (r0, r1) = (self.ref_idx_store_l0[i], self.ref_idx_store_l1[i]);
             let n = pw * ph;
-            let mut pred = [0u8; 64];
+            let mut pred = [P::default(); 64];
             let mc =
-                |ctx: &Self, list: &[Arc<DecodedPicture>], r: i8, mv: [i16; 2], out: &mut [u8]| {
+                |ctx: &Self, list: &[Arc<DecodedPicture>], r: i8, mv: [i16; 2], out: &mut [P]| {
                     let Some(pic) = ref_pic_safe(list, ctx.frame_ref_idx(mb_idx, r)) else {
                         return false;
                     };
                     let (mc_y, ref_stride, ref_y_off, _, _, _) =
                         ctx.mc_params(mb_idx, mb_y, pic.width as usize, r);
-                    inter_pred::luma_mc_stride(
+                    P::luma_mc(
                         pic,
                         (mb_x + px) as i32,
                         mc_y + py as i32,
@@ -1002,8 +1054,8 @@ impl SliceContext<'_> {
                     true
                 };
             if r0 >= 0 && r1 >= 0 {
-                let mut p0 = [0u8; 64];
-                let mut p1 = [0u8; 64];
+                let mut p0 = [P::default(); 64];
+                let mut p1 = [P::default(); 64];
                 if !mc(self, ref_pic_list_l0, r0, mv0, &mut p0[..n])
                     || !mc(self, ref_pic_list_l1, r1, mv1, &mut p1[..n])
                 {
@@ -1035,7 +1087,7 @@ impl SliceContext<'_> {
             }
             for r in 0..ph {
                 let o = self.ly_offset + (py + r) * self.ly_stride + mb_x + px;
-                inter_pred::copy_row(&mut self.frame.y[o..o + pw], &pred[r * pw..(r + 1) * pw]);
+                P::store_row(&mut self.frame.y, o, &pred[r * pw..(r + 1) * pw]);
             }
         }
 
@@ -1150,11 +1202,11 @@ impl SliceContext<'_> {
         // Above samples (16: 8 above + 8 above-right)
         let above_base = self.ly_offset + row_off * self.ly_stride;
         let above_avail = above_base >= self.ly_stride && (row_off > 0 || above_mb_avail);
-        let above_buf: Option<[u8; 16]> = if above_avail {
-            let mut buf = [0u8; 16];
+        let above_buf: Option<[P; 16]> = if above_avail {
+            let mut buf = [P::default(); 16];
             let above_row = above_base - self.ly_stride;
             for (i, b) in buf.iter_mut().enumerate().take(8) {
-                *b = self.frame.y[above_row + px + i];
+                *b = P::load(&self.frame.y, above_row + px + i);
             }
             let has_tr = if row_off == 0 {
                 if px + 8 < (mb_x + 16).min(self.stride) {
@@ -1170,7 +1222,7 @@ impl SliceContext<'_> {
             if has_tr {
                 for i in 0..8 {
                     let col = (px + 8 + i).min(self.stride - 1);
-                    buf[8 + i] = self.frame.y[above_row + col];
+                    buf[8 + i] = P::load(&self.frame.y, above_row + col);
                 }
             } else {
                 let last = buf[7];
@@ -1183,10 +1235,13 @@ impl SliceContext<'_> {
 
         // Left samples
         let left_avail = px > 0 && (col_off > 0 || left_mb_avail[row_off / 8]);
-        let left_buf: Option<[u8; 8]> = if left_avail {
-            let mut buf = [0u8; 8];
+        let left_buf: Option<[P; 8]> = if left_avail {
+            let mut buf = [P::default(); 8];
             for (i, b) in buf.iter_mut().enumerate() {
-                *b = self.frame.y[self.ly_offset + (row_off + i) * self.ly_stride + px - 1];
+                *b = P::load(
+                    &self.frame.y,
+                    self.ly_offset + (row_off + i) * self.ly_stride + px - 1,
+                );
             }
             Some(buf)
         } else {
@@ -1201,7 +1256,7 @@ impl SliceContext<'_> {
                 || (row_off == 0 && col_off > 0 && above_mb_avail)
                 || (row_off == 0 && col_off == 0 && above_left_mb_avail));
         let above_left_val = if al_avail {
-            Some(self.frame.y[above_base - self.ly_stride + px - 1])
+            Some(P::load(&self.frame.y, above_base - self.ly_stride + px - 1))
         } else {
             None
         };
@@ -1209,7 +1264,7 @@ impl SliceContext<'_> {
         let has_topright = above_buf.is_some()
             && ((row_off == 0 && px + 8 < self.stride) || (row_off > 0 && col_off == 0));
 
-        let mut pred = [0u8; 64];
+        let mut pred = [P::default(); 64];
         predict_intra_8x8(
             pred_mode,
             above_buf.as_ref().map(|b| &b[..]),
@@ -1251,11 +1306,11 @@ impl SliceContext<'_> {
         // Above samples
         let above_base = self.ly_offset + local_row * self.ly_stride;
         let above_avail = above_base >= self.ly_stride && (local_row > 0 || above_mb_avail);
-        let above_buf: Option<[u8; 8]> = if above_avail {
-            let mut buf = [0u8; 8];
+        let above_buf: Option<[P; 8]> = if above_avail {
+            let mut buf = [P::default(); 8];
             let above_row = above_base - self.ly_stride;
             for (i, b) in buf.iter_mut().enumerate().take(4) {
-                *b = self.frame.y[above_row + px + i];
+                *b = P::load(&self.frame.y, above_row + px + i);
             }
             let topright_avail = if local_row == 0 {
                 if px + 4 < (mb_x + 16).min(self.stride) {
@@ -1271,7 +1326,7 @@ impl SliceContext<'_> {
             if topright_avail {
                 for (i, b) in buf.iter_mut().enumerate().skip(4) {
                     let col = (px + i).min(self.stride - 1);
-                    *b = self.frame.y[above_row + col];
+                    *b = P::load(&self.frame.y, above_row + col);
                 }
             } else {
                 let last = buf[3];
@@ -1284,10 +1339,13 @@ impl SliceContext<'_> {
 
         // Left samples
         let left_avail = px > 0 && (local_col > 0 || left_mb_avail[local_row / 8]);
-        let left_buf: Option<[u8; 4]> = if left_avail {
-            let mut buf = [0u8; 4];
+        let left_buf: Option<[P; 4]> = if left_avail {
+            let mut buf = [P::default(); 4];
             for (i, b) in buf.iter_mut().enumerate() {
-                *b = self.frame.y[self.ly_offset + (local_row + i) * self.ly_stride + px - 1];
+                *b = P::load(
+                    &self.frame.y,
+                    self.ly_offset + (local_row + i) * self.ly_stride + px - 1,
+                );
             }
             Some(buf)
         } else {
@@ -1302,13 +1360,13 @@ impl SliceContext<'_> {
                 || (local_row == 0 && local_col > 0 && above_mb_avail)
                 || (local_row == 0 && local_col == 0 && above_left_mb_avail));
         let above_left_val = if al_avail {
-            Some(self.frame.y[above_base - self.ly_stride + px - 1])
+            Some(P::load(&self.frame.y, above_base - self.ly_stride + px - 1))
         } else {
             None
         };
 
         // Predict + add residual + write
-        let mut pred = [0u8; 16];
+        let mut pred = [P::default(); 16];
         predict_intra_4x4(
             pred_mode,
             above_buf.as_ref().map(|b| &b[..]),
@@ -1338,34 +1396,32 @@ impl SliceContext<'_> {
         left_avail: bool,
         above_left_avail: bool,
     ) {
-        let above: Option<Vec<u8>> = if self.ly_offset >= self.ly_stride && above_avail {
-            Some(
-                (0..16)
-                    .map(|x| self.frame.y[self.ly_offset - self.ly_stride + mb_x + x])
-                    .collect(),
-            )
-        } else {
-            None
-        };
-        let left: Option<Vec<u8>> = if mb_x > 0 && left_avail {
-            Some(
-                (0..16)
-                    .map(|y| self.frame.y[self.ly_offset + y * self.ly_stride + mb_x - 1])
-                    .collect(),
-            )
-        } else {
-            None
-        };
+        let above: Option<[P; 16]> = (self.ly_offset >= self.ly_stride && above_avail).then(|| {
+            core::array::from_fn(|x| {
+                P::load(&self.frame.y, self.ly_offset - self.ly_stride + mb_x + x)
+            })
+        });
+        let left: Option<[P; 16]> = (mb_x > 0 && left_avail).then(|| {
+            core::array::from_fn(|y| {
+                P::load(
+                    &self.frame.y,
+                    self.ly_offset + y * self.ly_stride + mb_x - 1,
+                )
+            })
+        });
         let above_left = if mb_x > 0 && self.ly_offset >= self.ly_stride && above_left_avail {
-            Some(self.frame.y[self.ly_offset - self.ly_stride + mb_x - 1])
+            Some(P::load(
+                &self.frame.y,
+                self.ly_offset - self.ly_stride + mb_x - 1,
+            ))
         } else {
             None
         };
-        let mut luma_pred = [0u8; 256];
+        let mut luma_pred = [P::default(); 256];
         predict_intra_16x16(
             pred_mode,
-            above.as_deref(),
-            left.as_deref(),
+            above.as_ref().map(|v| &v[..]),
+            left.as_ref().map(|v| &v[..]),
             above_left,
             &mut luma_pred,
         );
@@ -1402,20 +1458,20 @@ impl SliceContext<'_> {
                 &mut self.frame.v
             };
             let above = (base >= stride && above_avail).then(|| {
-                let mut a = [0u8; 8];
-                a.copy_from_slice(&buf[base - stride + cx..base - stride + cx + 8]);
+                let mut a = [P::default(); 8];
+                P::load_row(buf, base - stride + cx, &mut a);
                 a
             });
             let left = (cx > 0 && (left_avail[0] || left_avail[1])).then(|| {
-                let mut l = [0u8; 16];
+                let mut l = [P::default(); 16];
                 for (r, v) in l.iter_mut().enumerate().take(h) {
-                    *v = buf[base + r * stride + cx - 1];
+                    *v = P::load(buf, base + r * stride + cx - 1);
                 }
                 l
             });
-            let above_left =
-                (cx > 0 && base >= stride && above_left_avail).then(|| buf[base - stride + cx - 1]);
-            let mut pred = [0u8; 128];
+            let above_left = (cx > 0 && base >= stride && above_left_avail)
+                .then(|| P::load(buf, base - stride + cx - 1));
+            let mut pred = [P::default(); 128];
             predict_chroma(
                 intra_chroma_pred_mode,
                 above.as_ref().map(|a| &a[..]),
@@ -1427,7 +1483,7 @@ impl SliceContext<'_> {
             );
             for r in 0..h {
                 let o = base + r * stride + cx;
-                buf[o..o + 8].copy_from_slice(&pred[r * 8..r * 8 + 8]);
+                P::store_row(buf, o, &pred[r * 8..r * 8 + 8]);
             }
         }
     }

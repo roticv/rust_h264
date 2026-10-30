@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **10-bit streams** (High 10 and High 4:2:2 profiles, 4:2:0, 4:2:2 and
+  monochrome, progressive and interlaced) now decode instead of being
+  rejected. `Frame` has a new `bit_depth` field (8 or 10; code that builds
+  `Frame` values must set it): at 10 bits `y`/`u`/`v` hold 2 bytes per
+  sample, little-endian, the layout of FFmpeg's `yuv420p10le` /
+  `yuv422p10le`; `bytes_per_sample()` and `sample()` read either. The decoder
+  is generic over the sample type and compiled once per depth, so 8-bit
+  decoding runs the same code and SIMD kernels as before. All 13 10-bit JVT
+  conformance vectors pass, for 199 of 204 in all, the same as FFmpeg; the
+  other 5 use slice groups (FMO) or SP/SI slices.
 - **4:2:2 streams** (High 4:2:2 profile, 8-bit) now decode instead of being
   rejected, progressive and interlaced (MBAFF and field pictures).
   `Frame` has a new `chroma_format` field (`ChromaFormat::Yuv420` or
@@ -22,10 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tools/conformance/run.sh` runs the JVT conformance suites (JVT-AVC_V1,
   JVT-FR-EXT) through Fluster with a new `conformance_decode` example, and
   fails on any result other than the expected unsupported-format vectors.
-  Every 8-bit 4:2:0, 4:2:2 and monochrome vector passes: 186 of 204 (up
-  from 81 before this release's conformance fixes). The other 18 are
-  10-bit, slice groups (FMO) and SP/SI slices, all rejected with
-  `DecodeError::Unsupported`.
+  Every 8- and 10-bit 4:2:0, 4:2:2 and monochrome vector passes: 199 of
+  204 (up from 81 before this release's conformance fixes). The other 5 use
+  slice groups (FMO) or SP/SI slices.
 
 ### Fixed
 - **MBAFF streams from x264 (`--interlaced`)**, which failed with "invalid
@@ -101,11 +110,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picture through the last slice's reference list.
 
 ### Changed
-- **`Frame` has a new public field, `chroma_format`** (see 4:2:2 above), so
-  code that constructs `Frame` values must set it.
+- **`Frame` has new public fields, `chroma_format` and `bit_depth`** (see
+  4:2:2 and 10-bit above), so code that constructs `Frame` values must set
+  them.
 - Monochrome and 4:2:2 streams are no longer rejected with
-  `DecodeError::Unsupported`; 4:4:4, bit depths above 8 and lossless still
-  are.
+  `DecodeError::Unsupported`, nor are 10-bit streams; 4:4:4, other bit
+  depths (9, 12 and up, or chroma at a different depth from luma) and
+  lossless still are.
 - `bench_decode` times parsing and decoding only. It used to include
   hashing the output, about as long as decoding itself on the 1080p
   streams, so its fps figures were roughly half the decoder's.
