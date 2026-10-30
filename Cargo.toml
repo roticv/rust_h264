@@ -1,6 +1,6 @@
 [package]
 name = "rust_h264"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 # Oldest compiler checked in CI (the msrv job)
 rust-version = "1.89"
