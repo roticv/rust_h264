@@ -130,6 +130,51 @@ mod tests {
                     s::bi_pred_avg(&a, &b, o)
                 });
             }
+            // Edge transposes: 16 rows of 8 bytes at a random stride, and
+            // back (as a filter would write them)
+            let stride = 8 + (seed % 24) as usize;
+            let plane = random_bytes(&mut seed, 15 * stride + 8 + 3);
+            let base = (seed % 4) as usize;
+            let lanes = super::load_edge_lines_v(&plane, base, stride);
+            assert_eq!(
+                lanes,
+                s::load_edge_lines_v(&plane, base, stride),
+                "load round={round}"
+            );
+            let mut changed = lanes;
+            for row in changed.iter_mut() {
+                for v in row.iter_mut() {
+                    *v = v.wrapping_mul(7).wrapping_add(3);
+                }
+            }
+            let (mut a, mut b) = (plane.clone(), plane.clone());
+            super::store_edge_lines_v(&mut a, base, stride, &changed);
+            s::store_edge_lines_v(&mut b, base, stride, &changed);
+            assert_eq!(a, b, "store round={round}");
+            // Deblocking kernels on random lines and parameters
+            let lines: [[u8; 16]; 8] =
+                core::array::from_fn(|_| random_bytes(&mut seed, 16).try_into().unwrap());
+            let bs: [i8; 16] = core::array::from_fn(|_| (random_bytes(&mut seed, 1)[0] % 5) as i8);
+            let tc0: [i8; 16] = core::array::from_fn(|i| {
+                if bs[i] < 4 {
+                    (random_bytes(&mut seed, 1)[0] % 26) as i8
+                } else {
+                    0
+                }
+            });
+            let alpha = random_bytes(&mut seed, 1)[0] as i32;
+            let beta = (random_bytes(&mut seed, 1)[0] % 19) as i32;
+            for luma in [true, false] {
+                let (mut a, mut b) = (lines, lines);
+                if luma {
+                    super::deblock_luma_lines(&mut a, &bs, &tc0, alpha, beta);
+                    s::deblock_luma_lines(&mut b, &bs, &tc0, alpha, beta);
+                } else {
+                    super::deblock_chroma_lines(&mut a, &bs, &tc0, alpha, beta);
+                    s::deblock_chroma_lines(&mut b, &bs, &tc0, alpha, beta);
+                }
+                assert_eq!(a, b, "deblock luma={luma} round={round}");
+            }
             // Chroma bilinear: every block size, fractions, a plane whose
             // last row ends exactly where the block's reads do
             for &(bw, bh) in &[
@@ -190,6 +235,10 @@ mod tests {
         (
             "bench_1080p_100f_ponly",
             "e17bb157f49784e4e596451b2b84d96714c4c4cbd3e9ac44ed7cb19a385ce7d2",
+        ),
+        (
+            "bench_1080p_100f_deblock",
+            "dd7b914d1809e0129e943cd725f3b3f82b8b9a792456997bfa6fee0112bf2580",
         ),
     ];
 

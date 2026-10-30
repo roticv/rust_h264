@@ -49,6 +49,9 @@ pub struct MbInfo {
     pub list_count: u8,
     /// True if this MB uses 8x8 transform (High profile transform_size_8x8_flag).
     pub is_8x8dct: bool,
+    /// All 16 4x4 blocks have the same references and motion vectors (a
+    /// 16x16 or skipped MB): its internal edges never get bS 1
+    pub uniform_motion: bool,
 }
 
 // H.264 Table 8-16a: alpha threshold indexed by indexA = clamp(0..51, QPavg + offset_a)
@@ -280,6 +283,26 @@ fn filter_frame_inner(
                 continue;
             }
             let mb_p = &mb_info[left_mb_idx];
+            // Compute bS for all 4 segments first
+            let mut seg_bs = [0i32; 4];
+            for seg in 0..4 {
+                let blk_q = blk_idx(edge, seg);
+                let blk_p = if is_mb_edge {
+                    blk_idx(3, seg)
+                } else {
+                    blk_idx(edge - 1, seg)
+                };
+                let intra_bs = if is_mb_edge { 4 } else { 3 };
+                seg_bs[seg] = if !is_mb_edge && mb_q.uniform_motion {
+                    // Inside an MB with one motion: only intra and coefficients
+                    derive_bs_same_motion(mb_q, blk_p, blk_q, intra_bs)
+                } else {
+                    derive_bs(mb_p, mb_q, blk_p, blk_q, intra_bs, mvy_limit)
+                };
+            }
+            if seg_bs == [0; 4] {
+                continue;
+            }
 
             let qp_q = mb_q.qp_y;
             let qp_p = mb_p.qp_y;
@@ -300,75 +323,38 @@ fn filter_frame_inner(
             let cb = chroma_params(chroma_qp_index_offset);
             let cr = chroma_params(second_chroma_qp_index_offset);
 
-            // Compute bS for all 4 segments first
-            let mut seg_bs = [0i32; 4];
-            for seg in 0..4 {
-                let blk_q = blk_idx(edge, seg);
-                let blk_p = if is_mb_edge {
-                    blk_idx(3, seg)
-                } else {
-                    blk_idx(edge - 1, seg)
-                };
-                let intra_bs = if is_mb_edge { 4 } else { 3 };
-                seg_bs[seg] = derive_bs(mb_p, mb_q, blk_p, blk_q, intra_bs, mvy_limit);
-            }
-            // Luma: filter each segment independently
-            for seg in 0..4 {
-                if seg_bs[seg] == 0 {
-                    continue;
-                }
-                let tc0 = if seg_bs[seg] < 4 {
-                    TC0_TABLE[index_a][(seg_bs[seg] - 1) as usize]
-                } else {
-                    0
-                };
-                let y = mb_y + seg * 4;
-                filter_edge_v(
-                    &mut frame.y,
-                    stride_y,
-                    edge_x,
-                    y,
-                    4,
-                    seg_bs[seg],
-                    alpha,
-                    beta,
-                    tc0,
-                );
-            }
+            // Luma: the 16 lines of the edge at once, line i taking the bS
+            // of its segment
+            let lp = LineParams::new(16, index_a, |i| seg_bs[i / 4]);
+            filter_v_lines(
+                &mut frame.y,
+                stride_y,
+                edge_x,
+                mb_y,
+                16,
+                &lp,
+                (alpha, beta),
+                true,
+            );
 
-            // Chroma: per-pixel bS from the luma segment of its line
+            // Chroma: each line takes the bS of the luma segment beside it
             if edge % 2 == 0 {
                 let c_edge_x = mb_col * 8 + (edge / 2) * 4;
-                for cseg in 0..(4 >> sy) {
-                    let cy = (mb_y >> sy) + cseg * 4;
-                    let c_bs: [i32; 4] =
-                        core::array::from_fn(|i| seg_bs[((cseg * 4 + i) << sy) / 4]);
-                    for (plane, (c_index_a, c_alpha, c_beta)) in
-                        [(&mut frame.u, cb), (&mut frame.v, cr)]
-                    {
-                        for i in 0..4 {
-                            let pbs = c_bs[i];
-                            if pbs == 0 {
-                                continue;
-                            }
-                            let ptc0 = if pbs < 4 {
-                                TC0_TABLE[c_index_a][(pbs - 1) as usize]
-                            } else {
-                                0
-                            };
-                            filter_edge_v_chroma(
-                                plane,
-                                stride_c,
-                                c_edge_x,
-                                cy + i,
-                                1,
-                                pbs,
-                                c_alpha,
-                                c_beta,
-                                ptc0,
-                            );
-                        }
-                    }
+                let rows = 16 >> sy;
+                for (plane, (c_index_a, c_alpha, c_beta)) in
+                    [(&mut frame.u, cb), (&mut frame.v, cr)]
+                {
+                    let lp = LineParams::new(rows, c_index_a, |i| seg_bs[(i << sy) / 4]);
+                    filter_v_lines(
+                        plane,
+                        stride_c,
+                        c_edge_x,
+                        mb_y >> sy,
+                        rows,
+                        &lp,
+                        (c_alpha, c_beta),
+                        false,
+                    );
                 }
             }
         }
@@ -401,6 +387,31 @@ fn filter_frame_inner(
                 continue;
             }
             let mb_p = &mb_info[above_mb_idx];
+            // Compute bS for all 4 segments first
+            let mut seg_bs = [0i32; 4];
+            for seg in 0..4 {
+                let blk_q = blk_idx(seg, edge);
+                let blk_p = if is_mb_edge {
+                    blk_idx(seg, 3)
+                } else {
+                    blk_idx(seg, edge - 1)
+                };
+                let intra_bs = if is_mb_edge && !interlace.field_pic {
+                    4
+                } else {
+                    3
+                };
+                seg_bs[seg] = if !is_mb_edge && mb_q.uniform_motion {
+                    // Inside an MB with one motion: only intra and coefficients
+                    derive_bs_same_motion(mb_q, blk_p, blk_q, intra_bs)
+                } else {
+                    derive_bs(mb_p, mb_q, blk_p, blk_q, intra_bs, mvy_limit)
+                };
+            }
+
+            if seg_bs == [0; 4] {
+                continue;
+            }
 
             let qp_q = mb_q.qp_y;
             let qp_p = mb_p.qp_y;
@@ -420,85 +431,24 @@ fn filter_frame_inner(
             let cb = chroma_params(chroma_qp_index_offset);
             let cr = chroma_params(second_chroma_qp_index_offset);
 
-            // Compute bS for all 4 segments first
-            let mut seg_bs = [0i32; 4];
-            for seg in 0..4 {
-                let blk_q = blk_idx(seg, edge);
-                let blk_p = if is_mb_edge {
-                    blk_idx(seg, 3)
-                } else {
-                    blk_idx(seg, edge - 1)
-                };
-                let intra_bs = if is_mb_edge && !interlace.field_pic {
-                    4
-                } else {
-                    3
-                };
-                seg_bs[seg] = derive_bs(mb_p, mb_q, blk_p, blk_q, intra_bs, mvy_limit);
+            // Luma: the 16 lines (columns) of the edge at once, line i taking
+            // the bS of its segment
+            if !skip_luma {
+                let lp = LineParams::new(16, index_a, |i| seg_bs[i / 4]);
+                let off = edge_y * stride_y + mb_x;
+                filter_h_lines(&mut frame.y, off, stride_y, 16, &lp, (alpha, beta), true);
             }
 
-            // Luma: filter each segment independently
-            for seg in 0..4 {
-                if seg_bs[seg] == 0 || skip_luma {
-                    continue;
-                }
-                let tc0 = if seg_bs[seg] < 4 {
-                    TC0_TABLE[index_a][(seg_bs[seg] - 1) as usize]
-                } else {
-                    0
-                };
-                let x = mb_x + seg * 4;
-                filter_edge_h(
-                    &mut frame.y,
-                    stride_y,
-                    x,
-                    edge_y,
-                    4,
-                    seg_bs[seg],
-                    alpha,
-                    beta,
-                    tc0,
-                );
-            }
-
-            // Chroma: per-pixel bS from all 4 luma segments. 4:2:0 chroma
-            // has an edge every other luma edge, 4:2:2 one at each.
+            // Chroma: each column takes the bS of the luma segment above it.
+            // 4:2:0 chroma has an edge every other luma edge, 4:2:2 one at each.
             if c422 || edge % 2 == 0 {
                 let c_edge_y = (mb_y >> sy) + (edge >> sy) * 4;
-                for cseg in 0..2 {
-                    let cx = mb_x / 2 + cseg * 4;
-                    let c_bs = [
-                        seg_bs[cseg * 2],
-                        seg_bs[cseg * 2],
-                        seg_bs[cseg * 2 + 1],
-                        seg_bs[cseg * 2 + 1],
-                    ];
-                    for (plane, (c_index_a, c_alpha, c_beta)) in
-                        [(&mut frame.u, cb), (&mut frame.v, cr)]
-                    {
-                        for i in 0..4 {
-                            let pbs = c_bs[i];
-                            if pbs == 0 {
-                                continue;
-                            }
-                            let ptc0 = if pbs < 4 {
-                                TC0_TABLE[c_index_a][(pbs - 1) as usize]
-                            } else {
-                                0
-                            };
-                            filter_edge_h_chroma(
-                                plane,
-                                stride_c,
-                                cx + i,
-                                c_edge_y,
-                                1,
-                                pbs,
-                                c_alpha,
-                                c_beta,
-                                ptc0,
-                            );
-                        }
-                    }
+                let off = c_edge_y * stride_c + mb_x / 2;
+                for (plane, (c_index_a, c_alpha, c_beta)) in
+                    [(&mut frame.u, cb), (&mut frame.v, cr)]
+                {
+                    let lp = LineParams::new(8, c_index_a, |i| seg_bs[i / 2]);
+                    filter_h_lines(plane, off, stride_c, 8, &lp, (c_alpha, c_beta), false);
                 }
             }
         }
@@ -1030,6 +980,19 @@ fn derive_bs(
     0
 }
 
+/// bS of an internal edge of `mb`, whose blocks all share one motion: the
+/// motion test can't give 1, leaving intra (`intra_bs`) and coefficients.
+#[inline]
+fn derive_bs_same_motion(mb: &MbInfo, blk_p: usize, blk_q: usize, intra_bs: i32) -> i32 {
+    if is_intra(mb) {
+        intra_bs
+    } else if mb.nnz[blk_p] || mb.nnz[blk_q] {
+        2
+    } else {
+        0
+    }
+}
+
 /// Check if two 4x4 blocks have different motion (spec 8.7.2.1 conditions for bS=1).
 /// Returns true if reference pictures differ or the MVs differ by 4 or more
 /// horizontally or `mvy_limit` or more vertically.
@@ -1363,6 +1326,143 @@ fn clip(v: i32) -> i32 {
     v.clamp(0, 255)
 }
 
+/// Samples of up to 16 lines across one edge, by position: `s[k][i]` is
+/// p3, p2, p1, p0, q0, q1, q2, q3 for k = 0..8 of line i.
+type EdgeLines = [[u8; 16]; 8];
+
+/// Per-line filter parameters of an edge: bS (0 leaves the line alone, 4
+/// is the strong filter) and tC0 for bS 1..3.
+#[derive(Clone, Copy)]
+struct LineParams {
+    bs: [i8; 16],
+    tc0: [i8; 16],
+}
+
+impl LineParams {
+    /// `n` lines, line i taking bS `bs(i)`; tC0 from `index_a`.
+    fn new(n: usize, index_a: usize, bs: impl Fn(usize) -> i32) -> Self {
+        let mut p = LineParams {
+            bs: [0; 16],
+            tc0: [0; 16],
+        };
+        for i in 0..n {
+            let b = bs(i);
+            p.bs[i] = b as i8;
+            if (1..4).contains(&b) {
+                p.tc0[i] = TC0_TABLE[index_a][(b - 1) as usize] as i8;
+            }
+        }
+        p
+    }
+}
+
+/// Luma deblocking of up to 16 lines across one edge (spec 8.7.2.3-4),
+/// written lane by lane without data-dependent branches so it
+/// vectorizes. Line i is filtered when its bS is non-zero and the sample
+/// test passes, with the strong filter for bS 4. Bit-exact with
+/// `normal_filter`/`strong_filter`.
+fn luma_edge_lines(s: &mut EdgeLines, lp: &LineParams, alpha: i32, beta: i32) {
+    crate::simd::deblock_luma_lines(s, &lp.bs, &lp.tc0, alpha, beta);
+}
+
+/// Chroma deblocking of up to 16 lines across one edge (spec 8.7.2.3-4):
+/// only p0 and q0 change. Line i is filtered when its bS is non-zero and
+/// the sample test passes: bS 4 strong, else tC = tC0 + 1.
+fn chroma_edge_lines(s: &mut EdgeLines, lp: &LineParams, alpha: i32, beta: i32) {
+    crate::simd::deblock_chroma_lines(s, &lp.bs, &lp.tc0, alpha, beta);
+}
+
+/// Filter `n` lines across a horizontal edge whose q0 row starts at `off`
+/// (rows `stride` apart): each line is a column, so whole rows load into
+/// the lanes. `luma` filters p2..q2 (and reads p3/q3), chroma p0/q0.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_range_loop)]
+fn filter_h_lines(
+    plane: &mut [u8],
+    off: usize,
+    stride: usize,
+    n: usize,
+    lp: &LineParams,
+    (alpha, beta): (i32, i32),
+    luma: bool,
+) {
+    let (first, last) = if luma { (0, 8) } else { (2, 6) };
+    // Rows p3 (k = 0) .. q3 (k = 7); a malformed stream may put them out
+    // of the plane
+    let Some(top) = off.checked_sub(4 * stride) else {
+        return;
+    };
+    if top + 7 * stride + n > plane.len() {
+        return;
+    }
+    let mut s: EdgeLines = [[0; 16]; 8];
+    for k in first..last {
+        let o = top + k * stride;
+        s[k][..n].copy_from_slice(&plane[o..o + n]);
+    }
+    if luma {
+        luma_edge_lines(&mut s, lp, alpha, beta);
+    } else {
+        chroma_edge_lines(&mut s, lp, alpha, beta);
+    }
+    let (first, last) = if luma { (1, 7) } else { (3, 5) };
+    for k in first..last {
+        let o = top + k * stride;
+        plane[o..o + n].copy_from_slice(&s[k][..n]);
+    }
+}
+
+/// Filter `n` lines across a vertical edge at column `x`, lines starting
+/// at row `y`: line i is row y + i, its samples gathered into the lanes.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_range_loop)]
+fn filter_v_lines(
+    plane: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    n: usize,
+    lp: &LineParams,
+    (alpha, beta): (i32, i32),
+    luma: bool,
+) {
+    let (reach, first, last) = if luma { (4, 0, 8) } else { (2, 2, 6) };
+    if x < reach || (y + n - 1) * stride + x + reach > plane.len() {
+        return;
+    }
+    if n == 16 && x >= 4 && (y + 15) * stride + x + 4 <= plane.len() {
+        // A whole luma MB edge (or 4:2:2 chroma): transposed loads
+        let base = y * stride + x - 4;
+        let mut s = crate::simd::load_edge_lines_v(plane, base, stride);
+        if luma {
+            luma_edge_lines(&mut s, lp, alpha, beta);
+        } else {
+            chroma_edge_lines(&mut s, lp, alpha, beta);
+        }
+        crate::simd::store_edge_lines_v(plane, base, stride, &s);
+        return;
+    }
+    let mut s: EdgeLines = [[0; 16]; 8];
+    for i in 0..n {
+        let o = (y + i) * stride + x - 4;
+        for k in first..last {
+            s[k][i] = plane[o + k];
+        }
+    }
+    if luma {
+        luma_edge_lines(&mut s, lp, alpha, beta);
+    } else {
+        chroma_edge_lines(&mut s, lp, alpha, beta);
+    }
+    let (first, last) = if luma { (1, 7) } else { (3, 5) };
+    for i in 0..n {
+        let o = (y + i) * stride + x - 4;
+        for k in first..last {
+            plane[o + k] = s[k][i];
+        }
+    }
+}
+
 /// Normal filter for bS=1..3 (H.264 spec 8.7.2.3).
 /// Returns (p0', p1', q0', q1').
 #[allow(clippy::too_many_arguments)]
@@ -1460,6 +1560,56 @@ fn strong_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 16-line edge kernels match the per-sample scalar filters on
+    /// random lines of every bS, including samples near the thresholds.
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn edge_line_kernels_match_scalar_filters() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for round in 0..20_000 {
+            let index_a = next(52) as usize;
+            let alpha = ALPHA_TABLE[index_a];
+            let beta = BETA_TABLE[next(52) as usize];
+            // Smooth lines so the filters' conditions are often met
+            let mut s: EdgeLines = [[0; 16]; 8];
+            for i in 0..16 {
+                let mut v = next(256) as i32;
+                for k in 0..8 {
+                    v = (v + next(9) as i32 - 4).clamp(0, 255);
+                    s[k][i] = v as u8;
+                }
+            }
+            let bss: [i32; 16] = core::array::from_fn(|_| next(5) as i32);
+            let lp = LineParams::new(16, index_a, |i| bss[i]);
+            for luma in [true, false] {
+                let mut got = s;
+                if luma {
+                    luma_edge_lines(&mut got, &lp, alpha, beta);
+                } else {
+                    chroma_edge_lines(&mut got, &lp, alpha, beta);
+                }
+                for i in 0..16 {
+                    // The scalar filter on one line laid out as a row
+                    let mut row: [u8; 8] = core::array::from_fn(|k| s[k][i]);
+                    let bs = lp.bs[i] as i32;
+                    if bs > 0 {
+                        let tc0 = if bs < 4 { lp.tc0[i] as i32 } else { 0 };
+                        filter_edge_v_inner(&mut row, 8, 4, 0, 1, bs, alpha, beta, tc0, !luma);
+                    }
+                    let want: [u8; 8] = row;
+                    let got_line: [u8; 8] = core::array::from_fn(|k| got[k][i]);
+                    assert_eq!(got_line, want, "round {round} line {i} luma {luma} bs {bs}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_should_filter() {

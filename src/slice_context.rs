@@ -1489,15 +1489,33 @@ impl SliceContext<'_> {
                     None => list.get(ri).map_or(-1, |pic| pic.pic_order_cnt),
                 }
             };
+            // Blocks mostly share a reference: look each ref_idx up once
+            let mut last = [(i8::MIN, 0i32); 2];
+            let mut cached_id = |l: usize, list: &[Arc<DecodedPicture>], ri: i8| {
+                if last[l].0 != ri {
+                    last[l] = (ri, ref_id(list, ri));
+                }
+                last[l].1
+            };
             for blk in 0..16 {
                 info.mv_l0[blk] = self.mv_store_l0[base + blk];
                 info.ref_idx_l0[blk] = self.ref_idx_store_l0[base + blk];
                 info.mv_l1[blk] = self.mv_store_l1[base + blk];
                 info.ref_idx_l1[blk] = self.ref_idx_store_l1[base + blk];
                 info.nnz[blk] = self.nc_luma[base + blk] > 0;
-                info.ref_poc_l0[blk] = ref_id(l0_list, self.ref_idx_store_l0[base + blk]);
-                info.ref_poc_l1[blk] = ref_id(ref_pic_list_l1, self.ref_idx_store_l1[base + blk]);
+                info.ref_poc_l0[blk] = cached_id(0, l0_list, self.ref_idx_store_l0[base + blk]);
+                info.ref_poc_l1[blk] =
+                    cached_id(1, ref_pic_list_l1, self.ref_idx_store_l1[base + blk]);
             }
+            fn uniform<T: PartialEq + Copy>(a: &[T; 16]) -> bool {
+                a.iter().all(|&x| x == a[0])
+            }
+            info.uniform_motion = uniform(&info.mv_l0)
+                && uniform(&info.ref_poc_l0)
+                && uniform(&info.mv_l1)
+                && uniform(&info.ref_poc_l1)
+                && uniform(&info.ref_idx_l0)
+                && uniform(&info.ref_idx_l1);
             // An 8x8 transform block has coefficients if any of its 4x4
             // blocks does (CAVLC codes it as four interleaved 4x4 parts).
             if info.is_8x8dct {

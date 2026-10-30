@@ -34,7 +34,10 @@ use crate::once::OnceLock;
 
 use super::scalar::{self, hv_sample, v_sample};
 
-pub use super::scalar::{weighted_bi, weighted_bi_implicit, weighted_uni};
+pub use super::scalar::{
+    deblock_chroma_lines, deblock_luma_lines, load_edge_lines_v, store_edge_lines_v, weighted_bi,
+    weighted_bi_implicit, weighted_uni,
+};
 
 /// Detected CPU capability level, in ascending order. `Scalar` is only
 /// produced by the test-only force-scalar switch.
