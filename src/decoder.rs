@@ -4017,6 +4017,14 @@ mod tests {
         fuzz_decode_avcc("decode_avcc_frame_num_gap_prev_overflow.bin");
     }
 
+    /// Prediction weight outside [-128, 127] overflowing the weighted
+    /// prediction multiply (simd/scalar.rs weighted_uni); now rejected
+    /// when the slice header is parsed (slice.rs).
+    #[test]
+    fn test_fuzz_regression_weighted_pred_weight_overflow() {
+        fuzz_decode_avcc("decode_avcc_weighted_pred_weight_overflow.bin");
+    }
+
     /// MBAFF CAVLC test (64x64, 6-frame, interlaced, CAVLC, frame-coded pairs)
     #[test]
     fn test_mbaff_cavlc() {

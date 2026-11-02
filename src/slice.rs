@@ -223,51 +223,41 @@ pub fn parse_slice_header(
         let luma_def = 1i32 << luma_log2_weight_denom;
         let chroma_def = 1i32 << chroma_log2_weight_denom;
 
-        let mut l0 = Vec::new();
-        for _ in 0..num_ref_idx_l0_active {
+        // One reference's weights; spec 7.4.3.2 limits every weight and
+        // offset to [-128, 127] (FFmpeg rejects the slice otherwise).
+        let read_ref_weight = |r: &mut BitstreamReader| -> Result<RefWeight, &'static str> {
+            let read_s8 = |r: &mut BitstreamReader| match r.read_se()? {
+                v @ -128..=127 => Ok(v),
+                _ => Err("prediction weight or offset out of range"),
+            };
             let mut rw = RefWeight {
                 luma_weight: luma_def,
                 luma_offset: 0,
                 chroma_weight: [chroma_def, chroma_def],
                 chroma_offset: [0, 0],
             };
-            let luma_weight_flag = r.read_bit()? != 0;
-            if luma_weight_flag {
-                rw.luma_weight = r.read_se()?;
-                rw.luma_offset = r.read_se()?;
+            if r.read_bit()? != 0 {
+                rw.luma_weight = read_s8(r)?;
+                rw.luma_offset = read_s8(r)?;
             }
-            let chroma_weight_flag = has_chroma && r.read_bit()? != 0;
-            if chroma_weight_flag {
+            if has_chroma && r.read_bit()? != 0 {
                 for j in 0..2 {
-                    rw.chroma_weight[j] = r.read_se()?;
-                    rw.chroma_offset[j] = r.read_se()?;
+                    rw.chroma_weight[j] = read_s8(r)?;
+                    rw.chroma_offset[j] = read_s8(r)?;
                 }
             }
-            l0.push(rw);
+            Ok(rw)
+        };
+
+        let mut l0 = Vec::new();
+        for _ in 0..num_ref_idx_l0_active {
+            l0.push(read_ref_weight(&mut r)?);
         }
 
         let mut l1 = Vec::new();
         if slice_type == SliceType::B {
             for _ in 0..num_ref_idx_l1_active {
-                let mut rw = RefWeight {
-                    luma_weight: luma_def,
-                    luma_offset: 0,
-                    chroma_weight: [chroma_def, chroma_def],
-                    chroma_offset: [0, 0],
-                };
-                let luma_weight_flag = r.read_bit()? != 0;
-                if luma_weight_flag {
-                    rw.luma_weight = r.read_se()?;
-                    rw.luma_offset = r.read_se()?;
-                }
-                let chroma_weight_flag = has_chroma && r.read_bit()? != 0;
-                if chroma_weight_flag {
-                    for j in 0..2 {
-                        rw.chroma_weight[j] = r.read_se()?;
-                        rw.chroma_offset[j] = r.read_se()?;
-                    }
-                }
-                l1.push(rw);
+                l1.push(read_ref_weight(&mut r)?);
             }
         }
 
