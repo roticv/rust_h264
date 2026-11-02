@@ -4010,6 +4010,13 @@ mod tests {
         fuzz_decode_avcc("decode_avcc_field_pair_mismatch.bin");
     }
 
+    /// PrevRefFrameNum from an SPS with a larger MaxFrameNum underflowed the
+    /// frame_num gap count (dpb.rs fill_frame_num_gap).
+    #[test]
+    fn test_fuzz_regression_frame_num_gap_prev_overflow() {
+        fuzz_decode_avcc("decode_avcc_frame_num_gap_prev_overflow.bin");
+    }
+
     /// MBAFF CAVLC test (64x64, 6-frame, interlaced, CAVLC, frame-coded pairs)
     #[test]
     fn test_mbaff_cavlc() {

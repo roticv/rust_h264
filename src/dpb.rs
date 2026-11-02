@@ -581,8 +581,11 @@ impl Dpb {
         let Some(prev) = self.prev_ref_frame_num else {
             return;
         };
+        // prev is out of range only when the SPS changed without an IDR
+        // (a broken stream); there is no gap to fill then.
         if max_frame_num == 0
             || frame_num >= max_frame_num
+            || prev >= max_frame_num
             || frame_num == prev
             || frame_num == (prev + 1) % max_frame_num
         {
