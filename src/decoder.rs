@@ -13,7 +13,7 @@ use crate::mv_pred::WeightContext;
 use crate::nal::{NalUnit, NalUnitType};
 use crate::pixel::Pixel;
 use crate::pps::{parse_pps, Pps};
-use crate::slice::{parse_slice_header, SliceHeader, SliceType};
+use crate::slice::{parse_slice_header, SliceHeader, SliceType, MMCO_DIFF_BITS};
 use crate::slice_context::{SliceContext, SliceParams};
 use crate::sps::{parse_sps, Sps};
 
@@ -1659,7 +1659,7 @@ pub(crate) fn apply_reference_marking(
     for &(op, param) in mmco_ops {
         match op {
             1 => {
-                let pic_num_to_remove = mmco_curr_pic_num - ((param & 0xFFFF) as i32 + 1);
+                let pic_num_to_remove = mmco_curr_pic_num - (param as i32 + 1);
                 dpb.mark_short_term_unused(
                     frame_num_of(pic_num_to_remove),
                     field_of(pic_num_to_remove),
@@ -1670,8 +1670,8 @@ pub(crate) fn apply_reference_marking(
                 dpb.mark_long_term_unused(idx, field_of(param as i32));
             }
             3 => {
-                let abs_diff_minus1 = param & 0xFFFF;
-                let long_term_frame_idx = param >> 16;
+                let abs_diff_minus1 = param & ((1 << MMCO_DIFF_BITS) - 1);
+                let long_term_frame_idx = param >> MMCO_DIFF_BITS;
                 let pic_num = mmco_curr_pic_num - (abs_diff_minus1 as i32 + 1);
                 dpb.assign_long_term(
                     frame_num_of(pic_num),

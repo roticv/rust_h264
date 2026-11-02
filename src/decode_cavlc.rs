@@ -790,7 +790,7 @@ impl<P: Pixel> SliceContext<'_, P> {
             self.mb_is_8x8dct[mb_idx] = use_8x8_dct_b;
 
             let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
-                let mb_qp_delta = reader.read_se()?;
+                let mb_qp_delta = Self::read_mb_qp_delta(reader)?;
                 self.next_qp(mb_qp_delta)
             } else {
                 self.prev_mb_qp
@@ -1240,7 +1240,7 @@ impl<P: Pixel> SliceContext<'_, P> {
             self.mb_is_8x8dct[mb_idx] = use_8x8_dct;
 
             let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
-                let mb_qp_delta = reader.read_se()?;
+                let mb_qp_delta = Self::read_mb_qp_delta(reader)?;
                 self.next_qp(mb_qp_delta)
             } else {
                 self.prev_mb_qp
@@ -1486,7 +1486,7 @@ impl<P: Pixel> SliceContext<'_, P> {
             cbp_chroma = cbp >> 4;
 
             if cbp_luma != 0 || cbp_chroma != 0 {
-                let mb_qp_delta = reader.read_se()?;
+                let mb_qp_delta = Self::read_mb_qp_delta(reader)?;
                 qp_y = self.next_qp(mb_qp_delta);
             } else {
                 qp_y = self.prev_mb_qp;
@@ -1621,7 +1621,7 @@ impl<P: Pixel> SliceContext<'_, P> {
                 reader.read_ue()? as u8
             };
 
-            let mb_qp_delta = reader.read_se()?;
+            let mb_qp_delta = Self::read_mb_qp_delta(reader)?;
             qp_y = self.next_qp(mb_qp_delta);
             self.prev_mb_qp = qp_y;
 

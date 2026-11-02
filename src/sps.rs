@@ -305,6 +305,11 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, &'static str> {
     let _reserved_zero_2bits = r.read_bits(2)?;
     let level_idc = r.read_bits(8)? as u8;
     let seq_parameter_set_id = r.read_ue()?;
+    // Ranges of spec 7.4.2.1.1, checked here so later arithmetic on these
+    // fields (shift widths, table sizes, list lengths) cannot overflow
+    if seq_parameter_set_id > 31 {
+        return Err("seq_parameter_set_id out of range");
+    }
 
     let mut chroma_format_idc = 1; // default
     let mut separate_colour_plane_flag = false;
@@ -323,6 +328,12 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, &'static str> {
         }
         bit_depth_luma_minus8 = r.read_ue()?;
         bit_depth_chroma_minus8 = r.read_ue()?;
+        if chroma_format_idc > 3 {
+            return Err("chroma_format_idc out of range");
+        }
+        if bit_depth_luma_minus8 > 6 || bit_depth_chroma_minus8 > 6 {
+            return Err("bit depth out of range");
+        }
         qpprime_y_zero_transform_bypass_flag = r.read_bit()? != 0;
         seq_scaling_matrix_present_flag = r.read_bit()? != 0;
         if seq_scaling_matrix_present_flag {
@@ -340,6 +351,12 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, &'static str> {
 
     let log2_max_frame_num_minus4 = r.read_ue()?;
     let pic_order_cnt_type = r.read_ue()?;
+    if log2_max_frame_num_minus4 > 12 {
+        return Err("log2_max_frame_num_minus4 out of range");
+    }
+    if pic_order_cnt_type > 2 {
+        return Err("pic_order_cnt_type out of range");
+    }
 
     let mut log2_max_pic_order_cnt_lsb_minus4 = 0;
     let mut delta_pic_order_always_zero_flag = false;
@@ -350,17 +367,27 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, &'static str> {
 
     if pic_order_cnt_type == 0 {
         log2_max_pic_order_cnt_lsb_minus4 = r.read_ue()?;
+        if log2_max_pic_order_cnt_lsb_minus4 > 12 {
+            return Err("log2_max_pic_order_cnt_lsb_minus4 out of range");
+        }
     } else if pic_order_cnt_type == 1 {
         delta_pic_order_always_zero_flag = r.read_bit()? != 0;
         offset_for_non_ref_pic = r.read_se()?;
         offset_for_top_to_bottom_field = r.read_se()?;
         num_ref_frames_in_pic_order_cnt_cycle = r.read_ue()?;
+        if num_ref_frames_in_pic_order_cnt_cycle > 255 {
+            return Err("num_ref_frames_in_pic_order_cnt_cycle out of range");
+        }
         for _ in 0..num_ref_frames_in_pic_order_cnt_cycle {
             offset_for_ref_frame.push(r.read_se()?);
         }
     }
 
     let max_num_ref_frames = r.read_ue()?;
+    // MaxDpbFrames is at most 16 (spec A.3.1)
+    if max_num_ref_frames > 16 {
+        return Err("max_num_ref_frames out of range");
+    }
     let gaps_in_frame_num_value_allowed_flag = r.read_bit()? != 0;
     let pic_width_in_mbs_minus1 = r.read_ue()?;
     let pic_height_in_map_units_minus1 = r.read_ue()?;
@@ -572,9 +599,46 @@ fn skip_hrd_parameters(r: &mut BitstreamReader) -> Result<(), &'static str> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::nal::{parse_annex_b, NalUnitType};
+
+    /// Baseline 16x16 SPS (POC type 2), with each field overridable.
+    pub(crate) fn baseline_sps(
+        sps_id: u32,
+        log2_max_frame_num_minus4: u32,
+        poc_type: u32,
+        max_num_ref_frames: u32,
+    ) -> alloc::vec::Vec<u8> {
+        let mut w = crate::bitstream::BitWriter::default();
+        w.u(8, 66).u(8, 0).u(8, 10).ue(sps_id);
+        w.ue(log2_max_frame_num_minus4).ue(poc_type);
+        if poc_type == 0 {
+            w.ue(0);
+        }
+        w.ue(max_num_ref_frames).u(1, 0).ue(0).ue(0);
+        w.u(1, 1).u(1, 1).u(1, 0).u(1, 0);
+        w.finish()
+    }
+
+    /// Out-of-range SPS fields are rejected when parsed (spec 7.4.2.1.1),
+    /// including ue(v) values near u32::MAX that used to overflow `+ 4`.
+    #[test]
+    fn test_sps_field_ranges() {
+        assert!(parse_sps(&baseline_sps(31, 12, 2, 16)).is_ok());
+        for (rbsp, what) in [
+            (baseline_sps(32, 0, 2, 1), "seq_parameter_set_id"),
+            (baseline_sps(0, 13, 2, 1), "log2_max_frame_num_minus4"),
+            (
+                baseline_sps(0, u32::MAX - 1, 2, 1),
+                "log2_max_frame_num_minus4",
+            ),
+            (baseline_sps(0, 0, 3, 1), "pic_order_cnt_type"),
+            (baseline_sps(0, 0, 2, 17), "max_num_ref_frames"),
+        ] {
+            assert!(parse_sps(&rbsp).unwrap_err().starts_with(what), "{what}");
+        }
+    }
 
     #[test]
     fn test_parse_sps_single_frame() {

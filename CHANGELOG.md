@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Malformed streams no longer panic or stall the decoder** (found by
+  fuzzing and a review against spec section 7.4):
+  - SPS, PPS and slice header fields are now checked against their spec
+    ranges when parsed, as FFmpeg does. Out-of-range values return
+    `InvalidSyntax` instead of overflowing later: `log2_max_frame_num` and
+    `log2_max_pic_order_cnt_lsb`, the slice QP, the CAVLC `mb_qp_delta`,
+    chroma QP offsets and deblocking offsets. A huge `num_ref_idx_active`
+    no longer pads the reference lists to billions of entries.
+  - Prediction weights and offsets outside -128..127 are rejected; they
+    overflowed the weighted prediction.
+  - A frame_num gap after an SPS change without an IDR no longer underflows
+    (#3).
+  - A CABAC slice that reads more than 2 bytes past its data now stops with
+    an error, as in FFmpeg, instead of decoding zeros to the end of the
+    picture.
+- **MMCO 1 and 3 on field pictures** kept only 16 bits of
+  `difference_of_pic_nums_minus1`, which may need 17 when MaxFrameNum is
+  2^16, so they could unmark or mark the wrong picture.
+
 ## [0.6.0] - 2026-10-30
 
 ### Added

@@ -37,6 +37,11 @@ pub fn parse_pps(rbsp: &[u8], sps: Option<&Sps>) -> Result<Pps, &'static str> {
 
     let pic_parameter_set_id = r.read_ue()?;
     let seq_parameter_set_id = r.read_ue()?;
+    // Ranges of spec 7.4.2.2, checked here so later arithmetic on these
+    // fields (QP sums, reference list lengths) cannot overflow
+    if pic_parameter_set_id > 255 || seq_parameter_set_id > 31 {
+        return Err("parameter set id out of range");
+    }
     let entropy_coding_mode_flag = r.read_bit()? != 0;
     let bottom_field_pic_order_in_frame_present_flag = r.read_bit()? != 0;
     let num_slice_groups_minus1 = r.read_ue()?;
@@ -53,6 +58,23 @@ pub fn parse_pps(rbsp: &[u8], sps: Option<&Sps>) -> Result<Pps, &'static str> {
     let pic_init_qp_minus26 = r.read_se()?;
     let pic_init_qs_minus26 = r.read_se()?;
     let chroma_qp_index_offset = r.read_se()?;
+    if num_ref_idx_l0_default_active_minus1 > 31 || num_ref_idx_l1_default_active_minus1 > 31 {
+        return Err("num_ref_idx_default_active_minus1 out of range");
+    }
+    if weighted_bipred_idc > 2 {
+        return Err("weighted_bipred_idc out of range");
+    }
+    // The lower bound is -(26 + QpBdOffsetY); the bit depth is not known
+    // here, so allow the 14-bit maximum and leave the exact check to the
+    // slice QP (slice.rs)
+    if !(-(26 + 36)..=25).contains(&pic_init_qp_minus26)
+        || !(-26..=25).contains(&pic_init_qs_minus26)
+    {
+        return Err("pic_init_qp/qs_minus26 out of range");
+    }
+    if !(-12..=12).contains(&chroma_qp_index_offset) {
+        return Err("chroma_qp_index_offset out of range");
+    }
     let deblocking_filter_control_present_flag = r.read_bit()? != 0;
     let constrained_intra_pred_flag = r.read_bit()? != 0;
     let redundant_pic_cnt_present_flag = r.read_bit()? != 0;
@@ -98,6 +120,9 @@ pub fn parse_pps(rbsp: &[u8], sps: Option<&Sps>) -> Result<Pps, &'static str> {
             )?;
         }
         second_chroma_qp_index_offset = r.read_se()?;
+        if !(-12..=12).contains(&second_chroma_qp_index_offset) {
+            return Err("second_chroma_qp_index_offset out of range");
+        }
     }
 
     Ok(Pps {
@@ -125,9 +150,45 @@ pub fn parse_pps(rbsp: &[u8], sps: Option<&Sps>) -> Result<Pps, &'static str> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::nal::{parse_annex_b, NalUnitType};
+
+    /// CAVLC PPS with deblocking control, with the ranged fields given.
+    pub(crate) fn pps_with(
+        num_ref_idx_default_minus1: u32,
+        weighted_bipred_idc: u32,
+        pic_init_qp_minus26: i32,
+        chroma_qp_index_offset: i32,
+    ) -> alloc::vec::Vec<u8> {
+        let mut w = crate::bitstream::BitWriter::default();
+        w.ue(0).ue(0).u(1, 0).u(1, 0).ue(0);
+        w.ue(num_ref_idx_default_minus1)
+            .ue(0)
+            .u(1, 0)
+            .u(2, weighted_bipred_idc);
+        w.se(pic_init_qp_minus26).se(0).se(chroma_qp_index_offset);
+        w.u(1, 1).u(1, 0).u(1, 0);
+        w.finish()
+    }
+
+    /// Out-of-range PPS fields are rejected when parsed (spec 7.4.2.2).
+    #[test]
+    fn test_pps_field_ranges() {
+        assert!(parse_pps(&pps_with(31, 2, 25, -12), None).is_ok());
+        for (rbsp, what) in [
+            (pps_with(32, 0, 0, 0), "num_ref_idx_default_active_minus1"),
+            (pps_with(0, 3, 0, 0), "weighted_bipred_idc"),
+            (pps_with(0, 0, 26, 0), "pic_init_qp"),
+            (pps_with(0, 0, i32::MAX, 0), "pic_init_qp"),
+            (pps_with(0, 0, 0, 13), "chroma_qp_index_offset"),
+        ] {
+            assert!(
+                parse_pps(&rbsp, None).unwrap_err().starts_with(what),
+                "{what}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_pps_single_frame() {

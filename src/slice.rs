@@ -99,6 +99,27 @@ impl SliceHeader {
     }
 }
 
+/// Bits of an MMCO 3 parameter holding difference_of_pic_nums_minus1; the
+/// long_term_frame_idx sits above them.
+pub(crate) const MMCO_DIFF_BITS: u32 = 17;
+
+/// difference_of_pic_nums_minus1 (MMCO 1 and 3): below MaxPicNum, at most
+/// 2^17 for field pictures.
+fn read_pic_num_diff(r: &mut BitstreamReader) -> Result<u32, &'static str> {
+    match r.read_ue()? {
+        v if v < 1 << MMCO_DIFF_BITS => Ok(v),
+        _ => Err("difference_of_pic_nums_minus1 out of range"),
+    }
+}
+
+/// long_term_pic_num or long_term_frame_idx (MMCO 2, 3 and 6): below 32.
+fn read_long_term_idx(r: &mut BitstreamReader) -> Result<u32, &'static str> {
+    match r.read_ue()? {
+        v if v < 32 => Ok(v),
+        _ => Err("long-term reference index out of range"),
+    }
+}
+
 /// Parse a slice header from RBSP data. Returns the header and a reader
 /// positioned at the start of slice data (macroblock layer).
 pub fn parse_slice_header(
@@ -176,6 +197,13 @@ pub fn parse_slice_header(
                 num_ref_idx_l1_active = r.read_ue()? + 1;
             }
         }
+    }
+
+    // Spec 7.4.3: num_ref_idx_lX_active_minus1 is at most 15 for frames and
+    // 31 for fields (the PPS defaults allow 31 either way)
+    let max_refs = if field_pic_flag { 32 } else { 16 };
+    if num_ref_idx_l0_active > max_refs || num_ref_idx_l1_active > max_refs {
+        return Err("num_ref_idx_active out of range");
     }
 
     // ref_pic_list_modification (spec 7.3.3.1)
@@ -288,31 +316,37 @@ pub fn parse_slice_header(
                     break;
                 }
                 match op {
+                    // difference_of_pic_nums_minus1 is below MaxPicNum (up
+                    // to 2^17 for fields); long-term indices and numbers
+                    // are below 32 (spec 7.4.3.3, as FFmpeg checks)
                     1 => {
-                        let diff = r.read_ue()?;
+                        let diff = read_pic_num_diff(&mut r)?;
                         mmco_ops.push((1, diff));
                     }
                     2 => {
-                        let long_term_pic_num = r.read_ue()?;
+                        let long_term_pic_num = read_long_term_idx(&mut r)?;
                         mmco_ops.push((2, long_term_pic_num));
                     }
                     3 => {
-                        let diff = r.read_ue()?;
-                        let long_term_frame_idx = r.read_ue()?;
-                        mmco_ops.push((3, diff | (long_term_frame_idx << 16)));
+                        let diff = read_pic_num_diff(&mut r)?;
+                        let long_term_frame_idx = read_long_term_idx(&mut r)?;
+                        mmco_ops.push((3, diff | (long_term_frame_idx << MMCO_DIFF_BITS)));
                     }
                     4 => {
                         let max_long_term_frame_idx_plus1 = r.read_ue()?;
+                        if max_long_term_frame_idx_plus1 > 16 {
+                            return Err("max_long_term_frame_idx_plus1 out of range");
+                        }
                         mmco_ops.push((4, max_long_term_frame_idx_plus1));
                     }
                     5 => {
                         mmco_ops.push((5, 0));
                     }
                     6 => {
-                        let long_term_frame_idx = r.read_ue()?;
+                        let long_term_frame_idx = read_long_term_idx(&mut r)?;
                         mmco_ops.push((6, long_term_frame_idx));
                     }
-                    _ => break,
+                    _ => return Err("memory_management_control_operation out of range"),
                 }
             }
         }
@@ -335,15 +369,29 @@ pub fn parse_slice_header(
     };
 
     let slice_qp_delta = r.read_se()?;
+    // SliceQPY must lie in [-QpBdOffsetY, 51] (spec 7.4.3)
+    let qp_bd_offset = 6 * sps.bit_depth_luma_minus8 as i64;
+    let slice_qp = 26 + pps.pic_init_qp_minus26 as i64 + slice_qp_delta as i64;
+    if !(-qp_bd_offset..=51).contains(&slice_qp) {
+        return Err("slice QP out of range");
+    }
 
     let mut disable_deblocking_filter_idc = 0;
     let mut slice_alpha_c0_offset_div2 = 0;
     let mut slice_beta_offset_div2 = 0;
     if pps.deblocking_filter_control_present_flag {
         disable_deblocking_filter_idc = r.read_ue()?;
+        if disable_deblocking_filter_idc > 2 {
+            return Err("disable_deblocking_filter_idc out of range");
+        }
         if disable_deblocking_filter_idc != 1 {
             slice_alpha_c0_offset_div2 = r.read_se()?;
             slice_beta_offset_div2 = r.read_se()?;
+            if !(-6..=6).contains(&slice_alpha_c0_offset_div2)
+                || !(-6..=6).contains(&slice_beta_offset_div2)
+            {
+                return Err("deblocking filter offset out of range");
+            }
         }
     }
 
@@ -385,6 +433,92 @@ mod tests {
     use crate::nal::{parse_annex_b, NalUnitType};
     use crate::pps::parse_pps;
     use crate::sps::parse_sps;
+
+    use crate::bitstream::BitWriter;
+
+    /// SPS (4-bit frame_num, POC type 2, 16 refs) and PPS (deblocking control).
+    fn params() -> (Sps, Pps) {
+        let sps = parse_sps(&crate::sps::tests::baseline_sps(0, 0, 2, 16)).unwrap();
+        let pps = parse_pps(&crate::pps::tests::pps_with(0, 0, 0, 0), None).unwrap();
+        (sps, pps)
+    }
+
+    /// IDR I slice header with the given slice_qp_delta and deblocking offset.
+    fn idr_header(slice_qp_delta: i32, alpha_offset_div2: i32) -> Vec<u8> {
+        let mut w = BitWriter::default();
+        w.ue(0).ue(7).ue(0).u(4, 0).ue(0).u(1, 0).u(1, 0);
+        w.se(slice_qp_delta).ue(0).se(alpha_offset_div2).se(0);
+        w.finish()
+    }
+
+    /// Non-IDR reference P slice header: `num_refs` active references and
+    /// the given MMCO operations ((op, args)).
+    fn p_header(num_refs: u32, mmcos: &[(u32, &[u32])]) -> Vec<u8> {
+        let mut w = BitWriter::default();
+        w.ue(0).ue(5).ue(0).u(4, 1).u(1, 1).ue(num_refs - 1).u(1, 0);
+        w.u(1, 1);
+        for &(op, args) in mmcos {
+            w.ue(op);
+            for &a in args {
+                w.ue(a);
+            }
+        }
+        w.ue(0).se(0).ue(1);
+        w.finish()
+    }
+
+    fn parse(rbsp: &[u8], idr: bool) -> Result<SliceHeader, &'static str> {
+        let (sps, pps) = params();
+        let nal_type = if idr {
+            NalUnitType::SliceIdr
+        } else {
+            NalUnitType::Slice
+        };
+        parse_slice_header(rbsp, &sps, &pps, nal_type, 1).map(|(h, _)| h)
+    }
+
+    /// Out-of-range slice header fields are rejected (spec 7.4.3), including
+    /// values whose sums used to overflow (slice QP, deblocking offsets) or
+    /// that padded the reference lists to billions of entries.
+    #[test]
+    fn test_slice_header_field_ranges() {
+        assert!(parse(&idr_header(25, 6), true).is_ok());
+        assert!(parse(&p_header(16, &[]), false).is_ok());
+        for (rbsp, idr, what) in [
+            (idr_header(26, 0), true, "slice QP"),
+            (idr_header(i32::MAX, 0), true, "slice QP"),
+            (idr_header(0, 7), true, "deblocking filter offset"),
+            (p_header(17, &[]), false, "num_ref_idx_active"),
+            (
+                p_header(1, &[(3, &[0, 32])]),
+                false,
+                "long-term reference index",
+            ),
+            (
+                p_header(1, &[(1, &[1 << 17])]),
+                false,
+                "difference_of_pic_nums_minus1",
+            ),
+            (
+                p_header(1, &[(7, &[])]),
+                false,
+                "memory_management_control_operation",
+            ),
+        ] {
+            assert!(parse(&rbsp, idr).unwrap_err().starts_with(what), "{what}");
+        }
+    }
+
+    /// MMCO 3 keeps a 17-bit difference_of_pic_nums_minus1 (field pictures
+    /// with MaxFrameNum 2^16) apart from its long_term_frame_idx.
+    #[test]
+    fn test_mmco3_keeps_17_bit_pic_num_difference() {
+        let header = parse(&p_header(1, &[(3, &[100_000, 5])]), false).unwrap();
+        let (op, param) = header.mmco_ops[0];
+        assert_eq!(op, 3);
+        assert_eq!(param & ((1 << MMCO_DIFF_BITS) - 1), 100_000);
+        assert_eq!(param >> MMCO_DIFF_BITS, 5);
+    }
 
     #[test]
     fn test_parse_slice_header_idr() {

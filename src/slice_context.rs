@@ -233,6 +233,21 @@ impl<P: Pixel> SliceContext<'_, P> {
         (self.prev_mb_qp + delta + 52 + 2 * o).rem_euclid(52 + o) - o
     }
 
+    /// Read a CAVLC mb_qp_delta, which spec 7.4.5 limits to
+    /// [-(26 + QpBdOffsetY / 2), 25 + QpBdOffsetY / 2] (CABAC's unary code
+    /// is capped instead, see `decode_mb_qp_delta`).
+    pub(crate) fn read_mb_qp_delta(
+        reader: &mut crate::bitstream::BitstreamReader,
+    ) -> Result<i32, crate::error::DecodeError> {
+        let half = P::QP_BD_OFFSET / 2;
+        match reader.read_se()? {
+            d if (-(26 + half)..=25 + half).contains(&d) => Ok(d),
+            _ => Err(crate::error::DecodeError::InvalidSyntax(
+                "mb_qp_delta out of range",
+            )),
+        }
+    }
+
     /// log2 of the luma rows per chroma row: 1 for 4:2:0, 0 for 4:2:2.
     #[inline]
     pub(crate) fn chroma_shift_y(&self) -> usize {

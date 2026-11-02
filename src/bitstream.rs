@@ -275,3 +275,59 @@ mod tests {
         assert!(r.read_bit().is_err());
     }
 }
+
+/// MSB-first bit writer for building parameter sets and slice headers in
+/// tests (no emulation prevention: the result is RBSP).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct BitWriter {
+    bytes: alloc::vec::Vec<u8>,
+    bits: usize,
+}
+
+#[cfg(test)]
+impl BitWriter {
+    /// `width` bits of `value`, MSB first.
+    pub(crate) fn u(&mut self, width: u32, value: u32) -> &mut Self {
+        for shift in (0..width).rev() {
+            if self.bits.is_multiple_of(8) {
+                self.bytes.push(0);
+            }
+            if (value >> shift) & 1 != 0 {
+                *self.bytes.last_mut().unwrap() |= 0x80 >> (self.bits % 8);
+            }
+            self.bits += 1;
+        }
+        self
+    }
+
+    /// ue(v).
+    pub(crate) fn ue(&mut self, value: u32) -> &mut Self {
+        let code = value as u64 + 1;
+        let width = 64 - code.leading_zeros();
+        self.u(width - 1, 0);
+        for shift in (0..width).rev() {
+            self.u(1, ((code >> shift) & 1) as u32);
+        }
+        self
+    }
+
+    /// se(v).
+    pub(crate) fn se(&mut self, value: i32) -> &mut Self {
+        let code = if value > 0 {
+            2 * value as u32 - 1
+        } else {
+            2 * value.unsigned_abs()
+        };
+        self.ue(code)
+    }
+
+    /// The RBSP: the bits written, a stop bit and zero bits to a byte.
+    pub(crate) fn finish(&mut self) -> alloc::vec::Vec<u8> {
+        self.u(1, 1);
+        while !self.bits.is_multiple_of(8) {
+            self.u(1, 0);
+        }
+        core::mem::take(&mut self.bytes)
+    }
+}
