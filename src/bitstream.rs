@@ -322,6 +322,14 @@ impl BitWriter {
         self.ue(code)
     }
 
+    /// Zero bits up to the next byte boundary.
+    pub(crate) fn align(&mut self) -> &mut Self {
+        while !self.bits.is_multiple_of(8) {
+            self.u(1, 0);
+        }
+        self
+    }
+
     /// The RBSP: the bits written, a stop bit and zero bits to a byte.
     pub(crate) fn finish(&mut self) -> alloc::vec::Vec<u8> {
         self.u(1, 1);

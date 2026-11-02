@@ -36,6 +36,9 @@ pub struct SliceHeader {
     pub pic_parameter_set_id: u32,
     pub frame_num: u32,
     pub idr_pic_id: Option<u32>,
+    /// 0 for a primary coded picture; above 0 for a redundant one, which the
+    /// decoder ignores (spec 7.4.3, as FFmpeg does).
+    pub redundant_pic_cnt: u32,
     pub no_output_of_prior_pics_flag: bool,
     pub long_term_reference_flag: bool,
     pub slice_qp_delta: i32,
@@ -134,6 +137,11 @@ pub fn parse_slice_header(
     let first_mb_in_slice = r.read_ue()?;
     let slice_type_raw = r.read_ue()?;
     let slice_type = SliceType::from_raw(slice_type_raw)?;
+    // SP/SI slices are not decoded; reject them before the header fields
+    // only they have (sp_for_switch_flag, slice_qs_delta)
+    if matches!(slice_type, SliceType::Sp | SliceType::Si) {
+        return Err("unsupported slice type (SP/SI)");
+    }
     let pic_parameter_set_id = r.read_ue()?;
 
     let frame_num_bits = sps.log2_max_frame_num_minus4 + 4;
@@ -172,6 +180,14 @@ pub fn parse_slice_header(
             delta_pic_order_cnt[1] = r.read_se()?;
         }
     }
+    let redundant_pic_cnt = if pps.redundant_pic_cnt_present_flag {
+        match r.read_ue()? {
+            v @ 0..=127 => v,
+            _ => return Err("redundant_pic_cnt out of range"),
+        }
+    } else {
+        0
+    };
     // direct_spatial_mv_pred_flag (B-slices only, spec 7.3.3)
     let mut direct_spatial_mv_pred_flag = false;
     if slice_type == SliceType::B {
@@ -217,6 +233,10 @@ pub fn parse_slice_header(
                 if idc == 3 {
                     break;
                 }
+                // 4 and 5 exist only in MVC (Annex H) slices
+                if idc > 3 {
+                    return Err("modification_of_pic_nums_idc out of range");
+                }
                 let val = r.read_ue()?;
                 ref_list_mod_l0.push((idc, val));
             }
@@ -228,6 +248,9 @@ pub fn parse_slice_header(
                     let idc = r.read_ue()?;
                     if idc == 3 {
                         break;
+                    }
+                    if idc > 3 {
+                        return Err("modification_of_pic_nums_idc out of range");
                     }
                     let val = r.read_ue()?;
                     ref_list_mod_l1.push((idc, val));
@@ -401,6 +424,7 @@ pub fn parse_slice_header(
         pic_parameter_set_id,
         frame_num,
         idr_pic_id,
+        redundant_pic_cnt,
         no_output_of_prior_pics_flag,
         long_term_reference_flag,
         slice_qp_delta,
@@ -506,6 +530,21 @@ mod tests {
             ),
         ] {
             assert!(parse(&rbsp, idr).unwrap_err().starts_with(what), "{what}");
+        }
+    }
+
+    /// SP and SI slices are rejected as unsupported before the header fields
+    /// only they carry, so they are never misparsed into another error.
+    #[test]
+    fn test_sp_si_slices_are_unsupported() {
+        for slice_type in [3, 4, 8, 9] {
+            let mut w = BitWriter::default();
+            w.ue(0).ue(slice_type).ue(0).u(4, 0);
+            let err = parse(&w.finish(), false).unwrap_err();
+            assert!(matches!(
+                crate::error::DecodeError::from(err),
+                crate::error::DecodeError::Unsupported(_)
+            ));
         }
     }
 

@@ -42,8 +42,8 @@ use std::time::Duration;
 
 use crate::bitstream::BitstreamReader;
 use crate::decoder::{
-    apply_reference_marking, decoded_numbering, finish_output, has_mmco5, prepare_slice, run_slice,
-    store_parameter_set, Frame, PictureState, RowSync, SlicePlan,
+    apply_reference_marking, decoded_numbering, finish_output, has_mmco5, is_redundant_slice,
+    prepare_slice, run_slice, store_parameter_set, Frame, PictureState, RowSync, SlicePlan,
 };
 use crate::dpb::{DecodedPicture, Dpb, PictureMeta, PictureStructure, PictureWriter};
 use crate::error::DecodeError;
@@ -171,6 +171,9 @@ impl ThreadedDecoder {
                 store_parameter_set(&mut self.sps_table, &mut self.pps_table, &mut self.dpb, nal)?;
             }
             NalUnitType::SliceIdr | NalUnitType::Slice => {
+                if is_redundant_slice(&self.sps_table, &self.pps_table, nal) {
+                    return Ok(out);
+                }
                 let mut peek = BitstreamReader::new(&nal.rbsp);
                 let first_mb = peek.read_ue().unwrap_or(0);
                 let is_new_picture = first_mb == 0;

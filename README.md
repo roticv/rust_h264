@@ -36,8 +36,9 @@ every slice, rather than decoded into wrong pictures:
 - Bit depths other than 8 and 10, or chroma at a different depth from luma
 - Lossless coding (transform bypass)
 
-Also not implemented: SP/SI slices, and slice groups (FMO) or arbitrary
-slice order (ASO).
+Also not implemented: SP/SI slices (rejected with `Unsupported`), and slice
+groups (FMO) or arbitrary slice order (ASO). Redundant pictures are skipped,
+as in FFmpeg: only the primary picture is decoded.
 
 ## Minimum Rust version
 

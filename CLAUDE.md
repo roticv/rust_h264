@@ -285,5 +285,6 @@ Baseline, Main, High, High 10 and High 4:2:2 profile 8- and 10-bit 4:2:0, 4:2:2 
 ### Not Yet Implemented
 
 - Anything but 8- and 10-bit 4:2:0, 4:2:2 and 4:0:0: 4:4:4, other bit depths (9, 12+, or chroma depth different from luma), and lossless transform bypass. `check_supported` in `decoder.rs` rejects these with `DecodeError::Unsupported` when a slice activates the SPS, so they never decode into wrong pictures (`testdata/unsupported_*.h264` cover each case)
-- SP/SI slice types (parsed but not decoded)
+- SP/SI slice types (rejected with `Unsupported` when the slice type is read)
+- Redundant pictures (`redundant_pic_cnt > 0`) are skipped, as FFmpeg does (`is_redundant_slice`)
 - Slice groups / FMO (returns error)

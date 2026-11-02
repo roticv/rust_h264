@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A CABAC slice that reads more than 2 bytes past its data now stops with
     an error, as in FFmpeg, instead of decoding zeros to the end of the
     picture.
+- **Redundant pictures**: `redundant_pic_cnt` was not parsed, so every
+  slice header field after it was misread in streams whose PPS sets
+  `redundant_pic_cnt_present_flag`. It is now parsed, and slices of
+  redundant pictures are skipped, as FFmpeg does, instead of ending the
+  primary picture and decoding as an extra one.
+- **SP/SI slices** are rejected as `Unsupported` as soon as their slice type
+  is read, instead of failing on the header fields only they carry.
 - **MMCO 1 and 3 on field pictures** kept only 16 bits of
   `difference_of_pic_nums_minus1`, which may need 17 when MaxFrameNum is
   2^16, so they could unmark or mark the wrong picture.

@@ -270,6 +270,9 @@ impl Decoder {
             }
             NalUnitType::Sei => Ok(None),
             NalUnitType::SliceIdr | NalUnitType::Slice => {
+                if is_redundant_slice(&self.sps_table, &self.pps_table, nal) {
+                    return Ok(None);
+                }
                 // Peek at first_mb_in_slice to detect new vs continuation slice
                 let mut peek = BitstreamReader::new(&nal.rbsp);
                 let first_mb = peek.read_ue().unwrap_or(0);
@@ -502,6 +505,34 @@ pub(crate) struct SlicePlan {
 }
 
 /// Header-level half of slice decoding (see [`SlicePlan`]).
+/// True for a slice of a redundant coded picture (redundant_pic_cnt > 0),
+/// which is skipped as FFmpeg does: the primary picture carries the same
+/// content. Checked before the picture boundary, since a redundant
+/// picture's first slice would otherwise end the primary one.
+pub(crate) fn is_redundant_slice(
+    sps_table: &BTreeMap<u32, Arc<Sps>>,
+    pps_table: &BTreeMap<u32, Arc<Pps>>,
+    nal: &NalUnit,
+) -> bool {
+    let mut peek = BitstreamReader::new(&nal.rbsp);
+    let pps_id = (|| {
+        peek.read_ue()?;
+        peek.read_ue()?;
+        peek.read_ue()
+    })();
+    let Some(pps) = pps_id.ok().and_then(|id| pps_table.get(&id)) else {
+        return false;
+    };
+    if !pps.redundant_pic_cnt_present_flag {
+        return false;
+    }
+    let Some(sps) = sps_table.get(&pps.seq_parameter_set_id) else {
+        return false;
+    };
+    parse_slice_header(&nal.rbsp, sps, pps, nal.nal_unit_type, nal.nal_ref_idc)
+        .is_ok_and(|(header, _)| header.redundant_pic_cnt > 0)
+}
+
 pub(crate) fn prepare_slice(
     sps_table: &BTreeMap<u32, Arc<Sps>>,
     pps_table: &BTreeMap<u32, Arc<Pps>>,
@@ -4013,6 +4044,79 @@ mod tests {
     #[test]
     fn test_fuzz_regression_field_pair_mismatch() {
         fuzz_decode_avcc("decode_avcc_field_pair_mismatch.bin");
+    }
+
+    /// A 16x16 Baseline stream with a PPS that sets
+    /// redundant_pic_cnt_present_flag: an I_PCM IDR picture filled with
+    /// `primary`, then a redundant copy filled with `redundant`.
+    fn redundant_picture_stream(primary: u8, redundant: u8) -> Vec<u8> {
+        use crate::bitstream::BitWriter;
+        let mut stream = Vec::new();
+        let mut nal = |header: u8, rbsp: Vec<u8>| {
+            stream.extend_from_slice(&[0, 0, 0, 1, header]);
+            let mut zeros = 0;
+            for byte in rbsp {
+                if zeros >= 2 && byte <= 3 {
+                    stream.push(3);
+                    zeros = 0;
+                }
+                zeros = if byte == 0 { zeros + 1 } else { 0 };
+                stream.push(byte);
+            }
+        };
+        nal(0x67, crate::sps::tests::baseline_sps(0, 0, 2, 1));
+        let mut pps = BitWriter::default();
+        pps.ue(0)
+            .ue(0)
+            .u(1, 0)
+            .u(1, 0)
+            .ue(0)
+            .ue(0)
+            .ue(0)
+            .u(1, 0)
+            .u(2, 0);
+        pps.se(0).se(0).se(0).u(1, 1).u(1, 0).u(1, 1);
+        nal(0x68, pps.finish());
+        for (redundant_pic_cnt, sample) in [(0, primary), (1, redundant)] {
+            let mut w = BitWriter::default();
+            w.ue(0).ue(7).ue(0).u(4, 0).ue(0).ue(redundant_pic_cnt);
+            w.u(1, 0).u(1, 0).se(0).ue(1);
+            w.ue(25).align();
+            for _ in 0..384 {
+                w.u(8, sample as u32);
+            }
+            nal(0x65, w.finish());
+        }
+        stream
+    }
+
+    /// Slices of a redundant coded picture (redundant_pic_cnt > 0) are
+    /// skipped (spec 7.4.3, as FFmpeg does), so they neither end the primary
+    /// picture nor decode as a picture of their own; redundant_pic_cnt is
+    /// parsed, so the header fields after it are read from the right place.
+    #[test]
+    fn test_redundant_pictures_are_skipped() {
+        let stream = redundant_picture_stream(0x80, 0x40);
+        let mut decoder = Decoder::new();
+        let mut frames = Vec::new();
+        for nal in parse_annex_b(&stream) {
+            frames.extend(decoder.decode_nal(&nal).unwrap());
+        }
+        frames.extend(decoder.flush());
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].y.iter().all(|&v| v == 0x80));
+
+        #[cfg(feature = "std")]
+        {
+            let mut threaded = crate::threading::ThreadedDecoder::new(2);
+            let mut frames = Vec::new();
+            for nal in parse_annex_b(&stream) {
+                frames.extend(threaded.decode_nal(&nal).unwrap());
+            }
+            frames.extend(threaded.flush());
+            assert_eq!(frames.len(), 1);
+            assert!(frames[0].y.iter().all(|&v| v == 0x80));
+        }
     }
 
     /// A CABAC slice cut short stops with an error once it reads more than 2
