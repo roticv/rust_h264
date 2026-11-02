@@ -52,7 +52,11 @@ jobs:
         if: startsWith(matrix.target, 'decode_')
         run: |
           mkdir -p fuzz/corpus/${{ matrix.target }}
-          cp testdata/*.h264 fuzz/corpus/${{ matrix.target }}/ 2>/dev/null || true
+          # Small streams only: the multi-MB bench streams (and mutants of
+          # them, truncated to the 1 MB max input) decode tens of full
+          # 1080p pictures and exceed -timeout in the instrumented build.
+          find testdata -maxdepth 1 -name '*.h264' -size -300k \
+            -exec cp {} fuzz/corpus/${{ matrix.target }}/ \;
 
       - name: Run fuzz target
         run: |
