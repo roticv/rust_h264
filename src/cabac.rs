@@ -209,6 +209,14 @@ impl<'a> CabacReader<'a> {
         }
     }
 
+    /// True once decoding has read more than 2 bytes past the end of the
+    /// data, so the slice is truncated or corrupt. Past the end the reader
+    /// supplies zeros, which would otherwise keep decoding macroblocks to
+    /// the end of the picture (FFmpeg stops the slice at the same point).
+    pub fn overread(&self) -> bool {
+        self.pos > self.data.len() + 2
+    }
+
     /// Get the current byte position in the RBSP, accounting for buffered bits.
     /// Used for I_PCM: raw bytes start at this position.
     pub fn pcm_byte_position(&self) -> usize {

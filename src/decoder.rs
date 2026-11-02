@@ -1217,6 +1217,11 @@ fn run_slice_px<P: Pixel>(
                 prev_mb_qp = ctx.prev_mb_qp;
                 last_qp_delta_nonzero = ctx.last_qp_delta_nonzero;
             }
+            if cr.overread() {
+                return Err(DecodeError::InvalidSyntax(
+                    "CABAC read past the end of the slice data",
+                ));
+            }
             if mbaff && mb_idx % 2 != 0 {
                 let term = cr.get_cabac_terminate();
                 if term != 0 {
@@ -4008,6 +4013,34 @@ mod tests {
     #[test]
     fn test_fuzz_regression_field_pair_mismatch() {
         fuzz_decode_avcc("decode_avcc_field_pair_mismatch.bin");
+    }
+
+    /// A CABAC slice cut short stops with an error once it reads more than 2
+    /// bytes past its data, instead of decoding zeros to the end of the
+    /// picture (a fuzzer timeout: tiny slices in 1080p pictures).
+    #[test]
+    fn test_truncated_cabac_slice_stops_at_overread() {
+        let path = format!("{}/testdata/1080p_test.h264", env!("CARGO_MANIFEST_DIR"));
+        let data = std::fs::read(path).unwrap();
+        let mut decoder = Decoder::new();
+        for nal in parse_annex_b(&data) {
+            if nal.nal_unit_type != NalUnitType::SliceIdr {
+                decoder.decode_nal(&nal).unwrap();
+                continue;
+            }
+            let truncated = NalUnit {
+                rbsp: alloc::borrow::Cow::Borrowed(&nal.rbsp[..nal.rbsp.len() / 8]),
+                ..nal
+            };
+            assert!(matches!(
+                decoder.decode_nal(&truncated),
+                Err(DecodeError::InvalidSyntax(
+                    "CABAC read past the end of the slice data"
+                ))
+            ));
+            return;
+        }
+        panic!("no IDR slice");
     }
 
     /// PrevRefFrameNum from an SPS with a larger MaxFrameNum underflowed the
