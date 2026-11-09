@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   streams, so PTS values or container sample indices stay with the right frame. `M` needs no `Send`
   bound, and `ThreadedDecoder<()>` keeps the plain `decode_nal`/`flush`.
 
+### Fixed
+- **`ThreadedDecoder` no longer drops ready frames when it reports an error**:
+  a worker's macroblock error from an earlier picture, or a slice header
+  error on a slice that starts a new picture, discarded the frames the same
+  call had gathered. They are now returned, and the error is reported on the
+  next call that has no frames. `flush` still drops a pending error.
+
 ## [0.6.1] - 2026-11-02
 
 ### Fixed

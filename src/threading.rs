@@ -178,8 +178,11 @@ impl ThreadedDecoder<()> {
     /// Feed one NAL unit and return any frames that have become ready, in
     /// display order.
     ///
-    /// Errors from slice headers are reported immediately; errors from
-    /// macroblock decoding on a worker are reported on a later call.
+    /// Errors from slice headers are reported on the call that finds them;
+    /// errors from macroblock decoding on a worker are reported on a later
+    /// call. An error never discards frames that are ready: when a call has
+    /// frames to return it returns them, and the first error pending is
+    /// reported on the next call that has none. `flush` drops a pending error.
     pub fn decode_nal(&mut self, nal: &NalUnit) -> Result<Vec<Frame>, DecodeError> {
         Ok(self
             .decode_nal_buffered(nal, ())?
@@ -209,8 +212,11 @@ impl<M> ThreadedDecoder<M> {
     /// [`OrderedDecoder::decode_nal_with_meta`](crate::decoder::OrderedDecoder::decode_nal_with_meta).
     /// A frame that has no metadata (an unpaired field) is skipped.
     ///
-    /// Errors from slice headers are reported immediately; errors from
-    /// macroblock decoding on a worker are reported on a later call.
+    /// Errors from slice headers are reported on the call that finds them;
+    /// errors from macroblock decoding on a worker are reported on a later
+    /// call. An error never discards frames that are ready: when a call has
+    /// frames to return it returns them, and the first error pending is
+    /// reported on the next call that has none. `flush` drops a pending error.
     pub fn decode_nal_with_meta(
         &mut self,
         nal: &NalUnit,
@@ -280,6 +286,12 @@ impl<M> ThreadedDecoder<M> {
                     // The serial decoder swallows a failed continuation slice
                     // when it already holds part of the picture.
                     Err(_) if self.open.is_some() => {}
+                    // Frames that are ready are returned first, and the
+                    // error is reported on a later call.
+                    Err(e) if !out.is_empty() => {
+                        self.first_error.get_or_insert(e);
+                        return Ok(out);
+                    }
                     Err(e) => return Err(e),
                 }
 
@@ -293,8 +305,10 @@ impl<M> ThreadedDecoder<M> {
             _ => {}
         }
         self.pump(&mut out);
-        if let Some(e) = self.first_error.take() {
-            return Err(e);
+        if out.is_empty() {
+            if let Some(e) = self.first_error.take() {
+                return Err(e);
+            }
         }
         Ok(out)
     }
@@ -798,6 +812,46 @@ mod tests {
             }
             assert!(rejected > 0, "{name}");
             assert!(dec.flush().is_empty(), "{name}");
+        }
+    }
+
+    /// Truncating one slice NAL in the middle of a stream, inside or after its
+    /// header, loses that picture only: errors never discard frames that were
+    /// ready, whichever thread count and reorder depth.
+    #[test]
+    fn truncated_slice_keeps_other_pictures() {
+        let data = std::fs::read("testdata/p_multi_frame.h264").unwrap();
+        let slices: Vec<usize> = parse_annex_b(&data)
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n.nal_unit_type, NalUnitType::Slice | NalUnitType::SliceIdr))
+            .map(|(i, _)| i)
+            .collect();
+        let victim = slices[slices.len() / 2];
+        let all: Vec<i32> = decode_serial(&parse_annex_b(&data))
+            .iter()
+            .map(|f| f.pic_order_cnt)
+            .collect();
+        let lost = all[slices.len() / 2];
+        for len in 0..24 {
+            for threads in 1..=3 {
+                for max_depth in [0, 1, 16] {
+                    let mut nals = parse_annex_b(&data);
+                    nals[victim].rbsp.to_mut().truncate(len);
+                    let mut dec = ThreadedDecoder::with_max_depth(threads, max_depth);
+                    let mut got = Vec::new();
+                    for nal in &nals {
+                        if let Ok(frames) = dec.decode_nal(nal) {
+                            got.extend(frames.iter().map(|f| f.pic_order_cnt));
+                        }
+                    }
+                    got.extend(dec.flush().iter().map(|f| f.pic_order_cnt));
+                    assert!(
+                        all.iter().filter(|&&poc| poc != lost).all(|poc| got.contains(poc)),
+                        "cut to {len} bytes, {threads} threads, depth {max_depth}: got {got:?} of {all:?}"
+                    );
+                }
+            }
         }
     }
 
