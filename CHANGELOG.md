@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error on a slice that starts a new picture, discarded the frames the same
   call had gathered. They are now returned, and the error is reported on the
   next call that has no frames. `flush` still drops a pending error.
+- **`ThreadedDecoder` no longer waits up to 20 ms for a result it already
+  has**: with one thread this delayed every picture. The coordinator counted
+  busy workers by finished threads, and a worker sends its result just before
+  its thread finishes. It now counts pictures dispatched but not yet reported
+  and blocks on the next result.
 
 ## [0.6.1] - 2026-11-02
 
