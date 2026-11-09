@@ -140,6 +140,12 @@ therefore start while the frame it references is still being decoded, so
 both B-frame and P-only streams scale. Requires the `std` feature (on by
 default).
 
+Like `OrderedDecoder`, it is generic as `ThreadedDecoder<M = ()>`:
+`decode_nal_with_meta`/`flush_with_meta` return `(Frame, M)` pairs, the same as
+`OrderedDecoder`'s on well-formed streams, so PTS values (or the MP4 sample a picture came from)
+survive the worker threads. The metadata stays on the calling thread, so `M`
+needs no `Send` bound.
+
 ### Low-level `Decoder` (decode order)
 
 If you need raw decode order — for example, to drive a custom reorder buffer

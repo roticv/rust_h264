@@ -55,9 +55,11 @@ use crate::sps::Sps;
 type WorkerResult = Result<PictureState, DecodeError>;
 
 /// Picture currently accumulating slices on the coordinator.
-struct OpenPicture {
+struct OpenPicture<M> {
     seq: u64,
     slices: Vec<SlicePlan>,
+    /// Metadata of the slice that started the picture.
+    meta: M,
 }
 
 /// H.264 decoder that decodes several pictures concurrently and emits
@@ -81,18 +83,25 @@ struct OpenPicture {
 ///     println!("POC {}", frame.pic_order_cnt);
 /// }
 /// ```
-pub struct ThreadedDecoder {
+///
+/// It is generic as `ThreadedDecoder<M = ()>`, like
+/// [`OrderedDecoder<M>`](crate::decoder::OrderedDecoder):
+/// [`decode_nal_with_meta`](ThreadedDecoder::decode_nal_with_meta) and
+/// [`flush_with_meta`](ThreadedDecoder::flush_with_meta) return `(Frame, M)`
+/// pairs, which are the same as `OrderedDecoder`'s on well-formed streams. The metadata stays
+/// on the calling thread, so `M` needs no `Send` bound.
+pub struct ThreadedDecoder<M = ()> {
     threads: usize,
     sps_table: BTreeMap<u32, Arc<Sps>>,
     pps_table: BTreeMap<u32, Arc<Pps>>,
     /// DPB of pictures that may still be decoding on workers.
     dpb: Dpb,
-    open: Option<OpenPicture>,
+    open: Option<OpenPicture<M>>,
     next_seq: u64,
     /// Next picture (in coded order) to hand to the output stage.
     commit_next: u64,
-    /// Reorder-buffer GOP tag per dispatched picture.
-    gops: HashMap<u64, u32>,
+    /// Reorder-buffer GOP tag and metadata per dispatched picture.
+    gops: HashMap<u64, (u32, M)>,
     results: BTreeMap<u64, WorkerResult>,
     done_tx: Sender<(u64, WorkerResult)>,
     done_rx: Receiver<(u64, WorkerResult)>,
@@ -102,14 +111,18 @@ pub struct ThreadedDecoder {
     pending_field: Option<Frame>,
     /// Whether the most recent commit produced an output frame.
     last_commit_output: bool,
+    /// Metadata for the next output frame, as `OrderedDecoder::building_meta`:
+    /// it survives a commit that outputs nothing, so a field pair keeps the
+    /// metadata of its first field.
+    frame_meta: Option<M>,
     first_error: Option<DecodeError>,
     // Display-order reorder buffer with OrderedDecoder semantics.
-    buffer: Vec<(u32, Frame)>,
+    buffer: Vec<(u32, Frame, Option<M>)>,
     gop_id: u32,
     max_depth: usize,
 }
 
-impl ThreadedDecoder {
+impl<M> ThreadedDecoder<M> {
     /// Create a decoder that keeps up to `threads` pictures decoding
     /// concurrently (clamped to at least 1), with the default reorder depth.
     pub fn new(threads: usize) -> Self {
@@ -135,6 +148,7 @@ impl ThreadedDecoder {
             inflight: VecDeque::new(),
             pending_field: None,
             last_commit_output: false,
+            frame_meta: None,
             first_error: None,
             buffer: Vec::new(),
             gop_id: 0,
@@ -158,13 +172,74 @@ impl ThreadedDecoder {
         let (n, d) = self.frame_rate()?;
         Some(n as f64 / d as f64)
     }
+}
 
+impl ThreadedDecoder<()> {
     /// Feed one NAL unit and return any frames that have become ready, in
     /// display order.
     ///
     /// Errors from slice headers are reported immediately; errors from
     /// macroblock decoding on a worker are reported on a later call.
     pub fn decode_nal(&mut self, nal: &NalUnit) -> Result<Vec<Frame>, DecodeError> {
+        Ok(self
+            .decode_nal_buffered(nal, ())?
+            .into_iter()
+            .map(|(frame, _)| frame)
+            .collect())
+    }
+
+    /// Finish all in-flight pictures and return every remaining frame in
+    /// display order. Call once after the last `decode_nal`.
+    pub fn flush(&mut self) -> Vec<Frame> {
+        self.flush_buffered()
+            .into_iter()
+            .map(|(frame, _)| frame)
+            .collect()
+    }
+}
+
+impl<M> ThreadedDecoder<M> {
+    /// Feed one NAL unit with per-picture metadata and return any frames that
+    /// have become ready, in display order, each with its metadata.
+    ///
+    /// Metadata is taken from the slice NAL that starts a picture and ignored
+    /// for other NALs; continuation slices keep the metadata of the picture's
+    /// first slice, and a field pair keeps the metadata of its first field. On
+    /// well-formed streams the pairs are those of
+    /// [`OrderedDecoder::decode_nal_with_meta`](crate::decoder::OrderedDecoder::decode_nal_with_meta).
+    /// A frame that has no metadata (an unpaired field) is skipped.
+    ///
+    /// Errors from slice headers are reported immediately; errors from
+    /// macroblock decoding on a worker are reported on a later call.
+    pub fn decode_nal_with_meta(
+        &mut self,
+        nal: &NalUnit,
+        meta: M,
+    ) -> Result<Vec<(Frame, M)>, DecodeError> {
+        Ok(Self::paired(self.decode_nal_buffered(nal, meta)?))
+    }
+
+    /// Finish all in-flight pictures and return every remaining frame with its
+    /// metadata in display order. Call once after the last `decode_nal_with_meta`.
+    /// A frame that has no metadata (an unpaired field) is skipped.
+    pub fn flush_with_meta(&mut self) -> Vec<(Frame, M)> {
+        Self::paired(self.flush_buffered())
+    }
+
+    /// Keep the frames that have metadata
+    fn paired(frames: Vec<(Frame, Option<M>)>) -> Vec<(Frame, M)> {
+        frames
+            .into_iter()
+            .filter_map(|(frame, meta)| meta.map(|meta| (frame, meta)))
+            .collect()
+    }
+
+    /// Decode one NAL unit, pairing each frame with its metadata if it has any
+    fn decode_nal_buffered(
+        &mut self,
+        nal: &NalUnit,
+        meta: M,
+    ) -> Result<Vec<(Frame, Option<M>)>, DecodeError> {
         let mut out = Vec::new();
         match nal.nal_unit_type {
             NalUnitType::Sps | NalUnitType::Pps => {
@@ -197,6 +272,7 @@ impl ThreadedDecoder {
                             self.open = Some(OpenPicture {
                                 seq,
                                 slices: Vec::new(),
+                                meta,
                             });
                         }
                         self.open.as_mut().unwrap().slices.push(plan);
@@ -223,9 +299,8 @@ impl ThreadedDecoder {
         Ok(out)
     }
 
-    /// Finish all in-flight pictures and return every remaining frame in
-    /// display order. Call once after the last `decode_nal`.
-    pub fn flush(&mut self) -> Vec<Frame> {
+    /// Flush, pairing each frame with its metadata if it has any
+    fn flush_buffered(&mut self) -> Vec<(Frame, Option<M>)> {
         let closed = self.close_open_picture();
         let mut out = Vec::new();
         while let Some(handle) = self.inflight.pop_front() {
@@ -238,11 +313,12 @@ impl ThreadedDecoder {
         // output a lone pending field as a half-height frame.
         if !closed || !self.last_commit_output {
             if let Some(field) = self.pending_field.take() {
-                self.buffer.push((self.gop_id, field));
+                self.buffer
+                    .push((self.gop_id, field, self.frame_meta.take()));
             }
         }
-        self.buffer.sort_by_key(|(g, f)| (*g, f.pic_order_cnt));
-        out.extend(self.buffer.drain(..).map(|(_, f)| f));
+        self.buffer.sort_by_key(|(g, f, _)| (*g, f.pic_order_cnt));
+        out.extend(self.buffer.drain(..).map(|(_, f, m)| (f, m)));
         out
     }
 
@@ -307,7 +383,7 @@ impl ThreadedDecoder {
         if has_mmco5(&last.header.mmco_ops) {
             self.gop_id += 1;
         }
-        self.gops.insert(open.seq, self.gop_id);
+        self.gops.insert(open.seq, (self.gop_id, open.meta));
 
         let seq = open.seq;
         let slices = open.slices;
@@ -325,23 +401,34 @@ impl ThreadedDecoder {
 
     /// Collect finished pictures and hand them to the output stage in coded
     /// order, emitting display-ready frames into `out`.
-    fn pump(&mut self, out: &mut Vec<Frame>) {
+    fn pump(&mut self, out: &mut Vec<(Frame, Option<M>)>) {
         while let Ok((seq, res)) = self.done_rx.try_recv() {
             self.results.insert(seq, res);
         }
         self.inflight.retain(|h| !h.is_finished());
 
         while let Some(res) = self.results.remove(&self.commit_next) {
-            let gop = self.gops.remove(&self.commit_next).unwrap_or(self.gop_id);
+            let (gop, meta) = self
+                .gops
+                .remove(&self.commit_next)
+                .expect("every dispatched picture has a recorded GOP and metadata");
             self.commit_next += 1;
             match res {
-                Ok(ps) => match finish_output(ps, &mut self.pending_field) {
-                    Some(frame) => {
-                        self.last_commit_output = true;
-                        self.push_frame(gop, frame, out);
+                Ok(ps) => {
+                    // An earlier commit that output nothing (a first field)
+                    // still holds its metadata, which wins over this picture's
+                    let meta = self.frame_meta.take().unwrap_or(meta);
+                    match finish_output(ps, &mut self.pending_field) {
+                        Some(frame) => {
+                            self.last_commit_output = true;
+                            self.push_frame(gop, frame, Some(meta), out);
+                        }
+                        None => {
+                            self.frame_meta = Some(meta);
+                            self.last_commit_output = false;
+                        }
                     }
-                    None => self.last_commit_output = false,
-                },
+                }
                 Err(e) => {
                     if self.first_error.is_none() {
                         self.first_error = Some(e);
@@ -368,10 +455,16 @@ impl ThreadedDecoder {
     /// coded order, so the first frame of a newer GOP proves every older GOP
     /// is complete: drain them as one POC-sorted batch (what OrderedDecoder
     /// does when the IDR NAL arrives), then push and bound the depth.
-    fn push_frame(&mut self, gop: u32, frame: Frame, out: &mut Vec<Frame>) {
-        if self.buffer.iter().any(|(g, _)| *g < gop) {
-            let mut completed: Vec<(u32, Frame)> = Vec::new();
-            let mut remaining: Vec<(u32, Frame)> = Vec::with_capacity(self.buffer.len());
+    fn push_frame(
+        &mut self,
+        gop: u32,
+        frame: Frame,
+        meta: Option<M>,
+        out: &mut Vec<(Frame, Option<M>)>,
+    ) {
+        if self.buffer.iter().any(|(g, _, _)| *g < gop) {
+            let mut completed: Vec<(u32, Frame, Option<M>)> = Vec::new();
+            let mut remaining: Vec<(u32, Frame, Option<M>)> = Vec::with_capacity(self.buffer.len());
             for entry in self.buffer.drain(..) {
                 if entry.0 < gop {
                     completed.push(entry);
@@ -379,25 +472,26 @@ impl ThreadedDecoder {
                     remaining.push(entry);
                 }
             }
-            completed.sort_by_key(|(g, f)| (*g, f.pic_order_cnt));
-            out.extend(completed.into_iter().map(|(_, f)| f));
+            completed.sort_by_key(|(g, f, _)| (*g, f.pic_order_cnt));
+            out.extend(completed.into_iter().map(|(_, f, m)| (f, m)));
             self.buffer = remaining;
         }
-        self.buffer.push((gop, frame));
+        self.buffer.push((gop, frame, meta));
         while self.buffer.len() > self.max_depth {
             let idx = self
                 .buffer
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, (g, f))| (*g, f.pic_order_cnt))
+                .min_by_key(|(_, (g, f, _))| (*g, f.pic_order_cnt))
                 .map(|(i, _)| i)
                 .unwrap();
-            out.push(self.buffer.remove(idx).1);
+            let (_, frame, meta) = self.buffer.remove(idx);
+            out.push((frame, meta));
         }
     }
 }
 
-impl Drop for ThreadedDecoder {
+impl<M> Drop for ThreadedDecoder<M> {
     fn drop(&mut self) {
         // Workers only wait on each other, never on the coordinator, so they
         // all finish on their own.
@@ -543,6 +637,83 @@ mod tests {
     #[test]
     fn threaded_matches_serial_4_threads() {
         compare_all(4);
+    }
+
+    /// Decode with the NAL's index as metadata: non-slice NALs and
+    /// continuation slices must not change which index a frame carries.
+    fn decode_serial_meta(nals: &[NalUnit], max_depth: usize) -> Vec<(Frame, usize)> {
+        let mut dec = OrderedDecoder::with_max_depth(max_depth);
+        let mut frames = Vec::new();
+        for (i, nal) in nals.iter().enumerate() {
+            if let Ok(f) = dec.decode_nal_with_meta(nal, i) {
+                frames.extend(f);
+            }
+        }
+        frames.extend(dec.flush_with_meta());
+        frames
+    }
+
+    fn decode_threaded_meta(
+        nals: &[NalUnit],
+        threads: usize,
+        max_depth: usize,
+    ) -> Vec<(Frame, usize)> {
+        let mut dec = ThreadedDecoder::with_max_depth(threads, max_depth);
+        let mut frames = Vec::new();
+        for (i, nal) in nals.iter().enumerate() {
+            if let Ok(f) = dec.decode_nal_with_meta(nal, i) {
+                frames.extend(f);
+            }
+        }
+        frames.extend(dec.flush_with_meta());
+        frames
+    }
+
+    fn compare_all_meta(threads: usize, max_depth: usize) {
+        for path in all_streams() {
+            let data = std::fs::read(&path).unwrap();
+            let nals = parse_annex_b(&data);
+            let name = path.display().to_string();
+            let serial = decode_serial_meta(&nals, max_depth);
+            let threaded = decode_threaded_meta(&nals, threads, max_depth);
+            let (serial_frames, serial_meta): (Vec<_>, Vec<_>) = serial.into_iter().unzip();
+            let (threaded_frames, threaded_meta): (Vec<_>, Vec<_>) = threaded.into_iter().unzip();
+            assert_same(&name, &serial_frames, &threaded_frames);
+            assert_eq!(serial_meta, threaded_meta, "{name}: metadata differs");
+        }
+    }
+
+    #[test]
+    fn threaded_meta_matches_serial_1_thread() {
+        compare_all_meta(1, 16);
+    }
+
+    #[test]
+    fn threaded_meta_matches_serial_2_threads() {
+        compare_all_meta(2, 16);
+    }
+
+    #[test]
+    fn threaded_meta_matches_serial_4_threads() {
+        compare_all_meta(4, 16);
+    }
+
+    /// A small reorder depth evicts from a full buffer on most pictures.
+    #[test]
+    fn threaded_meta_matches_serial_small_max_depth() {
+        compare_all_meta(2, 2);
+    }
+
+    /// A flipped SPS bit leaves an unpaired first field followed by a frame
+    /// picture: nothing may panic, and the plain path outputs every frame
+    /// (four, as before metadata was added).
+    #[test]
+    fn unpaired_field_does_not_panic() {
+        let data = std::fs::read("testdata/cabac_b_test.h264").unwrap();
+        let mut nals = parse_annex_b(&data);
+        nals[0].rbsp.to_mut()[3] ^= 0x02;
+        assert_eq!(decode_threaded(&nals, 2).len(), 4);
+        decode_threaded_meta(&nals, 2, 16);
     }
 
     #[test]
