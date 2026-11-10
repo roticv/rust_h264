@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Per-picture metadata for `ThreadedDecoder`**: it is now
   `ThreadedDecoder<M = ()>`, and `decode_nal_with_meta`/`flush_with_meta`
   return `(Frame, M)` pairs, the same as `OrderedDecoder<M>`'s on well-formed
-  streams, so PTS values or container sample indices stay with the right frame. `M` needs no `Send`
-  bound, and `ThreadedDecoder<()>` keeps the plain `decode_nal`/`flush`.
+  streams, so PTS values or container sample indices stay with the right
+  frame. `M` needs no `Send` bound, and `ThreadedDecoder<()>` keeps the plain
+  `decode_nal`/`flush`.
 
 ### Fixed
 - **`ThreadedDecoder` no longer drops ready frames when it reports an error**:

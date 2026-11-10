@@ -87,8 +87,8 @@ struct OpenPicture<M> {
 /// [`OrderedDecoder<M>`](crate::decoder::OrderedDecoder):
 /// [`decode_nal_with_meta`](ThreadedDecoder::decode_nal_with_meta) and
 /// [`flush_with_meta`](ThreadedDecoder::flush_with_meta) return `(Frame, M)`
-/// pairs, which are the same as `OrderedDecoder`'s on well-formed streams. The metadata stays
-/// on the calling thread, so `M` needs no `Send` bound.
+/// pairs, which are the same as `OrderedDecoder`'s on well-formed streams.
+/// The metadata stays on the calling thread, so `M` needs no `Send` bound.
 pub struct ThreadedDecoder<M = ()> {
     threads: usize,
     sps_table: BTreeMap<u32, Arc<Sps>>,
@@ -112,15 +112,14 @@ pub struct ThreadedDecoder<M = ()> {
     /// First field of a field pair awaiting its complement (serial
     /// `Decoder::pending_field` equivalent; handled at commit time).
     pending_field: Option<Frame>,
+    /// Metadata of `pending_field`, set exactly when it is: a field pair
+    /// takes its first field's metadata, and a lone field keeps its own.
+    pending_meta: Option<M>,
     /// Whether the most recent commit produced an output frame.
     last_commit_output: bool,
-    /// Metadata for the next output frame, as `OrderedDecoder::building_meta`:
-    /// it survives a commit that outputs nothing, so a field pair keeps the
-    /// metadata of its first field.
-    frame_meta: Option<M>,
     first_error: Option<DecodeError>,
     // Display-order reorder buffer with OrderedDecoder semantics.
-    buffer: Vec<(u32, Frame, Option<M>)>,
+    buffer: Vec<(u32, Frame, M)>,
     gop_id: u32,
     max_depth: usize,
 }
@@ -151,8 +150,8 @@ impl<M> ThreadedDecoder<M> {
             inflight: VecDeque::new(),
             unreported: 0,
             pending_field: None,
+            pending_meta: None,
             last_commit_output: false,
-            frame_meta: None,
             first_error: None,
             buffer: Vec::new(),
             gop_id: 0,
@@ -214,7 +213,6 @@ impl<M> ThreadedDecoder<M> {
     /// first slice, and a field pair keeps the metadata of its first field. On
     /// well-formed streams the pairs are those of
     /// [`OrderedDecoder::decode_nal_with_meta`](crate::decoder::OrderedDecoder::decode_nal_with_meta).
-    /// A frame that has no metadata (an unpaired field) is skipped.
     ///
     /// Errors from slice headers are reported on the call that finds them;
     /// errors from macroblock decoding on a worker are reported on a later
@@ -226,30 +224,21 @@ impl<M> ThreadedDecoder<M> {
         nal: &NalUnit,
         meta: M,
     ) -> Result<Vec<(Frame, M)>, DecodeError> {
-        Ok(Self::paired(self.decode_nal_buffered(nal, meta)?))
+        self.decode_nal_buffered(nal, meta)
     }
 
     /// Finish all in-flight pictures and return every remaining frame with its
-    /// metadata in display order. Call once after the last `decode_nal_with_meta`.
-    /// A frame that has no metadata (an unpaired field) is skipped.
+    /// metadata in display order. Call once after the last
+    /// `decode_nal_with_meta`.
     pub fn flush_with_meta(&mut self) -> Vec<(Frame, M)> {
-        Self::paired(self.flush_buffered())
+        self.flush_buffered()
     }
 
-    /// Keep the frames that have metadata
-    fn paired(frames: Vec<(Frame, Option<M>)>) -> Vec<(Frame, M)> {
-        frames
-            .into_iter()
-            .filter_map(|(frame, meta)| meta.map(|meta| (frame, meta)))
-            .collect()
-    }
-
-    /// Decode one NAL unit, pairing each frame with its metadata if it has any
     fn decode_nal_buffered(
         &mut self,
         nal: &NalUnit,
         meta: M,
-    ) -> Result<Vec<(Frame, Option<M>)>, DecodeError> {
+    ) -> Result<Vec<(Frame, M)>, DecodeError> {
         let mut out = Vec::new();
         match nal.nal_unit_type {
             NalUnitType::Sps | NalUnitType::Pps => {
@@ -317,8 +306,7 @@ impl<M> ThreadedDecoder<M> {
         Ok(out)
     }
 
-    /// Flush, pairing each frame with its metadata if it has any
-    fn flush_buffered(&mut self) -> Vec<(Frame, Option<M>)> {
+    fn flush_buffered(&mut self) -> Vec<(Frame, M)> {
         let closed = self.close_open_picture();
         let mut out = Vec::new();
         while let Some(handle) = self.inflight.pop_front() {
@@ -330,9 +318,9 @@ impl<M> ThreadedDecoder<M> {
         // Serial flush: finalize the last picture; if that produced no frame,
         // output a lone pending field as a half-height frame.
         if !closed || !self.last_commit_output {
-            if let Some(field) = self.pending_field.take() {
-                self.buffer
-                    .push((self.gop_id, field, self.frame_meta.take()));
+            if let (Some(field), Some(meta)) = (self.pending_field.take(), self.pending_meta.take())
+            {
+                self.buffer.push((self.gop_id, field, meta));
             }
         }
         self.buffer.sort_by_key(|(g, f, _)| (*g, f.pic_order_cnt));
@@ -420,7 +408,7 @@ impl<M> ThreadedDecoder<M> {
 
     /// Collect finished pictures and hand them to the output stage in coded
     /// order, emitting display-ready frames into `out`.
-    fn pump(&mut self, out: &mut Vec<(Frame, Option<M>)>) {
+    fn pump(&mut self, out: &mut Vec<(Frame, M)>) {
         while let Ok((seq, res)) = self.done_rx.try_recv() {
             self.results.insert(seq, res);
             self.unreported -= 1;
@@ -435,16 +423,29 @@ impl<M> ThreadedDecoder<M> {
             self.commit_next += 1;
             match res {
                 Ok(ps) => {
-                    // An earlier commit that output nothing (a first field)
-                    // still holds its metadata, which wins over this picture's
-                    let meta = self.frame_meta.take().unwrap_or(meta);
+                    let is_field = ps.field_pic_flag;
                     match finish_output(ps, &mut self.pending_field) {
                         Some(frame) => {
+                            // A second field completes the pair, which keeps
+                            // the first field's metadata. A frame picture
+                            // keeps its own and leaves a pending field alone.
+                            let meta = match (is_field, self.pending_meta.take()) {
+                                (true, Some(first)) => first,
+                                (false, pending) => {
+                                    self.pending_meta = pending;
+                                    meta
+                                }
+                                (true, None) => meta,
+                            };
                             self.last_commit_output = true;
-                            self.push_frame(gop, frame, Some(meta), out);
+                            self.push_frame(gop, frame, meta, out);
                         }
                         None => {
-                            self.frame_meta = Some(meta);
+                            // A field held as a first field (or replacing a
+                            // stale one) takes this picture's metadata
+                            if is_field {
+                                self.pending_meta = self.pending_field.as_ref().map(|_| meta);
+                            }
                             self.last_commit_output = false;
                         }
                     }
@@ -473,16 +474,10 @@ impl<M> ThreadedDecoder<M> {
     /// coded order, so the first frame of a newer GOP proves every older GOP
     /// is complete: drain them as one POC-sorted batch (what OrderedDecoder
     /// does when the IDR NAL arrives), then push and bound the depth.
-    fn push_frame(
-        &mut self,
-        gop: u32,
-        frame: Frame,
-        meta: Option<M>,
-        out: &mut Vec<(Frame, Option<M>)>,
-    ) {
+    fn push_frame(&mut self, gop: u32, frame: Frame, meta: M, out: &mut Vec<(Frame, M)>) {
         if self.buffer.iter().any(|(g, _, _)| *g < gop) {
-            let mut completed: Vec<(u32, Frame, Option<M>)> = Vec::new();
-            let mut remaining: Vec<(u32, Frame, Option<M>)> = Vec::with_capacity(self.buffer.len());
+            let mut completed = Vec::new();
+            let mut remaining = Vec::with_capacity(self.buffer.len());
             for entry in self.buffer.drain(..) {
                 if entry.0 < gop {
                     completed.push(entry);
@@ -723,16 +718,25 @@ mod tests {
         compare_all_meta(2, 2);
     }
 
-    /// A flipped SPS bit leaves an unpaired first field followed by a frame
-    /// picture: nothing may panic, and the plain path outputs every frame
-    /// (four, as before metadata was added).
+    /// A flipped SPS bit leaves an unpaired first field followed by frame
+    /// pictures. The metadata path outputs the same four frames as the plain
+    /// path: the lone field keeps its own metadata (the IDR NAL, index 3) and
+    /// does not pass it to the frame after it.
     #[test]
-    fn unpaired_field_does_not_panic() {
+    fn unpaired_field_keeps_its_metadata() {
         let data = std::fs::read("testdata/cabac_b_test.h264").unwrap();
         let mut nals = parse_annex_b(&data);
         nals[0].rbsp.to_mut()[3] ^= 0x02;
-        assert_eq!(decode_threaded(&nals, 2).len(), 4);
-        decode_threaded_meta(&nals, 2, 16);
+        let plain = decode_threaded(&nals, 2);
+        assert_eq!(plain.len(), 4);
+        let with_meta = decode_threaded_meta(&nals, 2, 16);
+        let pocs = |frames: &[Frame]| frames.iter().map(|f| f.pic_order_cnt).collect::<Vec<_>>();
+        let (frames, meta): (Vec<_>, Vec<_>) = with_meta.into_iter().unzip();
+        assert_eq!(pocs(&frames), pocs(&plain));
+        assert_eq!(meta[0], 3, "lone field: {meta:?}");
+        let mut distinct = meta.clone();
+        distinct.dedup();
+        assert_eq!(distinct, meta, "one picture's metadata on two frames");
     }
 
     #[test]
