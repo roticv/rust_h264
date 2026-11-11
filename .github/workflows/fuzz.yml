@@ -1,13 +1,15 @@
 name: Fuzz
 
 # Periodic fuzzing job: runs each cargo-fuzz target for a few minutes to
-# catch panics on malformed input. Triggered weekly and on manual dispatch.
+# catch panics on malformed input. Triggered daily and on manual dispatch.
+# Each target's corpus is kept in the Actions cache between runs, so
+# coverage builds up over days instead of restarting from the seeds.
 #
 # To run locally for the same duration:
-#   cargo +nightly fuzz run <target> -- -max_total_time=180
+#   cargo +nightly fuzz run <target> -- -max_total_time=<seconds>
 on:
   schedule:
-    - cron: '0 6 * * 1' # 06:00 UTC every Monday
+    - cron: '0 6 * * *' # 06:00 UTC every day
   workflow_dispatch: {} # allow manual runs from the Actions tab
   push:
     paths:
@@ -17,16 +19,22 @@ on:
 jobs:
   fuzz:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - parse_annex_b
-          - parse_avcc
-          - parse_avcc_config
-          - decode_annex_b
-          - decode_avcc
+        # The decode targets get more time: the macroblock layer they reach
+        # is far larger than the parsers
+        include:
+          - { target: parse_annex_b, seconds: 180 }
+          - { target: parse_avcc, seconds: 180 }
+          - { target: parse_avcc_config, seconds: 180 }
+          - { target: decode_annex_b, seconds: 600 }
+          - { target: decode_avcc, seconds: 600 }
+          # Slice-data inputs are a stream index plus 4-byte edits: allow up
+          # to 16 edits from the start instead of growing the length slowly
+          - { target: decode_slice_data, seconds: 900, args: '-max_len=65 -len_control=0' }
+          - { target: decode_threaded, seconds: 600, args: '-max_len=65 -len_control=0' }
     steps:
       - uses: actions/checkout@v4
 
@@ -48,8 +56,16 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
-      - name: Seed corpus from test data (decode targets only)
-        if: startsWith(matrix.target, 'decode_')
+      - name: Restore corpus from earlier runs
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Seed corpus from test data (whole-stream decode targets)
+        if: matrix.target == 'decode_annex_b' || matrix.target == 'decode_avcc'
         run: |
           mkdir -p fuzz/corpus/${{ matrix.target }}
           # Small streams only: the multi-MB bench streams (and mutants of
@@ -58,11 +74,32 @@ jobs:
           find testdata -maxdepth 1 -name '*.h264' -size -300k \
             -exec cp {} fuzz/corpus/${{ matrix.target }}/ \;
 
+      - name: Seed corpus with the base streams (slice-data targets)
+        if: matrix.target == 'decode_slice_data' || matrix.target == 'decode_threaded'
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          # One single-byte input per base stream in
+          # fuzz/common/slice_mutation.rs (22 streams)
+          for i in $(seq 0 21); do
+            printf "\\$(printf %03o $i)" > fuzz/corpus/${{ matrix.target }}/seed_$i
+          done
+
       - name: Run fuzz target
         run: |
-          # 3 minutes per target. Increase if you want deeper coverage.
           cargo +nightly fuzz run ${{ matrix.target }} \
-            -- -max_total_time=180 -timeout=10
+            -- -max_total_time=${{ matrix.seconds }} -timeout=10 ${{ matrix.args }}
+
+      - name: Minimize corpus
+        # Keeps only inputs that add coverage, so the corpus loaded at the
+        # start of each run stays small as it accumulates
+        run: cargo +nightly fuzz cmin ${{ matrix.target }} -- -timeout=10
+
+      - name: Save corpus for the next run
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload crash artifacts on failure
         if: failure()

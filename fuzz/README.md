@@ -22,6 +22,15 @@ with `rustup toolchain install nightly` if you don't already have it.
 | `parse_avcc_config` | The MP4 `avcC` configuration record parser (`nal::parse_avcc_config`) |
 | `decode_annex_b` | End-to-end: parse Annex B + feed every NAL to `Decoder` |
 | `decode_avcc` | End-to-end: split input into avcC + sample, feed both to `Decoder` |
+| `decode_slice_data` | The macroblock layer: a real test stream with its slice NALs damaged by small edits (byte XORs, truncations) the fuzzer picks, decoded with `OrderedDecoder` |
+| `decode_threaded` | The `decode_slice_data` inputs decoded with `ThreadedDecoder` (3 threads) |
+
+Whole-stream byte mutations (`decode_annex_b`) mostly break the SPS, PPS or
+slice header and stop there. `decode_slice_data` and `decode_threaded` keep
+those valid: their first input byte picks one of the base streams listed in
+`common/slice_mutation.rs` (CAVLC and CABAC, B-frames, MBAFF and field
+pictures, I_PCM, weighted prediction, long-term references, 10-bit, 4:2:2,
+monochrome), and each following 4-byte group is one edit to one of its slices.
 
 ## Running
 
@@ -57,9 +66,20 @@ cp ../testdata/*.h264 fuzz/corpus/decode_annex_b/
 libFuzzer will mutate these to discover new code paths much faster than
 starting from random bytes.
 
+The slice-data targets need no files: one single-byte input per base stream
+(byte values 0 to 21) decodes each stream unchanged, and libFuzzer adds edits
+from there:
+
+```sh
+mkdir -p fuzz/corpus/decode_slice_data
+for i in $(seq 0 21); do printf "\\$(printf %03o $i)" > fuzz/corpus/decode_slice_data/seed_$i; done
+```
+
 ## Time budget
 
 A few minutes per target catches obvious crashes. An overnight run on the
-end-to-end targets gives much better coverage. CI integration is left as
-an exercise — `cargo fuzz run <target> -- -max_total_time=300` runs for 5
-minutes per target which is reasonable for a periodic job.
+end-to-end targets gives much better coverage.
+
+CI (`.github/workflows/fuzz.yml`) runs every target daily, 3 to 15 minutes
+each, and keeps each target's corpus in the Actions cache between runs, so
+coverage accumulates instead of restarting from the seeds every time.

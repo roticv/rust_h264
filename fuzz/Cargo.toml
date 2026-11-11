@@ -54,3 +54,17 @@ path = "fuzz_targets/decode_avcc.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decode_slice_data"
+path = "fuzz_targets/decode_slice_data.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_threaded"
+path = "fuzz_targets/decode_threaded.rs"
+test = false
+doc = false
+bench = false
