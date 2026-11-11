@@ -306,7 +306,11 @@ impl<P: Pixel> SliceContext<'_, P> {
                     self.mb_cbp[mb_idx] = (cbp_luma as u16) | ((cbp_chroma as u16) << 4);
 
                     let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
-                        let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
+                        let delta = cr.decode_mb_qp_delta(
+                            st,
+                            self.last_qp_delta_nonzero,
+                            51 + P::QP_BD_OFFSET as u32,
+                        )?;
                         self.last_qp_delta_nonzero = delta != 0;
                         self.next_qp(delta)
                     } else {
@@ -458,6 +462,12 @@ impl<P: Pixel> SliceContext<'_, P> {
                     let mt = i_mb_type - 1;
                     let i16_pred = (mt % 4) as u8;
                     let cbp_chroma = ((mt / 4) % 3) as u8;
+                    // Spec 7.4.5: a 4:0:0 I16x16 mb_type has CodedBlockPatternChroma 0
+                    if sp.monochrome && cbp_chroma != 0 {
+                        return Err(DecodeError::InvalidSyntax(
+                            "I16x16 chroma cbp in a monochrome stream",
+                        ));
+                    }
                     let cbp_luma = if mt >= 12 { 15u8 } else { 0u8 };
                     let left_cm = if let Some(left) = self.left_mb(mb_idx) {
                         self.mb_chroma_pred[left]
@@ -476,7 +486,11 @@ impl<P: Pixel> SliceContext<'_, P> {
                     };
                     self.mb_chroma_pred[mb_idx] = intra_chroma_pred_mode;
 
-                    let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
+                    let delta = cr.decode_mb_qp_delta(
+                        st,
+                        self.last_qp_delta_nonzero,
+                        51 + P::QP_BD_OFFSET as u32,
+                    )?;
                     self.last_qp_delta_nonzero = delta != 0;
                     let qp_y = self.next_qp(delta);
                     self.prev_mb_qp = qp_y;
@@ -703,7 +717,12 @@ impl<P: Pixel> SliceContext<'_, P> {
                                     self.mbaff,
                                     self.mb_field_decoding,
                                 );
-                                *sr = cr.decode_ref_idx(st, left_ref, top_ref);
+                                *sr = cr.decode_ref_idx(
+                                    st,
+                                    left_ref,
+                                    top_ref,
+                                    self.effective_num_ref(mb_idx, sp.num_ref_idx_l0_active),
+                                )?;
                             }
                             // Write ref_idx immediately for neighbor context
                             let (sy, sx) = sub_mb_origins[smb];
@@ -880,7 +899,12 @@ impl<P: Pixel> SliceContext<'_, P> {
                                 self.mbaff,
                                 self.mb_field_decoding,
                             );
-                            *ref_entry = cr.decode_ref_idx(st, left_ref, top_ref);
+                            *ref_entry = cr.decode_ref_idx(
+                                st,
+                                left_ref,
+                                top_ref,
+                                self.effective_num_ref(mb_idx, sp.num_ref_idx_l0_active),
+                            )?;
                         }
                         // Write ref_idx to store immediately so the next
                         // partition can see it as a neighbor.
@@ -1048,7 +1072,11 @@ impl<P: Pixel> SliceContext<'_, P> {
                 self.mb_is_8x8dct[mb_idx] = use_8x8_inter;
 
                 let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
-                    let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
+                    let delta = cr.decode_mb_qp_delta(
+                        st,
+                        self.last_qp_delta_nonzero,
+                        51 + P::QP_BD_OFFSET as u32,
+                    )?;
                     self.last_qp_delta_nonzero = delta != 0;
                     self.next_qp(delta)
                 } else {
@@ -1330,7 +1358,12 @@ impl<P: Pixel> SliceContext<'_, P> {
                             self.mbaff,
                             self.mb_field_decoding,
                         );
-                        ref_l0 = cr.decode_ref_idx(st, left_ref, top_ref);
+                        ref_l0 = cr.decode_ref_idx(
+                            st,
+                            left_ref,
+                            top_ref,
+                            self.effective_num_ref(mb_idx, sp.num_ref_idx_l0_active),
+                        )?;
                     }
                     if pred_l1 && self.effective_num_ref(mb_idx, sp.num_ref_idx_l1_active) > 1 {
                         let (left_ref, top_ref) = cabac_neighbor_ref(
@@ -1347,7 +1380,12 @@ impl<P: Pixel> SliceContext<'_, P> {
                             self.mbaff,
                             self.mb_field_decoding,
                         );
-                        ref_l1 = cr.decode_ref_idx(st, left_ref, top_ref);
+                        ref_l1 = cr.decode_ref_idx(
+                            st,
+                            left_ref,
+                            top_ref,
+                            self.effective_num_ref(mb_idx, sp.num_ref_idx_l1_active),
+                        )?;
                     }
 
                     let mut mv_l0 = [0i16; 2];
@@ -1511,7 +1549,12 @@ impl<P: Pixel> SliceContext<'_, P> {
                                     self.mbaff,
                                     self.mb_field_decoding,
                                 );
-                                part_ref_l0[p] = cr.decode_ref_idx(st, left_ref, top_ref);
+                                part_ref_l0[p] = cr.decode_ref_idx(
+                                    st,
+                                    left_ref,
+                                    top_ref,
+                                    self.effective_num_ref(mb_idx, sp.num_ref_idx_l0_active),
+                                )?;
                             } else {
                                 part_ref_l0[p] = 0;
                             }
@@ -1546,7 +1589,12 @@ impl<P: Pixel> SliceContext<'_, P> {
                                     self.mbaff,
                                     self.mb_field_decoding,
                                 );
-                                part_ref_l1[p] = cr.decode_ref_idx(st, left_ref, top_ref);
+                                part_ref_l1[p] = cr.decode_ref_idx(
+                                    st,
+                                    left_ref,
+                                    top_ref,
+                                    self.effective_num_ref(mb_idx, sp.num_ref_idx_l1_active),
+                                )?;
                             } else {
                                 part_ref_l1[p] = 0;
                             }
@@ -1791,7 +1839,12 @@ impl<P: Pixel> SliceContext<'_, P> {
                                         self.mbaff,
                                         self.mb_field_decoding,
                                     );
-                                    sub_ref_l0[smb] = cr.decode_ref_idx(st, left_ref, top_ref);
+                                    sub_ref_l0[smb] = cr.decode_ref_idx(
+                                        st,
+                                        left_ref,
+                                        top_ref,
+                                        self.effective_num_ref(mb_idx, sp.num_ref_idx_l0_active),
+                                    )?;
                                 } else {
                                     sub_ref_l0[smb] = 0;
                                 }
@@ -1830,7 +1883,12 @@ impl<P: Pixel> SliceContext<'_, P> {
                                         self.mbaff,
                                         self.mb_field_decoding,
                                     );
-                                    sub_ref_l1[smb] = cr.decode_ref_idx(st, left_ref, top_ref);
+                                    sub_ref_l1[smb] = cr.decode_ref_idx(
+                                        st,
+                                        left_ref,
+                                        top_ref,
+                                        self.effective_num_ref(mb_idx, sp.num_ref_idx_l1_active),
+                                    )?;
                                 } else {
                                     sub_ref_l1[smb] = 0;
                                 }
@@ -2373,7 +2431,11 @@ impl<P: Pixel> SliceContext<'_, P> {
                 self.mb_is_8x8dct[mb_idx] = use_8x8_b_inter;
 
                 let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
-                    let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
+                    let delta = cr.decode_mb_qp_delta(
+                        st,
+                        self.last_qp_delta_nonzero,
+                        51 + P::QP_BD_OFFSET as u32,
+                    )?;
                     self.last_qp_delta_nonzero = delta != 0;
                     self.next_qp(delta)
                 } else {
@@ -2637,7 +2699,11 @@ impl<P: Pixel> SliceContext<'_, P> {
             };
             self.mb_cbp[mb_idx] = (cbp_luma as u16) | ((cbp_chroma as u16) << 4);
             let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
-                let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
+                let delta = cr.decode_mb_qp_delta(
+                    st,
+                    self.last_qp_delta_nonzero,
+                    51 + P::QP_BD_OFFSET as u32,
+                )?;
                 self.last_qp_delta_nonzero = delta != 0;
                 self.next_qp(delta)
             } else {
@@ -2798,6 +2864,12 @@ impl<P: Pixel> SliceContext<'_, P> {
             let mt = mb_type - 1;
             let intra16x16_pred_mode = (mt % 4) as u8;
             let cbp_chroma = ((mt / 4) % 3) as u8;
+            // Spec 7.4.5: a 4:0:0 I16x16 mb_type has CodedBlockPatternChroma 0
+            if sp.monochrome && cbp_chroma != 0 {
+                return Err(DecodeError::InvalidSyntax(
+                    "I16x16 chroma cbp in a monochrome stream",
+                ));
+            }
             let cbp_luma = if mt >= 12 { 15u8 } else { 0u8 };
 
             let left_cm = if let Some(left) = self.left_mb(mb_idx) {
@@ -2816,7 +2888,8 @@ impl<P: Pixel> SliceContext<'_, P> {
                 cr.decode_chroma_pred_mode(st, left_cm, top_cm)
             };
             self.mb_chroma_pred[mb_idx] = intra_chroma_pred_mode;
-            let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
+            let delta =
+                cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero, 51 + P::QP_BD_OFFSET as u32)?;
             self.last_qp_delta_nonzero = delta != 0;
             let qp_y = self.next_qp(delta);
             self.prev_mb_qp = qp_y;

@@ -235,7 +235,7 @@ impl<P: Pixel> SliceContext<'_, P> {
 
     /// Read a CAVLC mb_qp_delta, which spec 7.4.5 limits to
     /// [-(26 + QpBdOffsetY / 2), 25 + QpBdOffsetY / 2] (CABAC's unary code
-    /// is capped instead, see `decode_mb_qp_delta`).
+    /// has FFmpeg's looser bound instead, see `decode_mb_qp_delta`).
     pub(crate) fn read_mb_qp_delta(
         reader: &mut crate::bitstream::BitstreamReader,
     ) -> Result<i32, crate::error::DecodeError> {

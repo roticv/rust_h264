@@ -1476,7 +1476,7 @@ impl<P: Pixel> SliceContext<'_, P> {
             intra_chroma_pred_mode = if sp.monochrome {
                 0
             } else {
-                reader.read_ue()? as u8
+                read_chroma_pred_mode(reader)?
             };
 
             let cbp_code = reader.read_ue()? as usize;
@@ -1613,12 +1613,18 @@ impl<P: Pixel> SliceContext<'_, P> {
             let mt = mb_type - 1;
             let intra16x16_pred_mode = (mt % 4) as u8;
             cbp_chroma = ((mt / 4) % 3) as u8;
+            // Spec 7.4.5: a 4:0:0 I16x16 mb_type has CodedBlockPatternChroma 0
+            if sp.monochrome && cbp_chroma != 0 {
+                return Err(DecodeError::InvalidSyntax(
+                    "I16x16 chroma cbp in a monochrome stream",
+                ));
+            }
             let cbp_luma = if mt >= 12 { 15u8 } else { 0u8 };
 
             intra_chroma_pred_mode = if sp.monochrome {
                 0
             } else {
-                reader.read_ue()? as u8
+                read_chroma_pred_mode(reader)?
             };
 
             let mb_qp_delta = Self::read_mb_qp_delta(reader)?;
@@ -1760,5 +1766,17 @@ impl<P: Pixel> SliceContext<'_, P> {
         );
         self.decode_chroma_residual_cavlc(reader, mb_idx, mb_x, cbp_chroma, qp_y, true, sp)?;
         Ok(())
+    }
+}
+
+/// intra_chroma_pred_mode, which spec 7.4.5.1 limits to 0..=3
+fn read_chroma_pred_mode(
+    reader: &mut crate::bitstream::BitstreamReader,
+) -> Result<u8, DecodeError> {
+    match reader.read_ue()? {
+        mode @ 0..=3 => Ok(mode as u8),
+        _ => Err(DecodeError::InvalidSyntax(
+            "intra_chroma_pred_mode out of range",
+        )),
     }
 }

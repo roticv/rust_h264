@@ -93,6 +93,9 @@ pub fn parse_residual_block_cavlc(
         let step = if zeros_left > 0 {
             let rb = parse_run_before(reader, zeros_left as u8)? as i32;
             zeros_left -= rb;
+            if zeros_left < 0 {
+                return Err("run_before larger than zeros_left");
+            }
             1 + rb as usize
         } else {
             1

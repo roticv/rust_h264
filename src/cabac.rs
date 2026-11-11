@@ -923,7 +923,15 @@ impl CabacReader<'_> {
 
     /// Decode reference index (unary with context switching) (spec 9.3.3.1.1.6).
     /// `left_ref`, `top_ref`: neighbor ref indices (-1 if unavailable).
-    pub fn decode_ref_idx(&mut self, state: &mut [u8; 1024], left_ref: i8, top_ref: i8) -> i8 {
+    /// `num_ref` is the length of the list the index points into; an index
+    /// past its end is an error, as in FFmpeg's `decode_cabac_mb`.
+    pub fn decode_ref_idx(
+        &mut self,
+        state: &mut [u8; 1024],
+        left_ref: i8,
+        top_ref: i8,
+        num_ref: u32,
+    ) -> Result<i8, DecodeError> {
         let mut ctx = 54usize;
         if left_ref > 0 {
             ctx += 1;
@@ -933,7 +941,7 @@ impl CabacReader<'_> {
         }
 
         if self.get_cabac(&mut state[ctx]) == 0 {
-            return 0;
+            return Ok(0);
         }
         let mut ref_idx = 1i8;
         ctx = 58; // context 4+ (54 + 4)
@@ -944,7 +952,10 @@ impl CabacReader<'_> {
                 break;
             }
         }
-        ref_idx
+        if ref_idx as u32 >= num_ref {
+            return Err(DecodeError::InvalidSyntax("ref_idx out of range"));
+        }
+        Ok(ref_idx)
     }
 
     /// Decode motion vector difference component (spec 9.3.3.1.1.7).
@@ -1004,14 +1015,16 @@ impl CabacReader<'_> {
 
     /// Decode QP delta (spec 9.3.3.1.1.5).
     /// `last_qp_delta_nonzero`: whether previous MB had non-zero QP delta.
+    /// `max_qp`: 51 + QpBdOffsetY.
     pub fn decode_mb_qp_delta(
         &mut self,
         state: &mut [u8; 1024],
         last_qp_delta_nonzero: bool,
-    ) -> i32 {
+        max_qp: u32,
+    ) -> Result<i32, DecodeError> {
         let ctx = 60 + last_qp_delta_nonzero as usize;
         if self.get_cabac(&mut state[ctx]) == 0 {
-            return 0;
+            return Ok(0);
         }
 
         let mut val = 1u32;
@@ -1019,19 +1032,19 @@ impl CabacReader<'_> {
         while self.get_cabac(&mut state[uctx]) != 0 {
             uctx = 63;
             val += 1;
-            // |mb_qp_delta| <= 26 + QpBdOffset / 2: 64 bins at 10 bits.
-            // The cap only stops a corrupt stream from looping forever.
-            if val > 128 {
-                break;
+            // |mb_qp_delta| <= 26 + QpBdOffset / 2 needs at most 52 +
+            // QpBdOffset bins; past FFmpeg's looser bound the slice is damaged
+            if val > 2 * max_qp {
+                return Err(DecodeError::InvalidSyntax("CABAC mb_qp_delta out of range"));
             }
         }
 
         // Convert unary to signed: 1->1, 2->-1, 3->2, 4->-2, ...
-        if val & 1 != 0 {
+        Ok(if val & 1 != 0 {
             ((val + 1) >> 1) as i32
         } else {
             -(((val + 1) >> 1) as i32)
-        }
+        })
     }
 
     /// Decode coded_block_flag for a block (spec 9.3.3.1.1.9).

@@ -108,7 +108,12 @@ impl BitstreamReader {
     /// When max > 1, reads a standard ue(v).
     pub fn read_te(&mut self, max: u32) -> Result<u32, &'static str> {
         if max > 1 {
-            self.read_ue()
+            // te(v) ranges over 0..=max (spec 7.4.5.1: ref_idx below
+            // num_ref_idx_active)
+            match self.read_ue()? {
+                v if v > max => Err("te(v) value out of range"),
+                v => Ok(v),
+            }
         } else {
             // Spec 9.1: value = 1 - bit
             Ok(1 - self.read_bit()? as u32)
@@ -218,6 +223,17 @@ mod tests {
         assert_eq!(r.read_bits(4).unwrap(), 0b1010);
         assert_eq!(r.read_bits(4).unwrap(), 0b0011);
         assert_eq!(r.read_bits(2).unwrap(), 0b11);
+    }
+
+    /// te(v) above its maximum (a ref_idx past the list) is an error.
+    #[test]
+    fn test_read_te_range() {
+        let data = BitWriter::default().ue(3).ue(4).u(1, 1).finish();
+        let mut r = BitstreamReader::new(&data);
+        assert_eq!(r.read_te(3), Ok(3));
+        assert!(r.read_te(3).is_err());
+        // max 1 is a single inverted bit
+        assert_eq!(r.read_te(1), Ok(0));
     }
 
     #[test]

@@ -1268,7 +1268,13 @@ fn run_slice_px<P: Pixel>(
         // P/B-slice skip run handling
         if is_p_slice || is_b_slice {
             if mb_skip_run < 0 {
-                mb_skip_run = reader.read_ue()? as i32;
+                // A run longer than the picture is damage (FFmpeg rejects
+                // it too); the cast below would also wrap past i32::MAX
+                let run = reader.read_ue()?;
+                if run as usize > total_mbs {
+                    return Err(DecodeError::InvalidSyntax("mb_skip_run out of range"));
+                }
+                mb_skip_run = run as i32;
             }
             if mb_skip_run > 0 {
                 mb_skip_run -= 1;

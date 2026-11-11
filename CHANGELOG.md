@@ -30,6 +30,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run of ones in the bypass bins of its Exp-Golomb prefix overflowed the
   value, a panic in builds with overflow checks. Past the bound FFmpeg uses,
   the slice now ends with `InvalidSyntax` in every build.
+- **Damaged macroblock syntax is rejected instead of decoded into a wrong
+  picture** (a review against FFmpeg's macroblock-layer checks). Each of these
+  now ends the slice with `InvalidSyntax`:
+  - a `ref_idx` past the end of its reference list (CAVLC and CABAC); it was
+    clamped to the last reference;
+  - a CAVLC `mb_skip_run` longer than the picture;
+  - a CABAC `mb_qp_delta` past FFmpeg's bound; it was capped and decoding
+    went on out of step with the bitstream;
+  - a CAVLC `intra_chroma_pred_mode` above 3; it fell back to DC prediction;
+  - an I16x16 macroblock with chroma coefficients in a monochrome stream;
+  - a `run_before` larger than the zeros left (rejected before too, but only
+    once the coefficient position ran out).
+
+### Changed
+- **Fuzzing reaches the macroblock layer**: two new targets,
+  `decode_slice_data` and `decode_threaded`, damage only the slice data of
+  real test streams (22 of them, CAVLC to 4:2:2 and 10-bit), so the
+  parameter sets and headers stay valid; `decode_threaded` decodes with
+  `ThreadedDecoder`. The fuzz workflow now runs daily, gives the decode
+  targets 10 to 15 minutes, and keeps each target's corpus between runs.
 
 ## [0.6.1] - 2026-11-02
 

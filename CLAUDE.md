@@ -33,6 +33,7 @@ This is a Rust project using Cargo:
 
 - **Input format:** Both Annex B (start code delimited) and AVCC (length-prefixed, MP4/MKV) are supported via `parse_annex_b` and `parse_avcc`/`parse_avcc_config` in `src/nal.rs`. The decoder itself accepts `NalUnit` values; the choice of parser determines the input format.
 - **Streaming API:** The decoder API is streaming — callers feed NAL units incrementally and receive decoded frames as they become available. No requirement to buffer an entire stream upfront.
+- **Malformed input:** every value read from the bitstream is checked against its spec range (7.4) where it is parsed, and every loop over bitstream bits or bins has an upper bound. FFmpeg's `AVERROR_INVALIDDATA` checks in `libavcodec/h264_*.c` are the reference list; out-of-range values return `DecodeError::InvalidSyntax` rather than being clamped.
 - **Performance:** The decoder should be fast. Prefer efficient algorithms, minimize allocations, and avoid unnecessary copies. Performance relative to ffmpeg's software decoder is a key benchmark.
 
 ## Code Structure
@@ -278,6 +279,7 @@ Baseline, Main, High, High 10 and High 4:2:2 profile 8- and 10-bit 4:2:0, 4:2:2 
   CAVLC, CABAC, MBAFF, monochrome, cropped low QP; SHA-256 of FFmpeg's `yuv4xxp10le`)
 - `testdata/unsupported_*.h264`: one tiny stream per rejected format
 - `testdata/fuzz_regressions/`: crash inputs replayed to check they don't panic
+- `fuzz/`: cargo-fuzz targets (run daily in CI with a cached corpus); `decode_slice_data` and `decode_threaded` damage only the slice NALs of 22 small test streams (`fuzz/common/slice_mutation.rs`) so the macroblock layer is reached behind valid headers
 - Frame threading: every test stream decoded serially and at 1, 2 and 4 threads must match
 - Ignored (slow) tests over the bench corpus: golden digests per SIMD backend, and
   threaded vs serial
