@@ -397,8 +397,14 @@ impl<M> ThreadedDecoder<M> {
         let handle = std::thread::spawn(move || {
             // A panic drops the writer during unwinding, which completes the
             // picture with stand-in content so no reader waits forever.
-            let result = catch_unwind(AssertUnwindSafe(move || run_picture(slices, writer)))
-                .unwrap_or(Err(DecodeError::InvalidSyntax("decode worker panicked")));
+            let result = match catch_unwind(AssertUnwindSafe(move || run_picture(slices, writer))) {
+                Ok(result) => result,
+                Err(_) => {
+                    #[cfg(test)]
+                    tests::WORKER_PANICS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(DecodeError::InvalidSyntax("decode worker panicked"))
+                }
+            };
             let _ = done_tx.send((seq, result));
         });
         self.inflight.push_back(handle);
@@ -570,6 +576,11 @@ mod tests {
     use crate::decoder::OrderedDecoder;
     use crate::nal::parse_annex_b;
     use std::time::Duration;
+
+    /// Worker panics caught by `catch_unwind`, which would otherwise pass
+    /// unnoticed as decode errors.
+    pub(super) static WORKER_PANICS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 
     fn decode_serial(nals: &[NalUnit]) -> Vec<Frame> {
         let mut dec = OrderedDecoder::new();
@@ -871,6 +882,7 @@ mod tests {
         let dir = format!("{}/testdata/fuzz_regressions", env!("CARGO_MANIFEST_DIR"));
         for entry in std::fs::read_dir(&dir).unwrap().flatten() {
             let path = entry.path();
+            let panics = WORKER_PANICS.load(std::sync::atomic::Ordering::Relaxed);
             let data = std::fs::read(&path).unwrap();
             let mut dec = ThreadedDecoder::new(3);
             if path.extension().is_some_and(|x| x == "h264") {
@@ -893,6 +905,12 @@ mod tests {
                 }
             }
             let _ = dec.flush();
+            assert_eq!(
+                WORKER_PANICS.load(std::sync::atomic::Ordering::Relaxed),
+                panics,
+                "{}: a decode worker panicked",
+                path.display()
+            );
         }
     }
 }

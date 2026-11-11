@@ -73,14 +73,25 @@ impl SharedPlane {
         );
     }
 
-    /// Fill `at..at + len` with `value`.
+    /// Fill `at..at + len` with copies of the sample `value` (its bytes, one
+    /// or two); `at` and `len` are multiples of `value.len()`.
     ///
     /// # Safety
     /// Same as [`write`](Self::write).
     #[inline]
-    pub(crate) unsafe fn fill(&self, at: usize, len: usize, value: u8) {
+    pub(crate) unsafe fn fill(&self, at: usize, len: usize, value: &[u8]) {
         debug_assert!(at + len <= self.len());
-        core::ptr::write_bytes((self.data.get() as *mut u8).add(at), value, len);
+        debug_assert!(at.is_multiple_of(value.len()) && len.is_multiple_of(value.len()));
+        let dst = (self.data.get() as *mut u8).add(at);
+        match *value {
+            [b] => core::ptr::write_bytes(dst, b, len),
+            _ => {
+                for chunk in core::slice::from_raw_parts_mut(dst, len).chunks_exact_mut(value.len())
+                {
+                    chunk.copy_from_slice(value);
+                }
+            }
+        }
     }
 }
 

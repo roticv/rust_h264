@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `decode_nal`/`flush`.
 
 ### Fixed
+- **`ThreadedDecoder` conceals a failed 10-bit picture with valid samples**:
+  a picture whose slices all fail is filled with mid-grey, which was the byte
+  128 at every bit depth. At 10 bits that made samples of 0x8080, far above
+  1023, and a later picture predicting from them overflowed in intra
+  prediction (found by the `decode_threaded` fuzz target). The fill is now
+  512 at 10 bits.
 - **`ThreadedDecoder` no longer drops ready frames when it reports an error**:
   a worker's macroblock error from an earlier picture, or a slice header
   error on a slice that starts a new picture, discarded the frames the same

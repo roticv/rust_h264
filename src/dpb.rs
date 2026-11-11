@@ -487,11 +487,17 @@ impl PictureWriter {
     /// empty motion, so pictures referencing it can still be decoded.
     fn abandon(&mut self) {
         let total = self.pic.progress.total();
+        // Mid-grey at the picture's bit depth: 128, or 512 as 2 bytes LE.
+        let mid: &[u8] = if self.pic.sample_bytes == 2 {
+            &[0x00, 0x02]
+        } else {
+            &[128]
+        };
         for p in 0..3 {
             let from = self.pic.plane_bytes(p, self.rows);
             let len = self.pic.planes[p].len() - from;
             // SAFETY: unique writer; the range is unpublished and in bounds.
-            unsafe { self.pic.planes[p].fill(from, len, 128) };
+            unsafe { self.pic.planes[p].fill(from, len, mid) };
         }
         let total_mbs = self.pic.mb_width as usize * total as usize;
         let _ = self.pic.motion.set(Motion::unavailable(total_mbs));
