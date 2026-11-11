@@ -4,6 +4,8 @@
 //! per H.264 spec 9.3. Used as an alternative to CAVLC for entropy decoding
 //! in Main and High profiles.
 
+use crate::error::DecodeError;
+
 /// Number of bits used for buffer operations (16-bit double-byte mode).
 const CABAC_BITS: u32 = 16;
 /// Mask for buffer alignment checks.
@@ -948,7 +950,12 @@ impl CabacReader<'_> {
     /// Decode motion vector difference component (spec 9.3.3.1.1.7).
     /// `ctx_base`: 40 for X, 47 for Y.
     /// `amvd`: sum of absolute MVD values from left and top neighbors.
-    pub fn decode_mvd_comp(&mut self, state: &mut [u8; 1024], ctx_base: usize, amvd: u32) -> i32 {
+    pub fn decode_mvd_comp(
+        &mut self,
+        state: &mut [u8; 1024],
+        ctx_base: usize,
+        amvd: u32,
+    ) -> Result<i32, DecodeError> {
         // Context selection based on sum of neighbor MVDs
         let ctx_offset = if amvd < 3 {
             0
@@ -960,7 +967,7 @@ impl CabacReader<'_> {
         let ctx = ctx_base + ctx_offset;
 
         if self.get_cabac(&mut state[ctx]) == 0 {
-            return 0;
+            return Ok(0);
         }
 
         // Unary coding for magnitude 1-8
@@ -979,6 +986,11 @@ impl CabacReader<'_> {
             while self.get_cabac_bypass() != 0 {
                 abs_mvd += 1 << k;
                 k += 1;
+                // A valid mvd stops far below this. A damaged slice's run of
+                // ones would overflow abs_mvd, so stop it as FFmpeg does.
+                if k > 24 {
+                    return Err(DecodeError::InvalidSyntax("CABAC mvd overflow"));
+                }
             }
             while k > 0 {
                 k -= 1;
@@ -987,7 +999,7 @@ impl CabacReader<'_> {
         }
 
         // Sign via bypass
-        self.get_cabac_bypass_sign(-(abs_mvd as i32))
+        Ok(self.get_cabac_bypass_sign(-(abs_mvd as i32)))
     }
 
     /// Decode QP delta (spec 9.3.3.1.1.5).

@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   busy workers by finished threads, and a worker sends its result just before
   its thread finishes. It now counts pictures dispatched but not yet reported
   and blocks on the next result.
+- **A damaged CABAC motion vector difference no longer overflows**: a long
+  run of ones in the bypass bins of its Exp-Golomb prefix overflowed the
+  value, a panic in builds with overflow checks. Past the bound FFmpeg uses,
+  the slice now ends with `InvalidSyntax` in every build.
 
 ## [0.6.1] - 2026-11-02
 

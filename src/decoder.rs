@@ -4162,6 +4162,13 @@ mod tests {
         fuzz_decode_avcc("decode_avcc_weighted_pred_weight_overflow.bin");
     }
 
+    /// A long run of ones in the bypass bins of an mvd's Exp-Golomb prefix
+    /// overflowed the mvd (cabac.rs decode_mvd_comp).
+    #[test]
+    fn test_fuzz_regression_cabac_mvd_bypass_overflow() {
+        fuzz_decode_annex_b("cabac_mvd_bypass_overflow.bin");
+    }
+
     /// MBAFF CAVLC test (64x64, 6-frame, interlaced, CAVLC, frame-coded pairs)
     #[test]
     fn test_mbaff_cavlc() {
