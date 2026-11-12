@@ -560,6 +560,33 @@ impl Dpb {
         self.max_ref_frames = max_ref_frames as usize;
     }
 
+    /// Drop every picture coded in another format than `width` x
+    /// `frame_height` (coded frame size; fields are half as high) with
+    /// `sample_bytes` and 4:2:2 or not. A new SPS may only be activated at an
+    /// IDR picture, which empties the DPB anyway; a damaged stream can change
+    /// it without one, and pictures of another size must not be used as
+    /// references (nor paired into a frame).
+    pub fn retain_format(
+        &mut self,
+        width: u32,
+        frame_height: u32,
+        sample_bytes: u8,
+        chroma_422: bool,
+    ) {
+        self.entries.retain(|e| {
+            let p = &e.pic;
+            let height = if p.structure == PictureStructure::Frame {
+                frame_height
+            } else {
+                frame_height / 2
+            };
+            p.width == width
+                && p.height == height
+                && p.sample_bytes == sample_bytes
+                && p.chroma_422 == chroma_422
+        });
+    }
+
     /// Clear the entire DPB. Called on IDR.
     pub fn clear(&mut self) {
         self.entries.clear();

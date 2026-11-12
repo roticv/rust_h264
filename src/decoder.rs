@@ -556,6 +556,17 @@ pub(crate) fn prepare_slice(
         .get(&pps.seq_parameter_set_id)
         .ok_or(DecodeError::InvalidSyntax("no SPS available"))?;
     check_supported(sps)?;
+    {
+        let mb_width = sps.pic_width_in_mbs_minus1.saturating_add(1);
+        let map_units = sps.pic_height_in_map_units_minus1.saturating_add(1);
+        let frame_mb_height = map_units.saturating_mul(2 - sps.frame_mbs_only_flag as u32);
+        dpb.retain_format(
+            mb_width.saturating_mul(16),
+            frame_mb_height.saturating_mul(16),
+            if sps.bit_depth_luma_minus8 > 0 { 2 } else { 1 },
+            sps.chroma_format_idc == 2,
+        );
+    }
 
     let (header, reader) =
         parse_slice_header(&nal.rbsp, sps, pps, nal.nal_unit_type, nal.nal_ref_idc)?;
@@ -4173,6 +4184,15 @@ mod tests {
     #[test]
     fn test_fuzz_regression_cabac_mvd_bypass_overflow() {
         fuzz_decode_annex_b("cabac_mvd_bypass_overflow.bin");
+    }
+
+    /// Two fields decoded under SPSs of different sizes were paired into a
+    /// frame reference shorter than its stated size, and motion compensation
+    /// read past its luma plane (inter_pred.rs luma_mc_inner). Pictures of
+    /// another format are now dropped from the DPB (Dpb::retain_format).
+    #[test]
+    fn test_fuzz_regression_field_pair_size_mismatch() {
+        fuzz_decode_avcc("decode_avcc_field_pair_size_mismatch.bin");
     }
 
     /// MBAFF CAVLC test (64x64, 6-frame, interlaced, CAVLC, frame-coded pairs)

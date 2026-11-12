@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `decode_nal`/`flush`.
 
 ### Fixed
+- **A damaged stream that switches SPS without an IDR no longer reads past
+  a reference picture**: references kept from the old SPS stayed in the DPB,
+  and two fields of different sizes were paired into a frame reference
+  shorter than its stated size, which motion compensation read past (found
+  by the `decode_avcc` fuzz target). Pictures of another size, bit depth or
+  chroma format are now dropped from the DPB when a slice activates an SPS,
+  as FFmpeg drops its references on such a change.
 - **`ThreadedDecoder` conceals a failed 10-bit picture with valid samples**:
   a picture whose slices all fail is filled with mid-grey, which was the byte
   128 at every bit depth. At 10 bits that made samples of 0x8080, far above
